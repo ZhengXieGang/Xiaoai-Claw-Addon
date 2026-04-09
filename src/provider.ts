@@ -492,8 +492,8 @@ const OPENCLAW_WORKSPACE_FILE_DEFINITIONS: Array<{
         id: "heartbeat",
         filename: "HEARTBEAT.md",
         label: "心跳说明",
-        description: "告诉 OpenClaw 这个 workspace 不需要额外的心跳动作。",
-        defaultContent: "无需执行心跳任务。",
+        description: "默认只保留注释，避免为这个专属 agent 触发额外 heartbeat 任务。",
+        defaultContent: "# 保持空文件或仅保留注释即可跳过 heartbeat API 调用。",
         defaultEnabled: true,
         disableAllowed: true,
     },
@@ -3784,7 +3784,11 @@ class XiaoaiCloudPlugin {
         const agentId = readString(config.openclawAgent) || "main";
         const globalConfig = await readOpenclawGlobalConfig(this.api);
         const { agentConfig } = this.readOpenclawAgentConfig(globalConfig, agentId);
-        const workspacePath = this.resolveOpenclawAgentWorkspacePath(agentConfig, globalConfig);
+        const workspacePath = this.resolveOpenclawAgentWorkspacePath(
+            agentId,
+            agentConfig,
+            globalConfig
+        );
         const promptState = await this.readOpenclawAgentWorkspacePromptState(
             workspacePath,
             config.openclawVoiceSystemPrompt
@@ -3855,13 +3859,17 @@ class XiaoaiCloudPlugin {
     }
 
     private resolveOpenclawAgentWorkspacePath(
+        agentId: string,
         agentConfig: Record<string, any> | undefined,
         globalConfig: Record<string, any> | undefined
     ) {
-        return pickFirstString(
-            readString(agentConfig?.workspace),
-            readString(globalConfig?.agents?.defaults?.workspace)
-        );
+        const explicitWorkspace = readString(agentConfig?.workspace);
+        if (explicitWorkspace) {
+            return explicitWorkspace;
+        }
+        return agentId === "main"
+            ? readString(globalConfig?.agents?.defaults?.workspace)
+            : "";
     }
 
     private async readOpenclawAgentWorkspacePromptState(
@@ -4009,7 +4017,11 @@ class XiaoaiCloudPlugin {
         const agentId = readString(config.openclawAgent) || "main";
         const globalConfig = await readOpenclawGlobalConfig(this.api);
         const { agentConfig } = this.readOpenclawAgentConfig(globalConfig, agentId);
-        const workspacePath = this.resolveOpenclawAgentWorkspacePath(agentConfig, globalConfig);
+        const workspacePath = this.resolveOpenclawAgentWorkspacePath(
+            agentId,
+            agentConfig,
+            globalConfig
+        );
         return {
             agentId,
             files: await Promise.all(
@@ -6298,7 +6310,11 @@ class XiaoaiCloudPlugin {
         if (!agentConfig) {
             throw new Error(`没有找到 id 为 ${agentId} 的 OpenClaw agent。`);
         }
-        const workspacePath = this.resolveOpenclawAgentWorkspacePath(agentConfig, globalConfig);
+        const workspacePath = this.resolveOpenclawAgentWorkspacePath(
+            agentId,
+            agentConfig,
+            globalConfig
+        );
         if (!workspacePath) {
             throw new Error(
                 `没有找到 id 为 ${agentId} 的 OpenClaw agent workspace，暂时不能写入 ${definition.filename}。`

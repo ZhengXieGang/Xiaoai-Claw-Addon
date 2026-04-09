@@ -52,7 +52,7 @@ const LIGHTWEIGHT_WORKSPACE_FILES = {
     "USER.md": "默认面向音箱前的真实用户，用中文交流。\n",
     "IDENTITY.md": "身份：小爱语音代理。\n",
     "TOOLS.md": "只使用 xiaoai_* 工具处理音箱相关任务。\n",
-    "HEARTBEAT.md": "无需执行心跳任务。\n",
+    "HEARTBEAT.md": "# 保持空文件或仅保留注释即可跳过 heartbeat API 调用。\n",
     "MEMORY.md": "仅保留少量长期偏好。\n",
 };
 const OBSOLETE_LIGHTWEIGHT_WORKSPACE_FILES = {

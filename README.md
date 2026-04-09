@@ -212,7 +212,7 @@ uninstall.cmd
 2. 打开控制台，先登录小米账号
 3. 在概览页选择要接管的音箱
 4. 到控制页设置模式、音量、唤醒词、通知渠道、上下文记忆和必要时的非流式兜底（一般不需要）
-5. 这些控制页配置除了网页里可以改，也可以直接通过和 OpenClaw 对话修改；复杂项统一由 `xiaoai_update_settings` 处理，包括通知渠道、模型、上下文记忆，以及 `AGENTS.md`、`IDENTITY.md`、`TOOLS.md`、`HEARTBEAT.md`、`BOOT.md`、`MEMORY.md` 这些 workspace 提示文件的编辑或禁用。`AGENTS.md` 作为核心提示文件会保留启用，其余文件会按 OpenClaw 的 workspace 语义启用或禁用
+5. 这些控制页配置除了网页里可以改，也可以直接通过和 OpenClaw 对话修改；复杂项统一由 `xiaoai_update_settings` 处理，包括通知渠道、模型、上下文记忆，以及 `AGENTS.md`、`IDENTITY.md`、`TOOLS.md`、`HEARTBEAT.md`、`BOOT.md`、`MEMORY.md` 这些 workspace 提示文件的编辑或禁用。`AGENTS.md` 作为核心提示文件会保留启用，其余文件会按 OpenClaw 的 workspace 语义启用或禁用。这些文件只写入 `xiaoai` 专属 agent 的 workspace；如果专属 agent 缺少显式 workspace，插件会直接报错，不会回退去读写主 agent 的默认 workspace
 
 
 ## 用法示例

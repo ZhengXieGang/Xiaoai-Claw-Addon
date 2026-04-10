@@ -27,6 +27,8 @@ import {
 import {
     ConsoleEventEntry,
     PersistedAudioCalibrationSummary,
+    PersistedConversationInterceptCalibrationSummary,
+    PersistedConversationInterceptLatencyProfile,
     PersistedSpeakerAudioLatencyProfile,
     PersistedSpeakerMuteState,
     defaultStateStorePath,
@@ -205,6 +207,7 @@ interface ConsoleBootstrapPayload {
     openclawRoute?: ConsoleOpenclawRouteState;
     openclawWorkspaceFiles?: ConsoleOpenclawWorkspaceState;
     audioCalibration?: ConsoleAudioCalibrationState;
+    conversationInterceptCalibration?: ConsoleConversationInterceptCalibrationState;
 }
 
 interface ConsoleSpeakerAudioLatencyProfile {
@@ -220,6 +223,21 @@ interface ConsoleAudioCalibrationState {
     tailPaddingMs: number;
     currentProfile?: ConsoleSpeakerAudioLatencyProfile;
     lastRun?: PersistedAudioCalibrationSummary;
+}
+
+interface ConsoleConversationInterceptLatencyProfile {
+    conversationVisibleEstimateMs?: number;
+    nativePlaybackStartEstimateMs?: number;
+    interceptLeadEstimateMs?: number;
+    updatedAt?: string;
+}
+
+interface ConsoleConversationInterceptCalibrationState {
+    running: boolean;
+    pollIntervalMs: number;
+    recommendedPollIntervalMs?: number;
+    currentProfile?: ConsoleConversationInterceptLatencyProfile;
+    lastRun?: PersistedConversationInterceptCalibrationSummary;
 }
 
 interface ConsoleOpenclawModelOption {
@@ -332,7 +350,7 @@ interface OpenclawGatewayAuthState {
 interface RecentSelfTriggeredQuery {
     text: string;
     comparable: string;
-    source: "execute";
+    source: "execute" | "speak";
     timeMs: number;
 }
 
@@ -433,6 +451,13 @@ interface SpeakerAudioLatencyProfile {
     pauseSettleEstimateMs?: number;
     stopSettleEstimateMs?: number;
     playbackDetectEstimateMs?: number;
+    updatedAtMs: number;
+}
+
+interface ConversationInterceptLatencyProfile {
+    conversationVisibleEstimateMs?: number;
+    nativePlaybackStartEstimateMs?: number;
+    interceptLeadEstimateMs?: number;
     updatedAtMs: number;
 }
 
@@ -555,6 +580,14 @@ const AUDIO_CALIBRATION_SAMPLE_DURATIONS_MS = [450, 800, 1200];
 const AUDIO_CALIBRATION_ROUND_SETTLE_MS = 500;
 const AUDIO_PLAYBACK_SKIP_TTL_MS = 10 * 60 * 1000;
 const AUDIO_STANDARDIZE_TIMEOUT_MS = 45_000;
+const CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS = 12_000;
+const CONVERSATION_INTERCEPT_CALIBRATION_POLL_MS = 90;
+const CONVERSATION_INTERCEPT_CALIBRATION_SETTLE_MS = 450;
+const CONVERSATION_INTERCEPT_CALIBRATION_QUERIES = [
+    "现在几点",
+    "今天星期几",
+    "今天天气怎么样",
+];
 const EXTERNAL_AUDIO_NON_LOOP_TYPE = 3;
 const EXTERNAL_AUDIO_LOOP_GUARD_POLL_MS = 180;
 const EXTERNAL_AUDIO_LOOP_GUARD_NEAR_END_POLL_MS = 45;
@@ -1682,6 +1715,19 @@ function normalizeAudioTailPaddingMs(
     );
 }
 
+function normalizePollIntervalMs(value: any, fallback = DEFAULT_POLL_INTERVAL_MS) {
+    const resolvedFallback = clamp(
+        Math.round(Number(fallback) || DEFAULT_POLL_INTERVAL_MS),
+        250,
+        10000
+    );
+    const parsed = readNumber(value);
+    if (typeof parsed !== "number" || !Number.isFinite(parsed)) {
+        return resolvedFallback;
+    }
+    return clamp(Math.round(parsed), 250, 10000);
+}
+
 function escapeRegexLiteral(value: string) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -2090,14 +2136,11 @@ async function resolvePluginConfig(
         storageDir,
         debugLogPath,
         pythonCommand,
-        pollIntervalMs: clamp(
-            Math.round(
-                readNumber(apiConfig.pollIntervalMs) ||
-                readNumber(env.XIAOAI_CLOUD_POLL_INTERVAL_MS) ||
-                DEFAULT_POLL_INTERVAL_MS
-            ),
-            250,
-            10000
+        pollIntervalMs: normalizePollIntervalMs(
+            readNumber(apiConfig.pollIntervalMs) ??
+                readNumber(env.XIAOAI_CLOUD_POLL_INTERVAL_MS) ??
+                readNumber(persisted.conversationPollIntervalMs),
+            DEFAULT_POLL_INTERVAL_MS
         ),
         authListenHost:
             pickFirstString(
@@ -2243,9 +2286,15 @@ class XiaoaiCloudPlugin {
     private readonly audioPlaybackCapability = new Map<string, AudioPlaybackCapabilityEntry>();
     private readonly externalAudioLoopGuards = new Map<string, ExternalAudioLoopGuard>();
     private readonly speakerAudioLatencyProfiles = new Map<string, SpeakerAudioLatencyProfile>();
-    private speakerAudioLatencyProfilesHydrated = false;
+    private readonly conversationInterceptLatencyProfiles = new Map<
+        string,
+        ConversationInterceptLatencyProfile
+    >();
+    private calibrationProfilesHydrated = false;
     private audioCalibrationRunning = false;
+    private conversationInterceptCalibrationRunning = false;
     private lastAudioCalibration?: PersistedAudioCalibrationSummary;
+    private lastConversationInterceptCalibration?: PersistedConversationInterceptCalibrationSummary;
     private readonly ttsBridgeInflightAssets = new Map<string, Promise<GeneratedAudioAsset>>();
     private ffmpegAvailable?: boolean;
     private ffmpegAvailabilityProbe?: Promise<boolean>;
@@ -2631,11 +2680,151 @@ class XiaoaiCloudPlugin {
             : undefined;
     }
 
+    private normalizeConversationInterceptLatencyProfile(
+        value: any
+    ): ConversationInterceptLatencyProfile | undefined {
+        if (!value || typeof value !== "object") {
+            return undefined;
+        }
+        const next: ConversationInterceptLatencyProfile = {
+            updatedAtMs: Math.max(
+                0,
+                Math.round(readNumber(value.updatedAtMs) || Date.now())
+            ),
+        };
+        let hasEstimate = false;
+        ([
+            "conversationVisibleEstimateMs",
+            "nativePlaybackStartEstimateMs",
+            "interceptLeadEstimateMs",
+        ] as const).forEach((key) => {
+            const estimate = readNumber(value[key]);
+            if (
+                typeof estimate === "number" &&
+                Number.isFinite(estimate) &&
+                estimate > 0
+            ) {
+                next[key] = clamp(Math.round(estimate), 1, 20_000);
+                hasEstimate = true;
+            }
+        });
+        return hasEstimate ? next : undefined;
+    }
+
+    private serializeConversationInterceptLatencyProfileForPersistence(
+        profile?: ConversationInterceptLatencyProfile | null
+    ): PersistedConversationInterceptLatencyProfile | undefined {
+        const normalized = this.normalizeConversationInterceptLatencyProfile(profile);
+        if (!normalized) {
+            return undefined;
+        }
+        return {
+            conversationVisibleEstimateMs:
+                normalized.conversationVisibleEstimateMs,
+            nativePlaybackStartEstimateMs:
+                normalized.nativePlaybackStartEstimateMs,
+            interceptLeadEstimateMs: normalized.interceptLeadEstimateMs,
+            updatedAtMs: normalized.updatedAtMs,
+        };
+    }
+
+    private buildConsoleConversationInterceptLatencyProfile(
+        profile?: ConversationInterceptLatencyProfile | null
+    ): ConsoleConversationInterceptLatencyProfile | undefined {
+        const normalized = this.normalizeConversationInterceptLatencyProfile(profile);
+        if (!normalized) {
+            return undefined;
+        }
+        return {
+            conversationVisibleEstimateMs:
+                normalized.conversationVisibleEstimateMs,
+            nativePlaybackStartEstimateMs:
+                normalized.nativePlaybackStartEstimateMs,
+            interceptLeadEstimateMs: normalized.interceptLeadEstimateMs,
+            updatedAt:
+                normalized.updatedAtMs > 0
+                    ? new Date(normalized.updatedAtMs).toISOString()
+                    : undefined,
+        };
+    }
+
+    private serializeConversationInterceptLatencyProfilesForPersistence() {
+        const entries = Array.from(this.conversationInterceptLatencyProfiles.entries())
+            .map(([deviceId, profile]) => {
+                const normalizedDeviceId = readString(deviceId);
+                const normalizedProfile =
+                    this.serializeConversationInterceptLatencyProfileForPersistence(
+                        profile
+                    );
+                if (!normalizedDeviceId || !normalizedProfile) {
+                    return undefined;
+                }
+                return [normalizedDeviceId, normalizedProfile] as const;
+            })
+            .filter(Boolean) as Array<
+            readonly [string, PersistedConversationInterceptLatencyProfile]
+        >;
+        return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+    }
+
+    private normalizePersistedConversationInterceptCalibrationSummary(
+        value: any
+    ): PersistedConversationInterceptCalibrationSummary | undefined {
+        if (!value || typeof value !== "object") {
+            return undefined;
+        }
+        const latencyProfile =
+            this.serializeConversationInterceptLatencyProfileForPersistence(
+                value.latencyProfile
+            );
+        const rounds = readNumber(value.rounds);
+        const successCount = readNumber(value.successCount);
+        const failureCount = readNumber(value.failureCount);
+        const pollIntervalMs = readNumber(value.pollIntervalMs);
+        const recommendedPollIntervalMs = readNumber(value.recommendedPollIntervalMs);
+        const summary: PersistedConversationInterceptCalibrationSummary = {
+            deviceId: readString(value.deviceId) || undefined,
+            deviceName: readString(value.deviceName) || undefined,
+            rounds:
+                typeof rounds === "number" && Number.isFinite(rounds) && rounds > 0
+                    ? Math.max(1, Math.round(rounds))
+                    : undefined,
+            successCount:
+                typeof successCount === "number" &&
+                Number.isFinite(successCount) &&
+                successCount >= 0
+                    ? Math.max(0, Math.round(successCount))
+                    : undefined,
+            failureCount:
+                typeof failureCount === "number" &&
+                Number.isFinite(failureCount) &&
+                failureCount >= 0
+                    ? Math.max(0, Math.round(failureCount))
+                    : undefined,
+            pollIntervalMs:
+                typeof pollIntervalMs === "number" && Number.isFinite(pollIntervalMs)
+                    ? normalizePollIntervalMs(pollIntervalMs)
+                    : undefined,
+            recommendedPollIntervalMs:
+                typeof recommendedPollIntervalMs === "number" &&
+                Number.isFinite(recommendedPollIntervalMs)
+                    ? normalizePollIntervalMs(recommendedPollIntervalMs)
+                    : undefined,
+            startedAt: readString(value.startedAt) || undefined,
+            completedAt: readString(value.completedAt) || undefined,
+            lastError: readString(value.lastError) || undefined,
+            latencyProfile,
+        };
+        return Object.values(summary).some((item) => item !== undefined)
+            ? summary
+            : undefined;
+    }
+
     private async hydratePersistedAudioCalibrationState(config: PluginConfig) {
-        if (this.speakerAudioLatencyProfilesHydrated) {
+        if (this.calibrationProfilesHydrated) {
             return;
         }
-        this.speakerAudioLatencyProfilesHydrated = true;
+        this.calibrationProfilesHydrated = true;
         const persisted = (await loadPersistedProfile(config.stateStorePath).catch(
             () => ({})
         )) as Record<string, any>;
@@ -2657,9 +2846,32 @@ class XiaoaiCloudPlugin {
                 }
             });
         }
+        const interceptLatencyProfiles =
+            persisted.conversationInterceptLatencyProfiles &&
+            typeof persisted.conversationInterceptLatencyProfiles === "object" &&
+            !Array.isArray(persisted.conversationInterceptLatencyProfiles)
+                ? persisted.conversationInterceptLatencyProfiles
+                : undefined;
+        if (interceptLatencyProfiles) {
+            Object.entries(interceptLatencyProfiles).forEach(([deviceId, profile]) => {
+                const normalizedDeviceId = readString(deviceId);
+                const normalizedProfile =
+                    this.normalizeConversationInterceptLatencyProfile(profile);
+                if (normalizedDeviceId && normalizedProfile) {
+                    this.conversationInterceptLatencyProfiles.set(
+                        normalizedDeviceId,
+                        normalizedProfile
+                    );
+                }
+            });
+        }
         this.lastAudioCalibration = this.normalizePersistedAudioCalibrationSummary(
             persisted.lastAudioCalibration
         );
+        this.lastConversationInterceptCalibration =
+            this.normalizePersistedConversationInterceptCalibrationSummary(
+                persisted.lastConversationInterceptCalibration
+            );
     }
 
     private buildPersistedProfile(
@@ -2694,9 +2906,14 @@ class XiaoaiCloudPlugin {
             voiceContextMaxTurns: config.voiceContextMaxTurns,
             voiceContextMaxChars: config.voiceContextMaxChars,
             audioTailPaddingMs: config.audioTailPaddingMs,
+            conversationPollIntervalMs: config.pollIntervalMs,
             speakerAudioLatencyProfiles:
                 this.serializeSpeakerAudioLatencyProfilesForPersistence(),
             lastAudioCalibration: this.lastAudioCalibration,
+            conversationInterceptLatencyProfiles:
+                this.serializeConversationInterceptLatencyProfilesForPersistence(),
+            lastConversationInterceptCalibration:
+                this.lastConversationInterceptCalibration,
         };
     }
 
@@ -2714,6 +2931,26 @@ class XiaoaiCloudPlugin {
                 this.readSpeakerAudioLatencyProfile(this.device?.minaDeviceId)
             ),
             lastRun: this.lastAudioCalibration,
+        };
+    }
+
+    private buildConsoleConversationInterceptCalibrationState(): ConsoleConversationInterceptCalibrationState {
+        const currentProfile = this.buildConsoleConversationInterceptLatencyProfile(
+            this.readConversationInterceptLatencyProfile(this.device?.minaDeviceId)
+        );
+        const recommendedPollIntervalMs = this.recommendConversationPollIntervalMs(
+            this.device?.minaDeviceId,
+            this.config?.pollIntervalMs
+        );
+        return {
+            running: this.conversationInterceptCalibrationRunning,
+            pollIntervalMs: normalizePollIntervalMs(
+                this.config?.pollIntervalMs,
+                DEFAULT_POLL_INTERVAL_MS
+            ),
+            recommendedPollIntervalMs,
+            currentProfile,
+            lastRun: this.lastConversationInterceptCalibration,
         };
     }
 
@@ -3686,6 +3923,8 @@ class XiaoaiCloudPlugin {
             openclawRoute,
             openclawWorkspaceFiles,
             audioCalibration: this.buildConsoleAudioCalibrationState(),
+            conversationInterceptCalibration:
+                this.buildConsoleConversationInterceptCalibrationState(),
         };
     }
 
@@ -4727,6 +4966,26 @@ class XiaoaiCloudPlugin {
                 });
                 return true;
             }
+            if (requestMethod === "POST" && action === "device/conversation-intercept-calibration") {
+                if (this.conversationInterceptCalibrationRunning) {
+                    sendJson(response, 409, {
+                        error: "对话拦截校准正在进行中，请稍后再试。",
+                    });
+                    return true;
+                }
+                const calibration = await this.runConversationInterceptCalibration();
+                const successCount = readNumber(calibration.successCount) || 0;
+                const rounds = readNumber(calibration.rounds) || 0;
+                sendJson(response, 200, {
+                    ok: true,
+                    message:
+                        successCount === rounds
+                            ? `对话拦截校准完成，共 ${rounds} 轮全部成功。`
+                            : `对话拦截校准完成，成功 ${successCount}/${rounds} 轮。`,
+                    calibration,
+                });
+                return true;
+            }
             if (requestMethod === "POST" && action === "device/audio-tail-padding") {
                 const body = await readJsonBody(request);
                 const tailPaddingMs = readNumber(
@@ -4757,6 +5016,35 @@ class XiaoaiCloudPlugin {
                     message: result.changed
                         ? `空余延迟已更新为 ${result.tailPaddingMs}ms`
                         : `当前空余延迟保持 ${result.tailPaddingMs}ms`,
+                });
+                return true;
+            }
+            if (requestMethod === "POST" && action === "device/poll-interval") {
+                const body = await readJsonBody(request);
+                const pollIntervalMs = readNumber(
+                    body?.pollIntervalMs ?? body?.milliseconds ?? body?.ms
+                );
+                if (
+                    typeof pollIntervalMs !== "number" ||
+                    !Number.isFinite(pollIntervalMs)
+                ) {
+                    sendJson(response, 400, { error: "轮询间隔参数无效。" });
+                    return true;
+                }
+                const result = await this.updatePollIntervalMs(pollIntervalMs);
+                await this.appendConsoleEvent(
+                    "console.poll_interval",
+                    "控制台修改轮询间隔",
+                    `${result.previousPollIntervalMs}ms -> ${result.pollIntervalMs}ms`,
+                    "success"
+                );
+                sendJson(response, 200, {
+                    ok: true,
+                    pollIntervalMs: result.pollIntervalMs,
+                    calibration: this.buildConsoleConversationInterceptCalibrationState(),
+                    message: result.changed
+                        ? `轮询间隔已更新为 ${result.pollIntervalMs}ms`
+                        : `当前轮询间隔保持 ${result.pollIntervalMs}ms`,
                 });
                 return true;
             }
@@ -6168,6 +6456,29 @@ class XiaoaiCloudPlugin {
         };
     }
 
+    private async updatePollIntervalMs(msInput: number) {
+        const config = await this.loadConfig(false);
+        const previousPollIntervalMs = normalizePollIntervalMs(
+            config.pollIntervalMs,
+            DEFAULT_POLL_INTERVAL_MS
+        );
+        const pollIntervalMs = normalizePollIntervalMs(
+            msInput,
+            previousPollIntervalMs
+        );
+        const nextConfig: PluginConfig = {
+            ...config,
+            pollIntervalMs,
+        };
+        this.config = nextConfig;
+        await this.persistResolvedProfile(nextConfig, this.device, true);
+        return {
+            pollIntervalMs,
+            previousPollIntervalMs,
+            changed: pollIntervalMs !== previousPollIntervalMs,
+        };
+    }
+
     private async updateAudioTailPaddingMs(msInput: number) {
         const config = await this.loadConfig(false);
         const previousTailPaddingMs = this.getAudioRelayTailPaddingMs(config);
@@ -7393,6 +7704,7 @@ class XiaoaiCloudPlugin {
         if (action) {
             const result = await miio.miotAction(device.miDid, action.siid, action.aiid, [text]);
             if (result.code === 0) {
+                this.rememberSelfTriggeredQuery(text, "speak");
                 return true;
             }
             await this.appendDebugTrace("speaker_play_text_failed_code", {
@@ -7410,6 +7722,7 @@ class XiaoaiCloudPlugin {
                 [`跟我说 ${text}`]
             );
             if (result.code === 0) {
+                this.rememberSelfTriggeredQuery(text, "speak");
                 return true;
             }
             await this.appendDebugTrace("speaker_message_router_post_failed_code", {
@@ -7425,7 +7738,11 @@ class XiaoaiCloudPlugin {
                 code: fallback?.code,
             });
         }
-        return fallback?.code === 0;
+        if (fallback?.code === 0) {
+            this.rememberSelfTriggeredQuery(text, "speak");
+            return true;
+        }
+        return false;
     }
 
     private normalizeAudioReplyTitle(title?: string) {
@@ -8930,6 +9247,329 @@ class XiaoaiCloudPlugin {
         return relayUrl;
     }
 
+    private isNewerConversationRecord(
+        record: any,
+        baselineTimestamp: number,
+        baselineRequestId?: string
+    ) {
+        const recordTimestamp = Number(record?.time || 0);
+        const recordRequestId = readString(record?.requestId) || "";
+        if (recordTimestamp > baselineTimestamp) {
+            return true;
+        }
+        if (
+            recordTimestamp === baselineTimestamp &&
+            recordRequestId &&
+            baselineRequestId &&
+            recordRequestId !== baselineRequestId
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    private async waitForConversationInterceptCalibrationRecord(
+        mina: MiNAClient,
+        device: DeviceContext,
+        command: string,
+        startedAtMs: number,
+        baselineTimestamp: number,
+        baselineRequestId?: string
+    ) {
+        const deadlineAtMs =
+            startedAtMs + CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS;
+        const expectedComparable =
+            comparableConversationText(command) ||
+            comparableDirectiveText(command) ||
+            command;
+        while (Date.now() < deadlineAtMs) {
+            const latest = await this.fetchLatestConversationFor(mina, device).catch(
+                () => null
+            );
+            if (latest && this.isNewerConversationRecord(latest, baselineTimestamp, baselineRequestId)) {
+                const normalizedQuery =
+                    normalizeEventText(readString(latest?.query), 200) ||
+                    readString(latest?.query) ||
+                    "";
+                const comparable =
+                    comparableConversationText(normalizedQuery) ||
+                    comparableDirectiveText(normalizedQuery) ||
+                    normalizedQuery;
+                if (comparable && comparable === expectedComparable) {
+                    return {
+                        record: latest,
+                        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                    };
+                }
+            }
+            await sleep(CONVERSATION_INTERCEPT_CALIBRATION_POLL_MS);
+        }
+        throw new Error("等待云端会话回写超时。");
+    }
+
+    private async waitForConversationInterceptCalibrationPlaybackStart(
+        mina: MiNAClient,
+        deviceId: string,
+        startedAtMs: number,
+        timeoutMs = CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS
+    ) {
+        const safeTimeoutMs = clamp(
+            Math.round(
+                Number(timeoutMs) || CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS
+            ),
+            400,
+            CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS
+        );
+        const deadlineAtMs = startedAtMs + safeTimeoutMs;
+        while (Date.now() < deadlineAtMs) {
+            const snapshot = await this.readSpeakerPlaybackSnapshotWithTiming(
+                mina,
+                deviceId
+            ).catch(() => null);
+            if (this.isSpeakerPlaybackActivelyPlaying(snapshot)) {
+                return {
+                    snapshot,
+                    elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                };
+            }
+            await sleep(CONVERSATION_INTERCEPT_CALIBRATION_POLL_MS);
+        }
+        throw new Error("等待原生回复起播超时。");
+    }
+
+    private estimateConversationInterceptPlaybackWaitMs(deviceId?: string) {
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const playbackDetectEstimateMs =
+            readNumber(speakerProfile?.playbackDetectEstimateMs) || 0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        return clamp(
+            Math.round(
+                Math.max(
+                    1800,
+                    playbackDetectEstimateMs > 0
+                        ? playbackDetectEstimateMs * 1.6
+                        : 0,
+                    statusProbeEstimateMs > 0
+                        ? statusProbeEstimateMs * 1.35
+                        : 0
+                )
+            ),
+            1800,
+            5000
+        );
+    }
+
+    private estimateFallbackConversationInterceptLeadMs(deviceId?: string) {
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const playbackDetectEstimateMs =
+            readNumber(speakerProfile?.playbackDetectEstimateMs) || 0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        return clamp(
+            Math.round(
+                Math.max(
+                    280,
+                    playbackDetectEstimateMs > 0
+                        ? playbackDetectEstimateMs * 0.28
+                        : 0,
+                    statusProbeEstimateMs > 0
+                        ? statusProbeEstimateMs * 0.2
+                        : 0
+                )
+            ),
+            250,
+            1200
+        );
+    }
+
+    private async runConversationInterceptCalibration() {
+        const config = await this.loadConfig(false);
+        const { device, mina } = await this.ensureActionContext();
+        const startedAt = new Date().toISOString();
+        const rounds = CONVERSATION_INTERCEPT_CALIBRATION_QUERIES.slice();
+        let successCount = 0;
+        let failureCount = 0;
+        let fallbackRounds = 0;
+        let lastError: string | undefined;
+
+        this.conversationInterceptCalibrationRunning = true;
+        try {
+            await this.stopSpeaker({ fast: true }).catch(() => false);
+            await this.clearConsoleAudioPlaybackState().catch(() => undefined);
+
+            for (let index = 0; index < rounds.length; index += 1) {
+                const command = rounds[index] || rounds[0] || "现在几点";
+                try {
+                    await this.stopSpeaker({ fast: true }).catch(() => false);
+                    await sleep(160);
+                    const baseline =
+                        (await this.fetchLatestConversationFor(mina, device).catch(
+                            () => null
+                        )) || null;
+                    const baselineTimestamp = Number(baseline?.time || 0);
+                    const baselineRequestId = readString(baseline?.requestId) || "";
+                    const startedAtMs = Date.now();
+                    const playbackWaitMs =
+                        this.estimateConversationInterceptPlaybackWaitMs(
+                            device.minaDeviceId
+                        );
+                    const ok = await this.executeDirective(command, false);
+                    if (!ok) {
+                        throw new Error("测试问句没有成功发给小爱。");
+                    }
+
+                    const playbackResultPromise =
+                        this.waitForConversationInterceptCalibrationPlaybackStart(
+                            mina,
+                            device.minaDeviceId,
+                            startedAtMs,
+                            playbackWaitMs
+                        ).catch(() => null);
+                    const conversationResult =
+                        await this.waitForConversationInterceptCalibrationRecord(
+                            mina,
+                            device,
+                            command,
+                            startedAtMs,
+                            baselineTimestamp,
+                            baselineRequestId
+                        );
+                    const playbackResult = await playbackResultPromise;
+                    const conversationVisibleMs = Math.max(
+                        1,
+                        conversationResult.elapsedMs
+                    );
+                    const normalizedConversation =
+                        this.normalizeConversationRecord(conversationResult.record);
+                    let nativePlaybackStartMs = 0;
+                    if (playbackResult) {
+                        nativePlaybackStartMs = Math.max(
+                            1,
+                            playbackResult.elapsedMs
+                        );
+                    } else if (normalizedConversation.answers.length > 0) {
+                        const fallbackLeadMs =
+                            this.estimateFallbackConversationInterceptLeadMs(
+                                device.minaDeviceId
+                            );
+                        nativePlaybackStartMs = Math.max(
+                            conversationVisibleMs + fallbackLeadMs,
+                            conversationVisibleMs + 1
+                        );
+                        fallbackRounds += 1;
+                        await this.appendDebugTrace(
+                            "conversation_intercept_calibration_fallback",
+                            {
+                                deviceId: device.minaDeviceId,
+                                command,
+                                conversationVisibleMs,
+                                fallbackLeadMs,
+                                playbackWaitMs,
+                                answers: normalizedConversation.answers.slice(0, 2),
+                            }
+                        );
+                    } else {
+                        throw new Error("等待原生回复起播超时。");
+                    }
+                    const interceptLeadMs = Math.max(
+                        1,
+                        nativePlaybackStartMs - conversationVisibleMs
+                    );
+                    this.updateConversationInterceptLatencyEstimate(
+                        device.minaDeviceId,
+                        "conversationVisibleEstimateMs",
+                        conversationVisibleMs
+                    );
+                    this.updateConversationInterceptLatencyEstimate(
+                        device.minaDeviceId,
+                        "nativePlaybackStartEstimateMs",
+                        nativePlaybackStartMs
+                    );
+                    this.updateConversationInterceptLatencyEstimate(
+                        device.minaDeviceId,
+                        "interceptLeadEstimateMs",
+                        interceptLeadMs
+                    );
+                    successCount += 1;
+                } catch (error) {
+                    failureCount += 1;
+                    lastError =
+                        this.errorMessage(error) || "对话拦截校准失败。";
+                } finally {
+                    await this.stopSpeaker({ fast: true }).catch(() => false);
+                    await this.clearConsoleAudioPlaybackState().catch(() => undefined);
+                    await sleep(CONVERSATION_INTERCEPT_CALIBRATION_SETTLE_MS);
+                }
+            }
+
+            const nextPollIntervalMs = this.recommendConversationPollIntervalMs(
+                device.minaDeviceId,
+                config.pollIntervalMs
+            );
+            let finalPollIntervalMs = normalizePollIntervalMs(
+                config.pollIntervalMs,
+                DEFAULT_POLL_INTERVAL_MS
+            );
+            if (successCount > 0 && nextPollIntervalMs !== finalPollIntervalMs) {
+                const updated = await this.updatePollIntervalMs(nextPollIntervalMs);
+                finalPollIntervalMs = updated.pollIntervalMs;
+            }
+
+            const summary: PersistedConversationInterceptCalibrationSummary = {
+                deviceId: device.minaDeviceId,
+                deviceName: device.name,
+                rounds: rounds.length,
+                successCount,
+                failureCount,
+                fallbackRounds,
+                pollIntervalMs: finalPollIntervalMs,
+                recommendedPollIntervalMs: nextPollIntervalMs,
+                startedAt,
+                completedAt: new Date().toISOString(),
+                lastError,
+                latencyProfile:
+                    this.serializeConversationInterceptLatencyProfileForPersistence(
+                        this.readConversationInterceptLatencyProfile(
+                            device.minaDeviceId
+                        )
+                    ),
+            };
+            this.lastConversationInterceptCalibration = summary;
+            await this.persistResolvedProfile(
+                this.config || config,
+                this.device || device,
+                false
+            );
+
+            this.recordConsoleEvent(
+                "console.conversation-intercept-calibration",
+                successCount > 0
+                    ? "控制台对话拦截校准完成"
+                    : "控制台对话拦截校准失败",
+                [
+                    `设备：${device.name || device.minaDeviceId}`,
+                    `成功 ${successCount}/${rounds.length} 轮`,
+                    `轮询间隔 ${finalPollIntervalMs}ms`,
+                    nextPollIntervalMs !== finalPollIntervalMs
+                        ? `建议值 ${nextPollIntervalMs}ms`
+                        : "",
+                    lastError ? `最后错误：${lastError}` : "",
+                ]
+                    .filter(Boolean)
+                    .join(" · "),
+                successCount > 0 ? "success" : "error"
+            );
+
+            if (successCount <= 0) {
+                throw new Error(lastError || "对话拦截校准未能成功跑通任何一轮。");
+            }
+            return summary;
+        } finally {
+            this.conversationInterceptCalibrationRunning = false;
+        }
+    }
+
     private async runSpeakerAudioCalibration() {
         const config = await this.loadConfig(false);
         const { device } = await this.ensureActionContext();
@@ -9114,6 +9754,84 @@ class XiaoaiCloudPlugin {
             return undefined;
         }
         return this.speakerAudioLatencyProfiles.get(normalizedDeviceId);
+    }
+
+    private updateConversationInterceptLatencyEstimate(
+        deviceId: string,
+        key:
+            | "conversationVisibleEstimateMs"
+            | "nativePlaybackStartEstimateMs"
+            | "interceptLeadEstimateMs",
+        observedMs?: number
+    ) {
+        const nextObservedMs = readNumber(observedMs);
+        if (
+            !deviceId ||
+            typeof nextObservedMs !== "number" ||
+            !Number.isFinite(nextObservedMs) ||
+            nextObservedMs <= 0
+        ) {
+            return undefined;
+        }
+        const boundedObservedMs = clamp(Math.round(nextObservedMs), 1, 20_000);
+        const current = this.conversationInterceptLatencyProfiles.get(deviceId) || {
+            updatedAtMs: 0,
+        };
+        const previousEstimate = readNumber(current[key]);
+        const nextEstimate =
+            typeof previousEstimate === "number" && Number.isFinite(previousEstimate)
+                ? Math.max(
+                    boundedObservedMs,
+                    clamp(Math.round(previousEstimate * 0.92), 1, 20_000)
+                )
+                : boundedObservedMs;
+        const nextProfile: ConversationInterceptLatencyProfile = {
+            ...current,
+            [key]: nextEstimate,
+            updatedAtMs: Date.now(),
+        };
+        this.conversationInterceptLatencyProfiles.set(deviceId, nextProfile);
+        return nextEstimate;
+    }
+
+    private readConversationInterceptLatencyProfile(deviceId?: string) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return this.conversationInterceptLatencyProfiles.get(normalizedDeviceId);
+    }
+
+    private recommendConversationPollIntervalMs(
+        deviceId?: string,
+        currentPollIntervalMs?: number
+    ) {
+        const currentPoll = normalizePollIntervalMs(
+            currentPollIntervalMs,
+            DEFAULT_POLL_INTERVAL_MS
+        );
+        const interceptProfile = this.readConversationInterceptLatencyProfile(deviceId);
+        const interceptLeadMs = readNumber(interceptProfile?.interceptLeadEstimateMs) || 0;
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const pauseSettleEstimateMs =
+            readNumber(speakerProfile?.pauseSettleEstimateMs) ||
+            readNumber(speakerProfile?.stopSettleEstimateMs) ||
+            0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        if (interceptLeadMs <= 0) {
+            return currentPoll;
+        }
+        const remainingBudgetMs = Math.max(
+            0,
+            interceptLeadMs - pauseSettleEstimateMs - statusProbeEstimateMs - 120
+        );
+        const suggested = clamp(
+            Math.round(Math.max(250, remainingBudgetMs * 2)),
+            250,
+            currentPoll
+        );
+        return Math.min(currentPoll, suggested);
     }
 
     private computeDynamicExternalAudioLoopGuardBaseLeadMs(deviceId?: string) {
@@ -11470,16 +12188,17 @@ class XiaoaiCloudPlugin {
         return 15;
     }
 
-    private async readVolumeSnapshotFromDevice(): Promise<VolumeSnapshot | null> {
+    private async readActualVolumeReadbackFromDevice(): Promise<
+        | {
+            percent: number;
+            raw: number;
+            source: "miot" | "mina";
+            deviceMuted?: boolean;
+        }
+        | null
+    > {
         const { device, miio, mina } = await this.ensureActionContext();
         const muteFeature = device.speakerFeatures.mute;
-        const storedMuteState = await this.getStoredSpeakerMuteState(device).catch(
-            () => ({} as PersistedSpeakerMuteState)
-        );
-        const effectiveStoredMuteState = this.mergePendingSoftMuteState(
-            storedMuteState,
-            this.getPendingVolumeSnapshot()
-        );
 
         if (device.speakerFeatures.volume) {
             const prop = device.speakerFeatures.volume;
@@ -11494,26 +12213,12 @@ class XiaoaiCloudPlugin {
             const results = await miio.miotGetProps(requestProps);
             const value = results[0]?.value;
             if (typeof value === "number") {
-                const pct = normalizeSpeakerVolumePercent(value, prop.min, prop.max);
-                const deviceMuted = muteFeature ? readBoolean(results[1]?.value) : undefined;
-                const softMuteState =
-                    effectiveStoredMuteState.mode === "soft-volume"
-                        ? await this.resolveSoftVolumeObservedState(
-                            device,
-                            effectiveStoredMuteState,
-                            pct,
-                            deviceMuted
-                        )
-                        : null;
-                return this.buildObservedVolumeSnapshot(
-                    device,
-                    effectiveStoredMuteState,
-                    pct,
-                    value,
-                    "miot",
-                    deviceMuted,
-                    softMuteState
-                );
+                return {
+                    percent: normalizeSpeakerVolumePercent(value, prop.min, prop.max),
+                    raw: value,
+                    source: "miot",
+                    deviceMuted: muteFeature ? readBoolean(results[1]?.value) : undefined,
+                };
             }
         }
 
@@ -11524,41 +12229,98 @@ class XiaoaiCloudPlugin {
                 ? readJsonObject<Record<string, any>>(info, "小爱播放状态 info")
                 : info;
         const volume = payload?.volume;
-        if (typeof volume === "number") {
-            const pct = clamp(Math.round(volume), 0, 100);
-            let deviceMuted: boolean | undefined;
-            if (muteFeature) {
-                const muteResult = await miio
-                    .miotGetProps([
-                        {
-                            did: device.miDid,
-                            siid: muteFeature.siid,
-                            piid: muteFeature.piid,
-                        },
-                    ])
-                    .catch(() => undefined);
-                deviceMuted = readBoolean(muteResult?.[0]?.value);
-            }
-            const softMuteState =
-                effectiveStoredMuteState.mode === "soft-volume"
-                    ? await this.resolveSoftVolumeObservedState(
-                        device,
-                        effectiveStoredMuteState,
-                        pct,
-                        deviceMuted
-                    )
-                    : null;
-            return this.buildObservedVolumeSnapshot(
-                device,
-                effectiveStoredMuteState,
-                pct,
-                volume,
-                "mina",
-                deviceMuted,
-                softMuteState
-            );
+        if (typeof volume !== "number") {
+            return null;
         }
-        return null;
+
+        let deviceMuted: boolean | undefined;
+        if (muteFeature) {
+            const muteResult = await miio
+                .miotGetProps([
+                    {
+                        did: device.miDid,
+                        siid: muteFeature.siid,
+                        piid: muteFeature.piid,
+                    },
+                ])
+                .catch(() => undefined);
+            deviceMuted = readBoolean(muteResult?.[0]?.value);
+        }
+
+        return {
+            percent: clamp(Math.round(volume), 0, 100),
+            raw: volume,
+            source: "mina",
+            deviceMuted,
+        };
+    }
+
+    private async waitForActualSpeakerVolumeAtMost(
+        maxPercent = SOFT_VOLUME_MUTE_READBACK_MAX_PERCENT
+    ) {
+        let lastSnapshot:
+            | {
+                percent: number;
+                raw: number;
+                source: "miot" | "mina";
+                deviceMuted?: boolean;
+            }
+            | null = null;
+        for (const delayMs of [0, ...SPEAKER_MUTE_READBACK_VERIFY_DELAYS_MS]) {
+            if (delayMs > 0) {
+                await sleep(delayMs);
+            }
+            const snapshot = await this.readActualVolumeReadbackFromDevice().catch(
+                () => null
+            );
+            if (!snapshot) {
+                continue;
+            }
+            lastSnapshot = snapshot;
+            if (snapshot.percent <= maxPercent) {
+                return {
+                    ok: true,
+                    snapshot,
+                };
+            }
+        }
+        return {
+            ok: false,
+            snapshot: lastSnapshot,
+        };
+    }
+
+    private async readVolumeSnapshotFromDevice(): Promise<VolumeSnapshot | null> {
+        const { device, miio, mina } = await this.ensureActionContext();
+        const storedMuteState = await this.getStoredSpeakerMuteState(device).catch(
+            () => ({} as PersistedSpeakerMuteState)
+        );
+        const effectiveStoredMuteState = this.mergePendingSoftMuteState(
+            storedMuteState,
+            this.getPendingVolumeSnapshot()
+        );
+        const actual = await this.readActualVolumeReadbackFromDevice();
+        if (!actual) {
+            return null;
+        }
+        const softMuteState =
+            effectiveStoredMuteState.mode === "soft-volume"
+                ? await this.resolveSoftVolumeObservedState(
+                    device,
+                    effectiveStoredMuteState,
+                    actual.percent,
+                    actual.deviceMuted
+                )
+                : null;
+        return this.buildObservedVolumeSnapshot(
+            device,
+            effectiveStoredMuteState,
+            actual.percent,
+            actual.raw,
+            actual.source,
+            actual.deviceMuted,
+            softMuteState
+        );
     }
 
     private clearPendingVolume(sequence?: number) {
@@ -13865,6 +14627,93 @@ class XiaoaiCloudPlugin {
         });
 
         this.api.registerTool({
+            name: "xiaoai_run_calibration",
+            description:
+                "运行小爱插件的延迟校准。mode=audio 为音频时序校准；mode=conversation 为对话拦截校准，会发送无副作用测试问句，测试期间音箱可能真实出声。",
+            parameters: schemaObject({
+                mode: schemaString({
+                    description: "校准类型。audio=音频时序校准；conversation=对话拦截校准。",
+                    enum: ["audio", "conversation"],
+                }),
+            }),
+            execute: async (_id: string, params: { mode: string }) => {
+                const mode = params.mode === "conversation" ? "conversation" : "audio";
+                const label =
+                    mode === "conversation" ? "对话拦截校准" : "音频时序校准";
+                try {
+                    if (mode === "conversation") {
+                        if (this.conversationInterceptCalibrationRunning) {
+                            return {
+                                content: [{
+                                    type: "text",
+                                    text: "[SYSTEM]对话拦截校准正在进行中，请稍后再试。",
+                                }],
+                            };
+                        }
+                        const calibration = await this.runConversationInterceptCalibration();
+                        const successCount = readNumber(calibration.successCount) || 0;
+                        const rounds = readNumber(calibration.rounds) || 0;
+                        const pollIntervalMs = readNumber(calibration.pollIntervalMs);
+                        const recommendedPollIntervalMs = readNumber(
+                            calibration.recommendedPollIntervalMs
+                        );
+                        return {
+                            content: [{
+                                type: "text",
+                                text:
+                                    `[SYSTEM]${label}完成。\n` +
+                                    `成功轮次: ${successCount}/${rounds || successCount}\n` +
+                                    (typeof pollIntervalMs === "number"
+                                        ? `当前轮询间隔: ${pollIntervalMs}ms\n`
+                                        : "") +
+                                    (typeof recommendedPollIntervalMs === "number"
+                                        ? `建议轮询间隔: ${recommendedPollIntervalMs}ms\n`
+                                        : "") +
+                                    (calibration.lastError
+                                        ? `最后错误: ${calibration.lastError}`
+                                        : "没有新的异常。"),
+                            }],
+                        };
+                    }
+
+                    if (this.audioCalibrationRunning) {
+                        return {
+                            content: [{
+                                type: "text",
+                                text: "[SYSTEM]音频时序校准正在进行中，请稍后再试。",
+                            }],
+                        };
+                    }
+                    const calibration = await this.runSpeakerAudioCalibration();
+                    const successCount = readNumber(calibration.successCount) || 0;
+                    const rounds = readNumber(calibration.rounds) || 0;
+                    const tailPaddingMs = readNumber(calibration.tailPaddingMs);
+                    return {
+                        content: [{
+                            type: "text",
+                            text:
+                                `[SYSTEM]${label}完成。\n` +
+                                `成功轮次: ${successCount}/${rounds || successCount}\n` +
+                                (typeof tailPaddingMs === "number"
+                                    ? `当前空余延迟: ${tailPaddingMs}ms\n`
+                                    : "") +
+                                (calibration.lastError
+                                    ? `最后错误: ${calibration.lastError}`
+                                    : "没有新的异常。"),
+                        }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `[SYSTEM]${label}失败: ${this.errorMessage(error)}`,
+                        }],
+                    };
+                }
+            },
+        });
+
+        this.api.registerTool({
             name: "xiaoai_set_dialog_window",
             description: "设置唤醒模式下的免唤醒对话窗口时长（秒）。",
             parameters: schemaObject({
@@ -13913,6 +14762,10 @@ class XiaoaiCloudPlugin {
                     dialogWindowSeconds: schemaNumber({
                         description: "唤醒模式下的免唤醒对话窗口时长，单位秒。",
                     }),
+                    pollIntervalMs: schemaNumber({
+                        description:
+                            "会话轮询间隔，单位毫秒。数值越小越积极，越大越省请求；控制台的对话拦截校准也会自动调整它。",
+                    }),
                     debugLogEnabled: schemaBoolean({
                         description: "是否开启小米网络调试日志。",
                     }),
@@ -13954,6 +14807,7 @@ class XiaoaiCloudPlugin {
                     thinkingEnabled?: boolean;
                     forceNonStreamingEnabled?: boolean;
                     dialogWindowSeconds?: number;
+                    pollIntervalMs?: number;
                     debugLogEnabled?: boolean;
                     voiceContextTurns?: number;
                     voiceContextChars?: number;
@@ -13998,6 +14852,11 @@ class XiaoaiCloudPlugin {
                         params.dialogWindowSeconds
                     );
                     summary.push(`对话窗口 ${result.seconds} 秒`);
+                }
+
+                if (typeof params.pollIntervalMs === "number") {
+                    const result = await this.updatePollIntervalMs(params.pollIntervalMs);
+                    summary.push(`轮询间隔 ${result.pollIntervalMs} ms`);
                 }
 
                 if (typeof params.audioTailPaddingMs === "number") {
@@ -14118,7 +14977,7 @@ class XiaoaiCloudPlugin {
                         content: [{
                             type: "text",
                             text:
-                                "[SYSTEM]没有收到可修改的高级设置。可用字段包括 channel、target、disableNotification、model、audioTailPaddingMs、thinkingEnabled、forceNonStreamingEnabled、dialogWindowSeconds、debugLogEnabled、voiceContextTurns、voiceContextChars、voiceSystemPrompt、workspaceFile、workspaceFileContent、disableWorkspaceFile、transitionPhrasesText。",
+                                "[SYSTEM]没有收到可修改的高级设置。可用字段包括 channel、target、disableNotification、model、audioTailPaddingMs、thinkingEnabled、forceNonStreamingEnabled、dialogWindowSeconds、pollIntervalMs、debugLogEnabled、voiceContextTurns、voiceContextChars、voiceSystemPrompt、workspaceFile、workspaceFileContent、disableWorkspaceFile、transitionPhrasesText。",
                         }],
                     };
                 }

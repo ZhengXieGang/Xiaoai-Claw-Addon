@@ -53,6 +53,7 @@ https://github.com/ZhengXieGang/Xiaoai-Claw-Addon
 - 专属 `xiaoai` agent 已创建
 - `xiaoai` agent 没有抢占现有默认 agent 或已有渠道入口
 - 插件通知渠道与目标已经正确推断；如果无法唯一推断，请明确提示我去控制台或通过对话手动设置
+- 如果设备已经就绪，再调用 `xiaoai_run_calibration` 自动跑一遍校准；默认先用 `mode=audio`。如果还要跑 `mode=conversation`，先明确告诉我测试期间音箱可能真实出声，不要把静音能力当成前置条件；如果设备暂时还没就绪，就在我登录并选好音箱后补跑
 - 最后调用 `xiaoai_console_open`，把控制台链接发给我
 
 如果你已经尽力自动修复，仍然无法安装，请：

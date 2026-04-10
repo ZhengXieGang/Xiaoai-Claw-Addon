@@ -35,6 +35,7 @@ const REQUIRED_XIAOAI_TOOLS = [
     "xiaoai_login_begin",
     "xiaoai_login_status",
     "xiaoai_console_open",
+    "xiaoai_run_calibration",
     "xiaoai_set_dialog_window",
     "xiaoai_update_settings",
 ];

@@ -717,17 +717,40 @@ ${renderSharedHead("XiaoAI Cloud Console", assetBasePath)}
                 </div>
               </section>
 
-              <section class="surface control-card control-card-audio-calibration">
-                <div class="card-head wake-action-head">
+              <section class="surface control-card control-card-calibration">
+                <div class="card-head wake-action-head calibration-card-head">
                   <div class="card-copy">
-                    <span class="micro-label">音频时序校准</span>
-                    <div class="card-meta">用静音样本跑几轮播放与停止，更新当前音箱的音频检测和收敛估计；不会发出实际声音。下方空余延迟数值可直接修改。</div>
+                    <span class="micro-label">延迟校准</span>
+                    <div class="card-meta" id="calibrationDescription">轮询间隔和空余延迟可修改，校准时不要和音箱说话。</div>
                   </div>
-                  <button class="soft-btn compact-btn" id="audioCalibrationBtn" type="button">开始静音校准</button>
+                  <div class="route-card-actions calibration-card-actions">
+                    <div class="picker-root calibration-mode-picker" id="calibrationModePicker">
+                      <select
+                        id="calibrationModeSelect"
+                        class="picker-native"
+                      >
+                        <option value="audio">音频时序校准</option>
+                        <option value="conversation">对话拦截校准</option>
+                      </select>
+                      <button
+                        class="picker-trigger"
+                        id="calibrationModePickerTrigger"
+                        type="button"
+                        aria-haspopup="listbox"
+                        aria-expanded="false"
+                        aria-controls="calibrationModePickerPanel"
+                      >
+                        <span class="picker-trigger-text" id="calibrationModePickerText">音频时序校准</span>
+                        <span class="picker-chevron" aria-hidden="true"></span>
+                      </button>
+                      <div class="picker-panel" id="calibrationModePickerPanel" role="listbox" hidden></div>
+                    </div>
+                    <button class="soft-btn compact-btn" id="calibrationRunBtn" type="button">一键校准</button>
+                  </div>
                 </div>
 
-                <div class="control-metric-grid audio-calibration-grid" id="audioCalibrationMetrics"></div>
-                <div class="card-meta card-meta-break" id="audioCalibrationDetail">当前还没有静音校准结果。</div>
+                <div class="control-metric-grid calibration-metrics-grid" id="calibrationMetrics"></div>
+                <div class="card-meta card-meta-break" id="calibrationDetail">当前还没有校准结果。</div>
               </section>
 
               <section class="surface control-card control-card-remote-wake">

@@ -23,8 +23,14 @@ export interface PersistedCloudProfile {
     voiceContextMaxTurns?: number;
     voiceContextMaxChars?: number;
     audioTailPaddingMs?: number;
+    conversationPollIntervalMs?: number;
     speakerAudioLatencyProfiles?: Record<string, PersistedSpeakerAudioLatencyProfile>;
     lastAudioCalibration?: PersistedAudioCalibrationSummary;
+    conversationInterceptLatencyProfiles?: Record<
+        string,
+        PersistedConversationInterceptLatencyProfile
+    >;
+    lastConversationInterceptCalibration?: PersistedConversationInterceptCalibrationSummary;
     updatedAt?: string;
 }
 
@@ -47,6 +53,28 @@ export interface PersistedAudioCalibrationSummary {
     completedAt?: string;
     lastError?: string;
     latencyProfile?: PersistedSpeakerAudioLatencyProfile;
+}
+
+export interface PersistedConversationInterceptLatencyProfile {
+    conversationVisibleEstimateMs?: number;
+    nativePlaybackStartEstimateMs?: number;
+    interceptLeadEstimateMs?: number;
+    updatedAtMs?: number;
+}
+
+export interface PersistedConversationInterceptCalibrationSummary {
+    deviceId?: string;
+    deviceName?: string;
+    rounds?: number;
+    successCount?: number;
+    failureCount?: number;
+    fallbackRounds?: number;
+    pollIntervalMs?: number;
+    recommendedPollIntervalMs?: number;
+    startedAt?: string;
+    completedAt?: string;
+    lastError?: string;
+    latencyProfile?: PersistedConversationInterceptLatencyProfile;
 }
 
 export interface ConsoleEventEntry {

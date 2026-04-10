@@ -73,7 +73,7 @@
       },
       "pollIntervalMs": {
         "type": "integer",
-        "description": "会话轮询间隔毫秒，默认 1000；活跃对话阶段会自动临时提速到更快的轮询节奏。"
+        "description": "会话轮询间隔毫秒，默认 320；活跃对话阶段会自动临时提速到更快的轮询节奏，也可以在控制台里通过“对话拦截校准”自动收紧。"
       },
       "authListenHost": {
         "type": "string",

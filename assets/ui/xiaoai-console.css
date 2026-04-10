@@ -3757,6 +3757,10 @@ body[data-page="console"] .console-shell-tabs {
   align-items: flex-start;
 }
 
+.calibration-card-head {
+  gap: 18px;
+}
+
 .route-card-head {
   align-items: flex-start;
   gap: 18px;
@@ -3772,6 +3776,14 @@ body[data-page="console"] .console-shell-tabs {
 
 .route-card-actions .soft-btn {
   flex: 0 0 auto;
+}
+
+.calibration-card-actions {
+  align-self: flex-start;
+}
+
+.calibration-card-actions .picker-root {
+  min-width: 184px;
 }
 
 .route-field-grid {
@@ -6147,6 +6159,16 @@ body[data-page="portal-embedded"] .portal-simple-head h1 {
     flex: 0 0 auto;
   }
 
+  .calibration-card-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .calibration-card-actions .picker-root {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
   .toggle-card-head {
     align-items: stretch;
     flex-direction: column;
@@ -6647,23 +6669,37 @@ body[data-page="portal-embedded"] .portal-simple-head h1 {
 
 .control-stack {
   --control-stack-gap: 12px;
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
   width: min(calc(100% - 12px), var(--console-desktop-width));
   max-width: var(--console-desktop-width);
   margin-inline: auto;
-  column-gap: var(--control-stack-gap);
-  column-fill: balance;
+  gap: var(--control-stack-gap);
+}
+
+.control-stack > .control-column {
+  display: grid;
+  align-content: start;
+  gap: var(--control-stack-gap);
+  min-width: 0;
+}
+
+.control-stack > .control-column[hidden] {
+  display: none !important;
 }
 
 body[data-page="console"] .control-card-model,
 body[data-page="console"] .control-card-route,
-body[data-page="console"] .control-card-workspace {
+body[data-page="console"] .control-card-workspace,
+body[data-page="console"] .control-card-calibration {
   overflow: visible;
 }
 
 body[data-page="console"] .control-card-model:has(.picker-root[data-picker-open="true"]),
 body[data-page="console"] .control-card-route:has(.picker-root[data-picker-open="true"]),
-body[data-page="console"] .control-card-workspace:has(.picker-root[data-picker-open="true"]) {
+body[data-page="console"] .control-card-workspace:has(.picker-root[data-picker-open="true"]),
+body[data-page="console"] .control-card-calibration:has(.picker-root[data-picker-open="true"]) {
   z-index: 24;
 }
 
@@ -6671,10 +6707,10 @@ body[data-page="console"] .control-card {
   animation: none !important;
   display: grid;
   width: 100%;
-  margin: 0 0 var(--control-stack-gap);
-  break-inside: avoid;
-  page-break-inside: avoid;
-  -webkit-column-break-inside: avoid;
+  margin: 0;
+  align-self: start;
+  align-content: start;
+  min-width: 0;
 }
 
 body[data-page="console"] .control-card .soft-btn,
@@ -6779,25 +6815,21 @@ button.mode-btn {
 
 @media (min-width: 961px) {
   .control-stack {
-    column-count: 2;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .control-stack > .control-column {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .control-card {
-    width: 100%;
     height: auto;
-    align-self: start;
-    align-content: start;
-    min-width: 0;
   }
 }
 
 @media (max-width: 960px) {
   .control-stack {
-    column-count: 1;
-  }
-
-  .control-card {
-    margin-bottom: var(--control-stack-gap);
+    grid-template-columns: 1fr;
   }
 
   .control-metric-grid {

@@ -5,6 +5,9 @@ const TAB_ORDER = ["overview", "chat", "control", "events"];
 const DEFAULT_DIALOG_WINDOW_SECONDS = 30;
 const MIN_DIALOG_WINDOW_SECONDS = 5;
 const MAX_DIALOG_WINDOW_SECONDS = 300;
+const DEFAULT_CONVERSATION_POLL_INTERVAL_MS = 320;
+const MIN_CONVERSATION_POLL_INTERVAL_MS = 250;
+const MAX_CONVERSATION_POLL_INTERVAL_MS = 10000;
 const DEFAULT_AUDIO_TAIL_PADDING_MS = 1500;
 const MAX_AUDIO_TAIL_PADDING_MS = 10000;
 const DEFAULT_VOICE_CONTEXT_TURNS = 6;
@@ -266,6 +269,11 @@ function initConsolePage() {
     thinking: new URL("./api/openclaw/thinking", window.location.href),
     nonStreaming: new URL("./api/openclaw/non-streaming", window.location.href),
     audioCalibration: new URL("./api/device/audio-calibration", window.location.href),
+    conversationInterceptCalibration: new URL(
+      "./api/device/conversation-intercept-calibration",
+      window.location.href
+    ),
+    pollInterval: new URL("./api/device/poll-interval", window.location.href),
     audioTailPadding: new URL("./api/device/audio-tail-padding", window.location.href),
     openclawModel: new URL("./api/openclaw/model", window.location.href),
     openclawRoute: new URL("./api/openclaw/route", window.location.href),
@@ -339,6 +347,13 @@ function initConsolePage() {
     forceNonStreamingEnabled: false,
     forceNonStreamingSaving: false,
     audioCalibrationRunning: false,
+    conversationInterceptCalibrationRunning: false,
+    selectedCalibrationMode: "audio",
+    currentPollIntervalMs: DEFAULT_CONVERSATION_POLL_INTERVAL_MS,
+    confirmedPollIntervalMs: DEFAULT_CONVERSATION_POLL_INTERVAL_MS,
+    pollIntervalEditing: false,
+    pollIntervalDirty: false,
+    pollIntervalSaving: false,
     currentAudioTailPaddingMs: DEFAULT_AUDIO_TAIL_PADDING_MS,
     confirmedAudioTailPaddingMs: DEFAULT_AUDIO_TAIL_PADDING_MS,
     audioTailPaddingEditing: false,
@@ -430,9 +445,20 @@ function initConsolePage() {
     thinkingOffLabel: byId("thinkingOffLabel"),
     forceNonStreamingToggle: byId("forceNonStreamingToggle"),
     forceNonStreamingLabel: byId("forceNonStreamingLabel"),
-    audioCalibrationBtn: byId("audioCalibrationBtn"),
-    audioCalibrationMetrics: byId("audioCalibrationMetrics"),
-    audioCalibrationDetail: byId("audioCalibrationDetail"),
+    calibrationModeSelect: byId("calibrationModeSelect"),
+    calibrationModePicker: byId("calibrationModePicker"),
+    calibrationModePickerTrigger: byId("calibrationModePickerTrigger"),
+    calibrationModePickerText: byId("calibrationModePickerText"),
+    calibrationModePickerPanel: byId("calibrationModePickerPanel"),
+    calibrationRunBtn: byId("calibrationRunBtn"),
+    calibrationMetrics: byId("calibrationMetrics"),
+    calibrationDetail: byId("calibrationDetail"),
+    calibrationDescription: byId("calibrationDescription"),
+    pollIntervalValue: byId("pollIntervalValue"),
+    pollIntervalNote: byId("pollIntervalNote"),
+    conversationVisibleValue: byId("conversationVisibleValue"),
+    nativePlaybackStartValue: byId("nativePlaybackStartValue"),
+    interceptLeadValue: byId("interceptLeadValue"),
     audioTailPaddingValue: byId("audioTailPaddingValue"),
     audioTailPaddingNote: byId("audioTailPaddingNote"),
     audioCalibrationPlaybackDetectValue: byId("audioCalibrationPlaybackDetectValue"),
@@ -499,7 +525,7 @@ function initConsolePage() {
     "control-card-dialog-window",
     "control-card-transition",
     "control-card-non-streaming",
-    "control-card-audio-calibration",
+    "control-card-calibration",
     "control-card-remote-wake",
   ];
 
@@ -528,9 +554,21 @@ function initConsolePage() {
       panel: els.workspaceFilePickerPanel,
       emptyText: "当前没有可编辑文件",
     },
+    {
+      select: els.calibrationModeSelect,
+      root: els.calibrationModePicker,
+      trigger: els.calibrationModePickerTrigger,
+      text: els.calibrationModePickerText,
+      panel: els.calibrationModePickerPanel,
+      emptyText: "请选择校准模式",
+    },
   ];
 
   let activePickerRoot = null;
+  let controlMasonryFrame = 0;
+  let controlMasonryForceReassign = false;
+  let controlLayoutMode = "single";
+  const controlCardAssignments = new WeakMap();
 
   function restoreControlScrollTop(scrollTop) {
     if (!els.controlScreenScroll || !Number.isFinite(scrollTop)) {
@@ -539,9 +577,160 @@ function initConsolePage() {
     els.controlScreenScroll.scrollTop = Math.max(0, scrollTop);
   }
 
-  function scheduleControlMasonryLayout() {}
+  function getOrderedControlCards() {
+    if (!els.controlStack) {
+      return [];
+    }
+    return Array.from(els.controlStack.querySelectorAll(".control-card")).sort(
+      (left, right) => {
+        const leftOrder = Number(left.dataset.controlOrder || "0");
+        const rightOrder = Number(right.dataset.controlOrder || "0");
+        return leftOrder - rightOrder;
+      }
+    );
+  }
 
-  function initControlMasonry() {}
+  function ensureControlColumns() {
+    if (!els.controlStack) {
+      return [];
+    }
+    if (els.controlColumns.length >= 2) {
+      return els.controlColumns;
+    }
+    const columns = [0, 1].map((index) => {
+      const column = document.createElement("div");
+      column.className = "control-column";
+      column.dataset.controlColumn = String(index);
+      return column;
+    });
+    columns.forEach((column) => {
+      els.controlStack.appendChild(column);
+    });
+    els.controlColumns = columns;
+    return columns;
+  }
+
+  function assignControlCardsToColumns(cards) {
+    const gap = 12;
+    const heights = [0, 0];
+    cards.forEach((card) => {
+      const height = Math.ceil(
+        card.getBoundingClientRect().height || card.offsetHeight || 0
+      );
+      const targetIndex = heights[0] <= heights[1] ? 0 : 1;
+      controlCardAssignments.set(card, targetIndex);
+      heights[targetIndex] += height + gap;
+    });
+  }
+
+  function applyControlMasonryLayout(forceReassign) {
+    if (!els.controlStack) {
+      return;
+    }
+    const columns = ensureControlColumns();
+    if (columns.length < 2) {
+      return;
+    }
+    const cards = getOrderedControlCards();
+    const desktop = window.innerWidth >= CONTROL_MASONRY_BREAKPOINT_PX;
+
+    if (!desktop) {
+      columns[0].hidden = false;
+      columns[1].hidden = true;
+      cards.forEach((card) => {
+        columns[0].appendChild(card);
+      });
+      controlLayoutMode = "single";
+      return;
+    }
+
+    columns[0].hidden = false;
+    columns[1].hidden = false;
+    const needsReassign =
+      forceReassign ||
+      controlLayoutMode !== "double" ||
+      cards.some((card) => typeof controlCardAssignments.get(card) !== "number");
+    if (needsReassign) {
+      assignControlCardsToColumns(cards);
+    }
+    cards.forEach((card) => {
+      const targetIndex = controlCardAssignments.get(card) === 1 ? 1 : 0;
+      columns[targetIndex].appendChild(card);
+    });
+    controlLayoutMode = "double";
+  }
+
+  function scheduleControlMasonryLayout(forceReassign) {
+    controlMasonryForceReassign =
+      controlMasonryForceReassign || Boolean(forceReassign);
+    if (controlMasonryFrame) {
+      return;
+    }
+    controlMasonryFrame = window.requestAnimationFrame(() => {
+      controlMasonryFrame = 0;
+      const shouldReassign = controlMasonryForceReassign;
+      controlMasonryForceReassign = false;
+      applyControlMasonryLayout(shouldReassign);
+    });
+  }
+
+  function initControlMasonry() {
+    getOrderedControlCards().forEach((card, index) => {
+      if (!card.dataset.controlOrder) {
+        card.dataset.controlOrder = String(index);
+      }
+    });
+    ensureControlColumns();
+    scheduleControlMasonryLayout(true);
+  }
+
+  function getSelectedCalibrationMode() {
+    return state.selectedCalibrationMode === "conversation"
+      ? "conversation"
+      : "audio";
+  }
+
+  function syncCalibrationModePicker() {
+    if (!els.calibrationModeSelect) {
+      return;
+    }
+    const mode = getSelectedCalibrationMode();
+    if (els.calibrationModeSelect.value !== mode) {
+      els.calibrationModeSelect.value = mode;
+    }
+    const config = selectPickerConfigs.find(
+      (item) => item.select === els.calibrationModeSelect
+    );
+    if (config) {
+      syncSelectPicker(config);
+    }
+  }
+
+  function syncCalibrationModeAvailability(forceDisabled) {
+    if (!els.calibrationModeSelect) {
+      return;
+    }
+    els.calibrationModeSelect.disabled =
+      Boolean(forceDisabled) ||
+      state.audioCalibrationRunning ||
+      state.conversationInterceptCalibrationRunning ||
+      state.audioTailPaddingSaving ||
+      state.pollIntervalSaving;
+    syncCalibrationModePicker();
+  }
+
+  function resetCalibrationMetricRefs() {
+    els.pollIntervalValue = null;
+    els.pollIntervalNote = null;
+    els.conversationVisibleValue = null;
+    els.nativePlaybackStartValue = null;
+    els.interceptLeadValue = null;
+    els.audioTailPaddingValue = null;
+    els.audioTailPaddingNote = null;
+    els.audioCalibrationPlaybackDetectValue = null;
+    els.audioCalibrationStopSettleValue = null;
+    els.audioCalibrationStatusProbeValue = null;
+  }
 
   function setPickerOpen(root, open) {
     if (!root) {
@@ -2493,6 +2682,10 @@ function initConsolePage() {
     });
   }
 
+  function sanitizePollIntervalText(value) {
+    return normalizeIntegerText(value, MAX_CONVERSATION_POLL_INTERVAL_MS);
+  }
+
   function syncVolumeMetricText(value, options) {
     if (!els.statVolume) {
       return;
@@ -2525,6 +2718,20 @@ function initConsolePage() {
     }
   }
 
+  function syncPollIntervalMetricText(value, options) {
+    if (!els.pollIntervalValue) {
+      return;
+    }
+    const text = String(value == null ? "" : value);
+    const force = Boolean(options && options.force);
+    if (!force && state.pollIntervalEditing && document.activeElement === els.pollIntervalValue) {
+      return;
+    }
+    if (els.pollIntervalValue.textContent !== text) {
+      els.pollIntervalValue.textContent = text;
+    }
+  }
+
   function updateVolumeDisplay(value, options) {
     const safe = clamp(Number(value) || 0, 0, 100);
     state.currentVolumeValue = safe;
@@ -2549,6 +2756,22 @@ function initConsolePage() {
       state.confirmedAudioTailPaddingMs = safe;
     }
     syncAudioTailPaddingMetricText(safe, {
+      force: Boolean(options && options.forceText),
+    });
+    return safe;
+  }
+
+  function updatePollIntervalDisplay(value, options) {
+    const safe = clamp(
+      Math.round(Number(value) || 0),
+      MIN_CONVERSATION_POLL_INTERVAL_MS,
+      MAX_CONVERSATION_POLL_INTERVAL_MS
+    );
+    state.currentPollIntervalMs = safe;
+    if (!state.pollIntervalEditing || Boolean(options && options.forceText)) {
+      state.confirmedPollIntervalMs = safe;
+    }
+    syncPollIntervalMetricText(safe, {
       force: Boolean(options && options.forceText),
     });
     return safe;
@@ -3180,6 +3403,279 @@ function initConsolePage() {
     scheduleControlMasonryLayout();
   }
 
+  function syncPollIntervalAvailability(disabled) {
+    if (!els.pollIntervalValue) {
+      return;
+    }
+    const effectiveDisabled =
+      Boolean(disabled) ||
+      state.conversationInterceptCalibrationRunning ||
+      state.pollIntervalSaving;
+    els.pollIntervalValue.setAttribute(
+      "contenteditable",
+      effectiveDisabled ? "false" : "plaintext-only"
+    );
+    els.pollIntervalValue.setAttribute("aria-disabled", String(effectiveDisabled));
+    els.pollIntervalValue.tabIndex = effectiveDisabled ? -1 : 0;
+    els.pollIntervalValue.classList.toggle("is-disabled", effectiveDisabled);
+  }
+
+  function bindPollIntervalEditor() {
+    if (!els.pollIntervalValue || els.pollIntervalValue.dataset.bound === "true") {
+      return;
+    }
+    els.pollIntervalValue.dataset.bound = "true";
+    els.pollIntervalValue.addEventListener("focus", () => {
+      state.pollIntervalEditing = true;
+      state.pollIntervalDirty = false;
+      syncPollIntervalMetricText(state.currentPollIntervalMs, { force: true });
+      window.requestAnimationFrame(() => {
+        if (!els.pollIntervalValue || document.activeElement !== els.pollIntervalValue) {
+          return;
+        }
+        const selection = window.getSelection();
+        if (!selection) {
+          return;
+        }
+        const range = document.createRange();
+        range.selectNodeContents(els.pollIntervalValue);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      });
+    });
+    els.pollIntervalValue.addEventListener("input", () => {
+      const raw = sanitizePollIntervalText(els.pollIntervalValue.textContent);
+      if ((els.pollIntervalValue.textContent || "") !== raw) {
+        els.pollIntervalValue.textContent = raw;
+      }
+      state.pollIntervalDirty = true;
+      if (!raw) {
+        return;
+      }
+      state.currentPollIntervalMs = clamp(
+        Math.round(Number(raw) || DEFAULT_CONVERSATION_POLL_INTERVAL_MS),
+        MIN_CONVERSATION_POLL_INTERVAL_MS,
+        MAX_CONVERSATION_POLL_INTERVAL_MS
+      );
+    });
+    els.pollIntervalValue.addEventListener("blur", () => {
+      state.pollIntervalEditing = false;
+      const raw = sanitizePollIntervalText(els.pollIntervalValue.textContent);
+      if (!raw) {
+        state.pollIntervalDirty = false;
+        updatePollIntervalDisplay(state.confirmedPollIntervalMs, {
+          forceText: true,
+        });
+        renderConversationInterceptCalibrationControl(
+          (state.bootstrap && state.bootstrap.conversationInterceptCalibration) || {}
+        );
+        return;
+      }
+      state.currentPollIntervalMs = clamp(
+        Math.round(Number(raw) || DEFAULT_CONVERSATION_POLL_INTERVAL_MS),
+        MIN_CONVERSATION_POLL_INTERVAL_MS,
+        MAX_CONVERSATION_POLL_INTERVAL_MS
+      );
+      syncPollIntervalMetricText(state.currentPollIntervalMs, { force: true });
+      if (state.pollIntervalDirty) {
+        void applyPollInterval();
+      } else {
+        renderConversationInterceptCalibrationControl(
+          (state.bootstrap && state.bootstrap.conversationInterceptCalibration) || {}
+        );
+      }
+    });
+    els.pollIntervalValue.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        els.pollIntervalValue.blur();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        state.pollIntervalEditing = false;
+        state.pollIntervalDirty = false;
+        updatePollIntervalDisplay(state.confirmedPollIntervalMs, {
+          forceText: true,
+        });
+        els.pollIntervalValue.blur();
+      }
+    });
+  }
+
+  function ensureConversationInterceptCalibrationMetricsShell() {
+    if (!els.calibrationMetrics) {
+      return;
+    }
+    if (els.calibrationMetrics.dataset.mode === "conversation") {
+      return;
+    }
+    resetCalibrationMetricRefs();
+    els.calibrationMetrics.innerHTML = `
+      <div class="control-metric control-metric-editable">
+        <span class="control-metric-label">轮询间隔</span>
+        <strong class="control-metric-value control-metric-value-editable">
+          <span
+            class="control-metric-inline-edit"
+            id="pollIntervalValue"
+            role="spinbutton"
+            tabindex="0"
+            spellcheck="false"
+            aria-label="对话轮询间隔，单位毫秒"
+            aria-valuemin="${escapeHtml(String(MIN_CONVERSATION_POLL_INTERVAL_MS))}"
+            aria-valuemax="${escapeHtml(String(MAX_CONVERSATION_POLL_INTERVAL_MS))}"
+          ></span>
+          <span class="control-metric-unit">ms</span>
+        </strong>
+        <span class="control-metric-note" id="pollIntervalNote">拦截主轮询节奏，回车或失焦保存</span>
+      </div>
+      <div class="control-metric">
+        <span class="control-metric-label">会话回写</span>
+        <strong class="control-metric-value" id="conversationVisibleValue">-</strong>
+        <span class="control-metric-note">测试问句出现在云端记录</span>
+      </div>
+      <div class="control-metric">
+        <span class="control-metric-label">原生起播</span>
+        <strong class="control-metric-value" id="nativePlaybackStartValue">-</strong>
+        <span class="control-metric-note">小爱原生回复开始播放</span>
+      </div>
+      <div class="control-metric">
+        <span class="control-metric-label">拦截提前量</span>
+        <strong class="control-metric-value" id="interceptLeadValue">-</strong>
+        <span class="control-metric-note">看到会话到原生起播之间的余量</span>
+      </div>
+    `;
+    els.calibrationMetrics.dataset.mode = "conversation";
+    els.pollIntervalValue = byId("pollIntervalValue");
+    els.pollIntervalNote = byId("pollIntervalNote");
+    els.conversationVisibleValue = byId("conversationVisibleValue");
+    els.nativePlaybackStartValue = byId("nativePlaybackStartValue");
+    els.interceptLeadValue = byId("interceptLeadValue");
+    bindPollIntervalEditor();
+  }
+
+  function renderConversationInterceptCalibrationControl(calibration) {
+    ensureConversationInterceptCalibrationMetricsShell();
+    syncCalibrationModePicker();
+    const nextCalibration =
+      calibration && typeof calibration === "object" ? calibration : {};
+    const currentProfile =
+      nextCalibration.currentProfile &&
+      typeof nextCalibration.currentProfile === "object"
+        ? nextCalibration.currentProfile
+        : null;
+    const lastRun =
+      nextCalibration.lastRun && typeof nextCalibration.lastRun === "object"
+        ? nextCalibration.lastRun
+        : null;
+    const pollIntervalMs = getFiniteNumber(
+      nextCalibration.pollIntervalMs,
+      state.confirmedPollIntervalMs || DEFAULT_CONVERSATION_POLL_INTERVAL_MS
+    );
+    const recommendedPollIntervalMs = getFiniteNumber(
+      nextCalibration.recommendedPollIntervalMs,
+      pollIntervalMs
+    );
+    state.conversationInterceptCalibrationRunning = Boolean(nextCalibration.running);
+    if (!state.pollIntervalEditing || !state.pollIntervalDirty) {
+      updatePollIntervalDisplay(pollIntervalMs, {
+        forceText: !state.pollIntervalEditing,
+      });
+    }
+
+    if (els.calibrationRunBtn) {
+      const anyCalibrationRunning =
+        state.audioCalibrationRunning ||
+        state.conversationInterceptCalibrationRunning;
+      els.calibrationRunBtn.disabled =
+        anyCalibrationRunning || !(state.bootstrap && state.bootstrap.ready);
+      els.calibrationRunBtn.textContent = anyCalibrationRunning
+        ? "校准中"
+        : "一键校准";
+    }
+    if (els.calibrationDescription) {
+      els.calibrationDescription.textContent =
+        "轮询间隔可修改，校准时不要和音箱说话。";
+    }
+    if (els.conversationVisibleValue) {
+      els.conversationVisibleValue.textContent = formatLatencyEstimate(
+        currentProfile && currentProfile.conversationVisibleEstimateMs
+      );
+    }
+    if (els.nativePlaybackStartValue) {
+      els.nativePlaybackStartValue.textContent = formatLatencyEstimate(
+        currentProfile && currentProfile.nativePlaybackStartEstimateMs
+      );
+    }
+    if (els.interceptLeadValue) {
+      els.interceptLeadValue.textContent = formatLatencyEstimate(
+        currentProfile && currentProfile.interceptLeadEstimateMs
+      );
+    }
+    if (els.pollIntervalValue) {
+      els.pollIntervalValue.setAttribute(
+        "aria-valuenow",
+        String(state.currentPollIntervalMs || DEFAULT_CONVERSATION_POLL_INTERVAL_MS)
+      );
+      els.pollIntervalValue.setAttribute("title", "直接修改毫秒值，回车或失焦保存");
+    }
+    if (els.pollIntervalNote) {
+      els.pollIntervalNote.textContent = state.pollIntervalSaving
+        ? "正在保存..."
+        : recommendedPollIntervalMs < pollIntervalMs
+          ? `建议收紧到 ${recommendedPollIntervalMs}ms`
+          : "拦截主轮询节奏，回车或失焦保存";
+    }
+    if (els.calibrationDetail) {
+      const detailParts = [];
+      if (currentProfile && currentProfile.updatedAt) {
+        detailParts.push(`当前画像更新于 ${formatDateTime(currentProfile.updatedAt)}`);
+      }
+      if (lastRun) {
+        const rounds = getFiniteNumber(lastRun.rounds, 0);
+        const successCount = getFiniteNumber(lastRun.successCount, 0);
+        const failureCount = getFiniteNumber(lastRun.failureCount, 0);
+        const fallbackRounds = getFiniteNumber(lastRun.fallbackRounds, 0);
+        const lastPollIntervalMs = getFiniteNumber(
+          lastRun.pollIntervalMs,
+          pollIntervalMs
+        );
+        detailParts.push(
+          `最近一次校准成功 ${successCount}/${rounds || successCount + failureCount || 0} 轮`
+        );
+        if (fallbackRounds > 0) {
+          detailParts.push(`其中 ${fallbackRounds} 轮使用保守估算`);
+        }
+        detailParts.push(`轮询间隔 ${lastPollIntervalMs}ms`);
+        if (
+          getFiniteNumber(lastRun.recommendedPollIntervalMs, lastPollIntervalMs) <
+          lastPollIntervalMs
+        ) {
+          detailParts.push(
+            `建议值 ${getFiniteNumber(
+              lastRun.recommendedPollIntervalMs,
+              lastPollIntervalMs
+            )}ms`
+          );
+        }
+        if (lastRun.completedAt) {
+          detailParts.push(`完成于 ${formatDateTime(lastRun.completedAt)}`);
+        }
+        if (lastRun.lastError) {
+          detailParts.push(`最后错误：${lastRun.lastError}`);
+        }
+      } else {
+        detailParts.push(
+          "校准会发测试问句，期间音箱可能出声。"
+        );
+      }
+      els.calibrationDetail.textContent = detailParts.join(" · ");
+    }
+    syncPollIntervalAvailability(!(state.bootstrap && state.bootstrap.ready));
+    syncCalibrationModeAvailability(!(state.bootstrap && state.bootstrap.ready));
+    scheduleControlMasonryLayout();
+  }
+
   function syncAudioTailPaddingAvailability(disabled) {
     if (!els.audioTailPaddingValue) {
       return;
@@ -3282,13 +3778,14 @@ function initConsolePage() {
   }
 
   function ensureAudioCalibrationMetricsShell() {
-    if (!els.audioCalibrationMetrics) {
+    if (!els.calibrationMetrics) {
       return;
     }
-    if (els.audioCalibrationMetrics.dataset.ready === "true") {
+    if (els.calibrationMetrics.dataset.mode === "audio") {
       return;
     }
-    els.audioCalibrationMetrics.innerHTML = `
+    resetCalibrationMetricRefs();
+    els.calibrationMetrics.innerHTML = `
       <div class="control-metric control-metric-editable">
         <span class="control-metric-label">空余延迟</span>
         <strong class="control-metric-value control-metric-value-editable">
@@ -3322,7 +3819,7 @@ function initConsolePage() {
         <span class="control-metric-note">状态轮询耗时</span>
       </div>
     `;
-    els.audioCalibrationMetrics.dataset.ready = "true";
+    els.calibrationMetrics.dataset.mode = "audio";
     els.audioTailPaddingValue = byId("audioTailPaddingValue");
     els.audioTailPaddingNote = byId("audioTailPaddingNote");
     els.audioCalibrationPlaybackDetectValue = byId(
@@ -3335,6 +3832,7 @@ function initConsolePage() {
 
   function renderAudioCalibrationControl(calibration) {
     ensureAudioCalibrationMetricsShell();
+    syncCalibrationModePicker();
     const nextCalibration =
       calibration && typeof calibration === "object" ? calibration : {};
     const currentProfile =
@@ -3357,13 +3855,19 @@ function initConsolePage() {
       });
     }
 
-    if (els.audioCalibrationBtn) {
-      els.audioCalibrationBtn.disabled =
+    if (els.calibrationRunBtn) {
+      const anyCalibrationRunning =
         state.audioCalibrationRunning ||
-        !(state.bootstrap && state.bootstrap.ready);
-      els.audioCalibrationBtn.textContent = state.audioCalibrationRunning
+        state.conversationInterceptCalibrationRunning;
+      els.calibrationRunBtn.disabled =
+        anyCalibrationRunning || !(state.bootstrap && state.bootstrap.ready);
+      els.calibrationRunBtn.textContent = anyCalibrationRunning
         ? "校准中"
-        : "开始静音校准";
+        : "一键校准";
+    }
+    if (els.calibrationDescription) {
+      els.calibrationDescription.textContent =
+        "空余延迟可修改，校准时不要和音箱说话。";
     }
 
     if (els.audioCalibrationPlaybackDetectValue) {
@@ -3396,7 +3900,7 @@ function initConsolePage() {
         : "尾部保守留白，回车或失焦保存";
     }
 
-    if (els.audioCalibrationDetail) {
+    if (els.calibrationDetail) {
       const detailParts = [];
       if (currentProfile && currentProfile.updatedAt) {
         detailParts.push(`当前画像更新于 ${formatDateTime(currentProfile.updatedAt)}`);
@@ -3418,10 +3922,23 @@ function initConsolePage() {
       if (!detailParts.length) {
         detailParts.push("可随时运行静音校准，结果会写入当前设备的延迟画像。");
       }
-      els.audioCalibrationDetail.textContent = detailParts.join(" · ");
+      els.calibrationDetail.textContent = detailParts.join(" · ");
     }
     syncAudioTailPaddingAvailability(!(state.bootstrap && state.bootstrap.ready));
+    syncCalibrationModeAvailability(!(state.bootstrap && state.bootstrap.ready));
     scheduleControlMasonryLayout();
+  }
+
+  function renderCalibrationControl() {
+    if (getSelectedCalibrationMode() === "conversation") {
+      renderConversationInterceptCalibrationControl(
+        (state.bootstrap && state.bootstrap.conversationInterceptCalibration) || {}
+      );
+      return;
+    }
+    renderAudioCalibrationControl(
+      (state.bootstrap && state.bootstrap.audioCalibration) || {}
+    );
   }
 
   function renderDebugLogToggle(enabled) {
@@ -3575,9 +4092,14 @@ function initConsolePage() {
     els.modeButtons.forEach((button) => {
       button.disabled = disabled;
     });
-    if (els.audioCalibrationBtn) {
-      els.audioCalibrationBtn.disabled = disabled || state.audioCalibrationRunning;
+    if (els.calibrationRunBtn) {
+      els.calibrationRunBtn.disabled =
+        disabled ||
+        state.audioCalibrationRunning ||
+        state.conversationInterceptCalibrationRunning;
     }
+    syncCalibrationModeAvailability(disabled);
+    syncPollIntervalAvailability(disabled);
     syncAudioTailPaddingAvailability(disabled);
     if (els.statVolume) {
       els.statVolume.setAttribute(
@@ -3639,6 +4161,13 @@ function initConsolePage() {
         : 0;
     const ready = Boolean(data.ready);
     const authenticated = Boolean(data.authenticated || ready);
+    state.audioCalibrationRunning = Boolean(
+      data.audioCalibration && data.audioCalibration.running
+    );
+    state.conversationInterceptCalibrationRunning = Boolean(
+      data.conversationInterceptCalibration &&
+        data.conversationInterceptCalibration.running
+    );
     state.rawSpeakerAudioPlayback = data.audioPlayback || null;
     const speakerAudioPlayback = resolveSpeakerPlayback(
       state.rawSpeakerAudioPlayback,
@@ -3814,7 +4343,7 @@ function initConsolePage() {
           : false
       )
     );
-    renderAudioCalibrationControl(data.audioCalibration);
+    renderCalibrationControl();
     renderDebugLogToggle(data.debugLogEnabled !== false);
     setModeSelection(data.mode || "wake");
     renderSpeakerControlState();
@@ -5161,11 +5690,7 @@ function initConsolePage() {
       return;
     }
     state.audioCalibrationRunning = true;
-    renderAudioCalibrationControl(
-      Object.assign({}, state.bootstrap && state.bootstrap.audioCalibration, {
-        running: true,
-      })
-    );
+    renderCalibrationControl();
     try {
       const payload = await postJson(API.audioCalibration, {});
       showToast(
@@ -5183,9 +5708,87 @@ function initConsolePage() {
       await refreshBootstrap(true);
     } finally {
       state.audioCalibrationRunning = false;
-      renderAudioCalibrationControl(
-        (state.bootstrap && state.bootstrap.audioCalibration) || {}
+      renderCalibrationControl();
+    }
+  }
+
+  async function applyConversationInterceptCalibration() {
+    if (state.conversationInterceptCalibrationRunning) {
+      return;
+    }
+    state.conversationInterceptCalibrationRunning = true;
+    renderCalibrationControl();
+    try {
+      const payload = await postJson(API.conversationInterceptCalibration, {});
+      showToast(
+        payload && payload.message
+          ? payload.message
+          : "对话拦截校准完成。",
+        "success"
       );
+      await refreshBootstrap(true);
+      if (state.activeTab === "events") {
+        await refreshEvents(true);
+      }
+    } catch (error) {
+      showToast(error.message || String(error), "error");
+      await refreshBootstrap(true);
+    } finally {
+      state.conversationInterceptCalibrationRunning = false;
+      renderCalibrationControl();
+    }
+  }
+
+  async function applySelectedCalibration() {
+    if (getSelectedCalibrationMode() === "conversation") {
+      await applyConversationInterceptCalibration();
+      return;
+    }
+    await applyAudioCalibration();
+  }
+
+  async function applyPollInterval() {
+    if (state.pollIntervalSaving) {
+      return;
+    }
+    const pollIntervalMs = clamp(
+      Math.round(Number(state.currentPollIntervalMs) || 0),
+      MIN_CONVERSATION_POLL_INTERVAL_MS,
+      MAX_CONVERSATION_POLL_INTERVAL_MS
+    );
+    state.pollIntervalSaving = true;
+    renderCalibrationControl();
+    try {
+      const payload = await postJson(API.pollInterval, { pollIntervalMs });
+      const nextPollIntervalMs = getFiniteNumber(
+        payload && payload.pollIntervalMs,
+        pollIntervalMs
+      );
+      state.pollIntervalDirty = false;
+      updatePollIntervalDisplay(nextPollIntervalMs, { forceText: true });
+      if (state.bootstrap) {
+        state.bootstrap.conversationInterceptCalibration = Object.assign(
+          {},
+          state.bootstrap.conversationInterceptCalibration,
+          payload && payload.calibration,
+          { pollIntervalMs: nextPollIntervalMs }
+        );
+      }
+      showToast(
+        payload && payload.message ? payload.message : "轮询间隔已更新。",
+        "success"
+      );
+      await refreshBootstrap(true);
+    } catch (error) {
+      state.pollIntervalDirty = false;
+      updatePollIntervalDisplay(state.confirmedPollIntervalMs, {
+        forceText: true,
+      });
+      showToast(error.message || String(error), "error");
+      await refreshBootstrap(true);
+    } finally {
+      state.pollIntervalSaving = false;
+      renderCalibrationControl();
     }
   }
 
@@ -5199,11 +5802,7 @@ function initConsolePage() {
       MAX_AUDIO_TAIL_PADDING_MS
     );
     state.audioTailPaddingSaving = true;
-    renderAudioCalibrationControl(
-      Object.assign({}, state.bootstrap && state.bootstrap.audioCalibration, {
-        tailPaddingMs,
-      })
-    );
+    renderCalibrationControl();
     try {
       const payload = await postJson(API.audioTailPadding, { tailPaddingMs });
       const nextTailPaddingMs = getFiniteNumber(
@@ -5234,9 +5833,7 @@ function initConsolePage() {
       await refreshBootstrap(true);
     } finally {
       state.audioTailPaddingSaving = false;
-      renderAudioCalibrationControl(
-        (state.bootstrap && state.bootstrap.audioCalibration) || {}
-      );
+      renderCalibrationControl();
     }
   }
 
@@ -5580,9 +6177,19 @@ function initConsolePage() {
     });
   }
 
-  if (els.audioCalibrationBtn) {
-    els.audioCalibrationBtn.addEventListener("click", () => {
-      void applyAudioCalibration();
+  if (els.calibrationModeSelect) {
+    els.calibrationModeSelect.addEventListener("change", () => {
+      state.selectedCalibrationMode =
+        els.calibrationModeSelect.value === "conversation"
+          ? "conversation"
+          : "audio";
+      renderCalibrationControl();
+    });
+  }
+
+  if (els.calibrationRunBtn) {
+    els.calibrationRunBtn.addEventListener("click", () => {
+      void applySelectedCalibration();
     });
   }
 
@@ -5802,6 +6409,7 @@ function initConsolePage() {
   );
   renderThinkingToggle(false);
   renderDebugLogToggle(true);
+  renderCalibrationControl();
   renderSpeakerControlState();
   setControlAvailability(false);
   renderIdleCurrentAudio();

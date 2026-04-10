@@ -507,6 +507,18 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       return String(value.verifyUrl || "") + "|" + methods;
     }
 
+    function looksLikeVerificationFlow(raw) {
+      return /(验证码|安全验证|二次验证|验证页面|验证链接|identity_session|identity session|verification|verify|短信验证|邮箱验证)/i.test(raw);
+    }
+
+    function looksLikePasswordFailure(raw) {
+      return /(账号或密码错误|密码错误|密码不正确|密码有误|invalid password|incorrect password|wrong password)/i.test(raw);
+    }
+
+    function looksLikeAccountFailure(raw) {
+      return /(账号错误|账号不存在|账号无效|账号不正确|invalid account|unknown account|user not found)/i.test(raw);
+    }
+
     function summarizeStatus(kind, text) {
       const raw = String(text || "").replace(/\\s+/g, " ").trim();
       if (!raw) {
@@ -515,10 +527,26 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       if (/验证码/.test(raw) && /(错|误|无效|失败|过期)/.test(raw)) {
         return "验证码错误";
       }
-      if (/密码/.test(raw) && /(错|误|无效|失败)/.test(raw)) {
+      if (looksLikeVerificationFlow(raw)) {
+        if (/(identity_session|identity session|会话)/i.test(raw) && /(没有|缺少|失效|过期|重新)/.test(raw)) {
+          return "请重新打开验证页面";
+        }
+        if (/(短信|邮箱|邮件|验证码).{0,8}已发送/.test(raw) || /已发送.{0,8}(短信|邮箱|邮件|验证码)/.test(raw)) {
+          const method = verificationMethodLabel(verification && verification.methods);
+          return method ? method + "已发送" : "验证码已发送";
+        }
+        if (/(打开|前往|跳转).{0,8}(验证页面|验证链接)/.test(raw) || /官方.{0,8}(验证页面|验证链接)/.test(raw)) {
+          return "请打开验证页面";
+        }
+        if (verification) {
+          const method = verificationMethodLabel(verification.methods);
+          return method ? "请输入" + method : "请输入验证码";
+        }
+      }
+      if (looksLikePasswordFailure(raw)) {
         return "密码错误";
       }
-      if (/账号/.test(raw) && /(错|误|无效|不存在)/.test(raw)) {
+      if (looksLikeAccountFailure(raw)) {
         return "账号错误";
       }
       if (/登录成功|账号已登录/.test(raw)) {

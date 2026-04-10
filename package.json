@@ -17,6 +17,7 @@
     "assets/fonts/noto-sans-sc/LICENSE",
     "scripts/configure-openclaw-install.mjs",
     "scripts/configure-openclaw-uninstall.mjs",
+    "scripts/probe-xiaomi-status.mjs",
     "openclaw.plugin.json",
     "README.md",
     "install.sh",

@@ -465,6 +465,42 @@ ${renderSharedHead("XiaoAI Cloud Console", assetBasePath)}
                 <div class="card-meta" id="openclawModelDetail">当前正在读取 xiaoai agent 模型信息…</div>
               </section>
 
+              <section class="surface control-card control-card-calibration">
+                <div class="card-head wake-action-head calibration-card-head">
+                  <div class="card-copy">
+                    <span class="micro-label">延迟校准</span>
+                    <div class="card-meta" id="calibrationDescription">轮询间隔和空余延迟可修改，校准时不要和音箱说话。</div>
+                  </div>
+                  <div class="route-card-actions calibration-card-actions">
+                    <div class="picker-root calibration-mode-picker" id="calibrationModePicker">
+                      <select
+                        id="calibrationModeSelect"
+                        class="picker-native"
+                      >
+                        <option value="audio">音频时序校准</option>
+                        <option value="conversation">对话拦截校准</option>
+                      </select>
+                      <button
+                        class="picker-trigger"
+                        id="calibrationModePickerTrigger"
+                        type="button"
+                        aria-haspopup="listbox"
+                        aria-expanded="false"
+                        aria-controls="calibrationModePickerPanel"
+                      >
+                        <span class="picker-trigger-text" id="calibrationModePickerText">音频时序校准</span>
+                        <span class="picker-chevron" aria-hidden="true"></span>
+                      </button>
+                      <div class="picker-panel" id="calibrationModePickerPanel" role="listbox" hidden></div>
+                    </div>
+                    <button class="soft-btn compact-btn" id="calibrationRunBtn" type="button">一键校准</button>
+                  </div>
+                </div>
+
+                <div class="control-metric-grid calibration-metrics-grid" id="calibrationMetrics"></div>
+                <div class="card-meta card-meta-break" id="calibrationDetail">当前还没有校准结果。</div>
+              </section>
+
               <section class="surface control-card control-card-route">
                 <div class="card-head route-card-head">
                   <div class="card-copy">
@@ -628,33 +664,21 @@ ${renderSharedHead("XiaoAI Cloud Console", assetBasePath)}
               <section class="surface control-card control-card-context">
                 <div class="card-head context-memory-head">
                   <div class="card-copy">
-                    <span class="micro-label">上下文记忆</span>
-                    <div class="card-meta">保留最近几轮对话给 OpenClaw 参考。超过设置轮数后，较早的内容会自动压缩成摘要，再和最近几轮一起带上。设为 0 可关闭。离开输入框后会自动保存。</div>
+                    <span class="micro-label">上下文窗口</span>
+                    <div class="card-meta">直接写入 xiaoai 专属 agent 的 <code>contextTokens</code>，只影响这个 agent。OpenClaw 会自己管理会话历史。离开输入框后会自动保存。</div>
                   </div>
                   <div class="context-inline-grid">
                     <label class="context-inline-field metric">
                       <input
-                        id="voiceContextTurnsInput"
+                        id="openclawContextTokensInput"
                         type="text"
                         inputmode="numeric"
                         pattern="[0-9]*"
-                        value="6"
+                        value="32000"
                         autocomplete="off"
                         spellcheck="false"
                       />
-                      <span>轮</span>
-                    </label>
-                    <label class="context-inline-field metric">
-                      <input
-                        id="voiceContextCharsInput"
-                        type="text"
-                        inputmode="numeric"
-                        pattern="[0-9]*"
-                        value="1400"
-                        autocomplete="off"
-                        spellcheck="false"
-                      />
-                      <span>字</span>
+                      <span>tokens</span>
                     </label>
                   </div>
                 </div>
@@ -715,42 +739,6 @@ ${renderSharedHead("XiaoAI Cloud Console", assetBasePath)}
                     <strong id="forceNonStreamingLabel">已关闭</strong>
                   </button>
                 </div>
-              </section>
-
-              <section class="surface control-card control-card-calibration">
-                <div class="card-head wake-action-head calibration-card-head">
-                  <div class="card-copy">
-                    <span class="micro-label">延迟校准</span>
-                    <div class="card-meta" id="calibrationDescription">轮询间隔和空余延迟可修改，校准时不要和音箱说话。</div>
-                  </div>
-                  <div class="route-card-actions calibration-card-actions">
-                    <div class="picker-root calibration-mode-picker" id="calibrationModePicker">
-                      <select
-                        id="calibrationModeSelect"
-                        class="picker-native"
-                      >
-                        <option value="audio">音频时序校准</option>
-                        <option value="conversation">对话拦截校准</option>
-                      </select>
-                      <button
-                        class="picker-trigger"
-                        id="calibrationModePickerTrigger"
-                        type="button"
-                        aria-haspopup="listbox"
-                        aria-expanded="false"
-                        aria-controls="calibrationModePickerPanel"
-                      >
-                        <span class="picker-trigger-text" id="calibrationModePickerText">音频时序校准</span>
-                        <span class="picker-chevron" aria-hidden="true"></span>
-                      </button>
-                      <div class="picker-panel" id="calibrationModePickerPanel" role="listbox" hidden></div>
-                    </div>
-                    <button class="soft-btn compact-btn" id="calibrationRunBtn" type="button">一键校准</button>
-                  </div>
-                </div>
-
-                <div class="control-metric-grid calibration-metrics-grid" id="calibrationMetrics"></div>
-                <div class="card-meta card-meta-break" id="calibrationDetail">当前还没有校准结果。</div>
               </section>
 
               <section class="surface control-card control-card-remote-wake">

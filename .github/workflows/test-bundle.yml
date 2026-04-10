@@ -44,6 +44,7 @@ jobs:
           sh uninstall.sh --help >/dev/null
           node scripts/configure-openclaw-install.mjs --help >/dev/null
           node scripts/configure-openclaw-uninstall.mjs --help >/dev/null
+          node --check scripts/probe-xiaomi-status.mjs
 
   verify-windows:
     runs-on: windows-latest
@@ -104,7 +105,7 @@ jobs:
           bundle_root="release-bundle/openclaw-plugin-xiaoai-cloud"
 
           rm -rf release-bundle
-          rm -f openclaw-plugin-xiaoai-cloud-bundle.tar.gz openclaw-plugin-xiaoai-cloud-bundle.zip release-assets.sha256
+          rm -f openclaw-plugin-xiaoai-cloud-bundle.zip release-assets.sha256
 
           mkdir -p "$bundle_root/scripts"
 
@@ -112,6 +113,7 @@ jobs:
           cp -R assets "$bundle_root/"
           cp scripts/configure-openclaw-install.mjs "$bundle_root/scripts/"
           cp scripts/configure-openclaw-uninstall.mjs "$bundle_root/scripts/"
+          cp scripts/probe-xiaomi-status.mjs "$bundle_root/scripts/"
           cp package.json package-lock.json openclaw.plugin.json install.sh install.cmd uninstall.sh uninstall.cmd "$bundle_root/"
 
           test ! -e "$bundle_root/README.md"
@@ -199,6 +201,7 @@ jobs:
           test -f "$root/assets/fonts/noto-sans-sc/wght.css"
           test -f "$root/scripts/configure-openclaw-install.mjs"
           test -f "$root/scripts/configure-openclaw-uninstall.mjs"
+          test -f "$root/scripts/probe-xiaomi-status.mjs"
           test ! -e "$root/README.md"
           test ! -e "$root/PROJECT_ANALYSIS.md"
           test ! -e "$root/CROSS_CLAW_ADAPTATION_PLAN.md"
@@ -214,3 +217,4 @@ jobs:
           sh "$root/uninstall.sh" --help >/dev/null
           node "$root/scripts/configure-openclaw-install.mjs" --help >/dev/null
           node "$root/scripts/configure-openclaw-uninstall.mjs" --help >/dev/null
+          node --check "$root/scripts/probe-xiaomi-status.mjs"

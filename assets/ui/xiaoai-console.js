@@ -6,14 +6,14 @@ const DEFAULT_DIALOG_WINDOW_SECONDS = 30;
 const MIN_DIALOG_WINDOW_SECONDS = 5;
 const MAX_DIALOG_WINDOW_SECONDS = 300;
 const DEFAULT_CONVERSATION_POLL_INTERVAL_MS = 320;
-const MIN_CONVERSATION_POLL_INTERVAL_MS = 250;
+const MIN_CONVERSATION_POLL_INTERVAL_MS = 80;
+const MIN_RECOMMENDED_CONVERSATION_POLL_INTERVAL_MS = 120;
 const MAX_CONVERSATION_POLL_INTERVAL_MS = 10000;
 const DEFAULT_AUDIO_TAIL_PADDING_MS = 1500;
 const MAX_AUDIO_TAIL_PADDING_MS = 10000;
-const DEFAULT_VOICE_CONTEXT_TURNS = 6;
-const DEFAULT_VOICE_CONTEXT_CHARS = 1400;
-const MAX_VOICE_CONTEXT_TURNS = 24;
-const MAX_VOICE_CONTEXT_CHARS = 8000;
+const DEFAULT_OPENCLAW_CONTEXT_TOKENS = 32000;
+const MIN_OPENCLAW_CONTEXT_TOKENS = 1;
+const MAX_OPENCLAW_CONTEXT_TOKENS = 2000000;
 const MAX_OPENCLAW_VOICE_SYSTEM_PROMPT_CHARS = 6000;
 const MAX_TRANSITION_PHRASES = 12;
 const MAX_TRANSITION_PHRASE_CHARS = 40;
@@ -40,6 +40,17 @@ function escapeHtml(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function buildLowPollIntervalWarning(pollIntervalMs) {
+  const safeMs = Math.round(Number(pollIntervalMs) || 0);
+  if (
+    !Number.isFinite(safeMs) ||
+    safeMs >= MIN_RECOMMENDED_CONVERSATION_POLL_INTERVAL_MS
+  ) {
+    return "";
+  }
+  return `低于 ${MIN_RECOMMENDED_CONVERSATION_POLL_INTERVAL_MS}ms 不建议，容易放大小米侧超时并触发自动退避。`;
 }
 
 function getStoredThemeMode() {
@@ -281,7 +292,7 @@ function initConsolePage() {
     workspaceFile: new URL("./api/openclaw/workspace-file", window.location.href),
     transitionPhrases: new URL("./api/device/transition-phrases", window.location.href),
     debugLog: new URL("./api/debug-log", window.location.href),
-    voiceContext: new URL("./api/openclaw/voice-context", window.location.href),
+    contextTokens: new URL("./api/openclaw/context-tokens", window.location.href),
     mode: new URL("./api/device/mode", window.location.href),
     wakeWord: new URL("./api/device/wake-word", window.location.href),
     deviceList: new URL("./api/device/list", window.location.href),
@@ -316,10 +327,9 @@ function initConsolePage() {
     dialogWindowDirty: false,
     dialogWindowSaving: false,
     controlScrollRevision: 0,
-    currentVoiceContextTurnsValue: DEFAULT_VOICE_CONTEXT_TURNS,
-    currentVoiceContextCharsValue: DEFAULT_VOICE_CONTEXT_CHARS,
-    voiceContextDirty: false,
-    voiceContextSaving: false,
+    currentOpenclawContextTokensValue: DEFAULT_OPENCLAW_CONTEXT_TOKENS,
+    openclawContextTokensDirty: false,
+    openclawContextTokensSaving: false,
     currentVoiceSystemPromptValue: "",
     openclawWorkspaceFiles: [],
     selectedWorkspaceFileId: "agents",
@@ -338,6 +348,7 @@ function initConsolePage() {
     loginWorkspaceOpen: false,
     loginWorkspaceUrl: "",
     pendingDeviceSelectionAfterLogin: false,
+    bootstrapInitialized: false,
     animateEventsNextRender: false,
     eventItems: [],
     eventItemsLoaded: false,
@@ -488,8 +499,7 @@ function initConsolePage() {
     volumeMuteToggle: byId("volumeMuteToggle"),
     volumeMuteLabel: byId("volumeMuteLabel"),
     dialogWindowInput: byId("dialogWindowInput"),
-    voiceContextTurnsInput: byId("voiceContextTurnsInput"),
-    voiceContextCharsInput: byId("voiceContextCharsInput"),
+    openclawContextTokensInput: byId("openclawContextTokensInput"),
     browserAudioDock: byId("browserAudioDock"),
     browserAudioPlayerShell: byId("browserAudioPlayerShell"),
     speakerAudioShell: byId("speakerAudioShell"),
@@ -990,7 +1000,8 @@ function initConsolePage() {
       return;
     }
     els.toast.textContent = message;
-    els.toast.dataset.tone = tone === "error" ? "error" : "success";
+    els.toast.dataset.tone =
+      tone === "error" ? "error" : tone === "warn" ? "warn" : "success";
     els.toast.classList.add("show");
     window.clearTimeout(showToast.timer);
     showToast.timer = window.setTimeout(() => {
@@ -2588,6 +2599,85 @@ function initConsolePage() {
     return Number.isFinite(numeric) ? numeric : fallback;
   }
 
+  function getBootstrapDeviceId(data) {
+    return data &&
+      data.device &&
+      typeof data.device.minaDeviceId === "string" &&
+      data.device.minaDeviceId.trim()
+      ? data.device.minaDeviceId.trim()
+      : "";
+  }
+
+  function normalizeCalibrationPrompt(value) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const stateValue =
+      value.state === "missing" || value.state === "recalibrate"
+        ? value.state
+        : "";
+    const title =
+      typeof value.title === "string" && value.title.trim() ? value.title.trim() : "";
+    const detail =
+      typeof value.detail === "string" && value.detail.trim()
+        ? value.detail.trim()
+        : "";
+    if (!stateValue || !title) {
+      return null;
+    }
+    return {
+      state: stateValue,
+      title,
+      detail,
+    };
+  }
+
+  function formatConversationCalibrationStrategy(strategy) {
+    if (strategy === "observable") {
+      return "可观测";
+    }
+    if (strategy === "mixed") {
+      return "混合";
+    }
+    if (strategy === "fallback-only") {
+      return "保守补偿";
+    }
+    return "";
+  }
+
+  function collectCalibrationPrompts(data) {
+    const prompts = [];
+    const audioPrompt = normalizeCalibrationPrompt(
+      data && data.audioCalibration ? data.audioCalibration.prompt : null
+    );
+    const conversationPrompt = normalizeCalibrationPrompt(
+      data && data.conversationInterceptCalibration
+        ? data.conversationInterceptCalibration.prompt
+        : null
+    );
+    if (audioPrompt) {
+      prompts.push(audioPrompt);
+    }
+    if (conversationPrompt) {
+      prompts.push(conversationPrompt);
+    }
+    return prompts;
+  }
+
+  function showCalibrationPromptToastForDevice(data) {
+    const prompts = collectCalibrationPrompts(data);
+    if (!prompts.length) {
+      return;
+    }
+    showToast(
+      prompts
+        .map((item) => item.title)
+        .filter(Boolean)
+        .join("\n"),
+      "warn"
+    );
+  }
+
   function formatAudioTailPaddingSeconds(value) {
     const safeMs = clamp(
       Math.round(Number(value) || 0),
@@ -2796,23 +2886,21 @@ function initConsolePage() {
     return safe;
   }
 
-  function updateVoiceContextDisplay(turns, chars, options) {
-    const safeTurns = clamp(Number(turns) || 0, 0, MAX_VOICE_CONTEXT_TURNS);
-    const safeChars = clamp(Number(chars) || 0, 0, MAX_VOICE_CONTEXT_CHARS);
+  function updateOpenclawContextTokensDisplay(value, options) {
+    const safeTokens = clamp(
+      Number(value) || DEFAULT_OPENCLAW_CONTEXT_TOKENS,
+      MIN_OPENCLAW_CONTEXT_TOKENS,
+      MAX_OPENCLAW_CONTEXT_TOKENS
+    );
     const forceInput = Boolean(options && options.forceInput);
-    const keepUserInput = !forceInput && (state.voiceContextDirty || state.voiceContextSaving);
-    state.currentVoiceContextTurnsValue = safeTurns;
-    state.currentVoiceContextCharsValue = safeChars;
-    if (els.voiceContextTurnsInput && !keepUserInput) {
-      els.voiceContextTurnsInput.value = String(safeTurns);
+    const keepUserInput =
+      !forceInput &&
+      (state.openclawContextTokensDirty || state.openclawContextTokensSaving);
+    state.currentOpenclawContextTokensValue = safeTokens;
+    if (els.openclawContextTokensInput && !keepUserInput) {
+      els.openclawContextTokensInput.value = String(safeTokens);
     }
-    if (els.voiceContextCharsInput && !keepUserInput) {
-      els.voiceContextCharsInput.value = String(safeChars);
-    }
-    return {
-      turns: safeTurns,
-      chars: safeChars,
-    };
+    return safeTokens;
   }
 
   function normalizeWorkspaceFileItem(item) {
@@ -3559,6 +3647,7 @@ function initConsolePage() {
     syncCalibrationModePicker();
     const nextCalibration =
       calibration && typeof calibration === "object" ? calibration : {};
+    const prompt = normalizeCalibrationPrompt(nextCalibration.prompt);
     const currentProfile =
       nextCalibration.currentProfile &&
       typeof nextCalibration.currentProfile === "object"
@@ -3594,8 +3683,10 @@ function initConsolePage() {
         : "一键校准";
     }
     if (els.calibrationDescription) {
-      els.calibrationDescription.textContent =
-        "轮询间隔可修改，校准时不要和音箱说话。";
+      els.calibrationDescription.textContent = prompt
+        ? prompt.title
+        : "轮询间隔可修改，校准时不要和音箱说话。";
+      els.calibrationDescription.dataset.tone = prompt ? "warn" : "default";
     }
     if (els.conversationVisibleValue) {
       els.conversationVisibleValue.textContent = formatLatencyEstimate(
@@ -3628,6 +3719,9 @@ function initConsolePage() {
     }
     if (els.calibrationDetail) {
       const detailParts = [];
+      if (prompt && prompt.detail) {
+        detailParts.push(prompt.detail);
+      }
       if (currentProfile && currentProfile.updatedAt) {
         detailParts.push(`当前画像更新于 ${formatDateTime(currentProfile.updatedAt)}`);
       }
@@ -3636,6 +3730,9 @@ function initConsolePage() {
         const successCount = getFiniteNumber(lastRun.successCount, 0);
         const failureCount = getFiniteNumber(lastRun.failureCount, 0);
         const fallbackRounds = getFiniteNumber(lastRun.fallbackRounds, 0);
+        const strategyLabel = formatConversationCalibrationStrategy(
+          typeof lastRun.strategy === "string" ? lastRun.strategy : ""
+        );
         const lastPollIntervalMs = getFiniteNumber(
           lastRun.pollIntervalMs,
           pollIntervalMs
@@ -3645,6 +3742,9 @@ function initConsolePage() {
         );
         if (fallbackRounds > 0) {
           detailParts.push(`其中 ${fallbackRounds} 轮使用保守估算`);
+        }
+        if (strategyLabel) {
+          detailParts.push(`策略：${strategyLabel}`);
         }
         detailParts.push(`轮询间隔 ${lastPollIntervalMs}ms`);
         if (
@@ -3658,13 +3758,16 @@ function initConsolePage() {
             )}ms`
           );
         }
+        if (lastRun.deviceName || lastRun.deviceId) {
+          detailParts.push(`设备：${lastRun.deviceName || lastRun.deviceId}`);
+        }
         if (lastRun.completedAt) {
           detailParts.push(`完成于 ${formatDateTime(lastRun.completedAt)}`);
         }
         if (lastRun.lastError) {
           detailParts.push(`最后错误：${lastRun.lastError}`);
         }
-      } else {
+      } else if (!prompt) {
         detailParts.push(
           "校准会发测试问句，期间音箱可能出声。"
         );
@@ -3835,6 +3938,7 @@ function initConsolePage() {
     syncCalibrationModePicker();
     const nextCalibration =
       calibration && typeof calibration === "object" ? calibration : {};
+    const prompt = normalizeCalibrationPrompt(nextCalibration.prompt);
     const currentProfile =
       nextCalibration.currentProfile &&
       typeof nextCalibration.currentProfile === "object"
@@ -3866,8 +3970,10 @@ function initConsolePage() {
         : "一键校准";
     }
     if (els.calibrationDescription) {
-      els.calibrationDescription.textContent =
-        "空余延迟可修改，校准时不要和音箱说话。";
+      els.calibrationDescription.textContent = prompt
+        ? prompt.title
+        : "空余延迟可修改，校准时不要和音箱说话。";
+      els.calibrationDescription.dataset.tone = prompt ? "warn" : "default";
     }
 
     if (els.audioCalibrationPlaybackDetectValue) {
@@ -3902,6 +4008,9 @@ function initConsolePage() {
 
     if (els.calibrationDetail) {
       const detailParts = [];
+      if (prompt && prompt.detail) {
+        detailParts.push(prompt.detail);
+      }
       if (currentProfile && currentProfile.updatedAt) {
         detailParts.push(`当前画像更新于 ${formatDateTime(currentProfile.updatedAt)}`);
       }
@@ -4078,8 +4187,7 @@ function initConsolePage() {
       els.wakeBtn,
       els.volumeSlider,
       els.dialogWindowInput,
-      els.voiceContextTurnsInput,
-      els.voiceContextCharsInput,
+      els.openclawContextTokensInput,
     ].forEach((element) => {
       if (element) {
         element.disabled = disabled;
@@ -4151,9 +4259,12 @@ function initConsolePage() {
   }
 
   function renderBootstrap(data) {
+    const previousBootstrap = state.bootstrap;
+    const previousDeviceId = getBootstrapDeviceId(previousBootstrap);
     const wasReady = state.bootstrap ? Boolean(state.bootstrap.ready) : false;
     state.bootstrap = data;
     const device = data.device || {};
+    const currentDeviceId = getBootstrapDeviceId(data);
     const volume = data.volume || null;
     const serverVolume =
       volume && typeof volume.percent === "number"
@@ -4307,14 +4418,13 @@ function initConsolePage() {
         state.currentDialogWindowValue || DEFAULT_DIALOG_WINDOW_SECONDS
       )
     );
-    updateVoiceContextDisplay(
+    updateOpenclawContextTokensDisplay(
       getFiniteNumber(
-        data.voiceContextMaxTurns,
-        state.currentVoiceContextTurnsValue
-      ),
-      getFiniteNumber(
-        data.voiceContextMaxChars,
-        state.currentVoiceContextCharsValue
+        data.openclawContextTokens,
+        getFiniteNumber(
+          data.openclawContextWindow,
+          state.currentOpenclawContextTokensValue
+        )
       )
     );
     state.currentVoiceSystemPromptValue =
@@ -4379,6 +4489,15 @@ function initConsolePage() {
     if (state.deviceListVisible && state.deviceListLoaded) {
       renderDeviceList(state.deviceItems);
     }
+
+    if (
+      state.bootstrapInitialized &&
+      currentDeviceId &&
+      currentDeviceId !== previousDeviceId
+    ) {
+      showCalibrationPromptToastForDevice(data);
+    }
+    state.bootstrapInitialized = true;
   }
 
   function flattenConversationMessages(items) {
@@ -5152,63 +5271,57 @@ function initConsolePage() {
     }
   }
 
-  async function applyVoiceContextSettings() {
-    if (state.voiceContextSaving) {
+  async function applyOpenclawContextTokens() {
+    if (state.openclawContextTokensSaving) {
       return;
     }
-    const turnsRaw = els.voiceContextTurnsInput
-      ? normalizeIntegerText(els.voiceContextTurnsInput.value, MAX_VOICE_CONTEXT_TURNS)
-      : "";
-    const charsRaw = els.voiceContextCharsInput
-      ? normalizeIntegerText(els.voiceContextCharsInput.value, MAX_VOICE_CONTEXT_CHARS)
+    const tokensRaw = els.openclawContextTokensInput
+      ? normalizeIntegerText(
+          els.openclawContextTokensInput.value,
+          MAX_OPENCLAW_CONTEXT_TOKENS
+        )
       : "";
 
-    if (els.voiceContextTurnsInput) {
-      els.voiceContextTurnsInput.value = turnsRaw;
-    }
-    if (els.voiceContextCharsInput) {
-      els.voiceContextCharsInput.value = charsRaw;
+    if (els.openclawContextTokensInput) {
+      els.openclawContextTokensInput.value = tokensRaw;
     }
 
-    if (!turnsRaw && !charsRaw) {
-      state.voiceContextDirty = false;
-      updateVoiceContextDisplay(
-        state.currentVoiceContextTurnsValue,
-        state.currentVoiceContextCharsValue,
+    if (!tokensRaw) {
+      state.openclawContextTokensDirty = false;
+      updateOpenclawContextTokensDisplay(
+        state.currentOpenclawContextTokensValue,
         { forceInput: true }
       );
       return;
     }
 
-    const turns =
-      turnsRaw === ""
-        ? state.currentVoiceContextTurnsValue
-        : clamp(Number(turnsRaw) || 0, 0, MAX_VOICE_CONTEXT_TURNS);
-    const chars =
-      charsRaw === ""
-        ? state.currentVoiceContextCharsValue
-        : clamp(Number(charsRaw) || 0, 0, MAX_VOICE_CONTEXT_CHARS);
+    const contextTokens = clamp(
+      Number(tokensRaw) || DEFAULT_OPENCLAW_CONTEXT_TOKENS,
+      MIN_OPENCLAW_CONTEXT_TOKENS,
+      MAX_OPENCLAW_CONTEXT_TOKENS
+    );
 
     if (
-      turns === state.currentVoiceContextTurnsValue &&
-      chars === state.currentVoiceContextCharsValue &&
-      !state.voiceContextDirty
+      contextTokens === state.currentOpenclawContextTokensValue &&
+      !state.openclawContextTokensDirty
     ) {
-      updateVoiceContextDisplay(turns, chars, { forceInput: true });
+      updateOpenclawContextTokensDisplay(contextTokens, { forceInput: true });
       return;
     }
 
-    state.voiceContextSaving = true;
+    state.openclawContextTokensSaving = true;
     try {
-      const payload = await postJson(API.voiceContext, { turns, chars });
-      state.voiceContextDirty = false;
-      const nextTurns = getFiniteNumber(payload && payload.turns, turns);
-      const nextChars = getFiniteNumber(payload && payload.chars, chars);
-      updateVoiceContextDisplay(nextTurns, nextChars, { forceInput: true });
+      const payload = await postJson(API.contextTokens, { contextTokens });
+      state.openclawContextTokensDirty = false;
+      const nextTokens = getFiniteNumber(
+        payload && payload.contextTokens,
+        contextTokens
+      );
+      updateOpenclawContextTokensDisplay(nextTokens, { forceInput: true });
       showToast(
         payload && payload.message
           ? payload.message
-          : `上下文记忆已保存：保留最近 ${nextTurns} 轮，最多 ${nextChars} 字，超出的更早对话会自动压缩。`,
+          : `xiaoai agent 上下文窗口已保存为 ${nextTokens} tokens。`,
         "success"
       );
       await refreshBootstrap(true);
@@ -5218,7 +5331,7 @@ function initConsolePage() {
     } catch (error) {
       showToast(error.message || String(error), "error");
     } finally {
-      state.voiceContextSaving = false;
+      state.openclawContextTokensSaving = false;
     }
   }
 
@@ -5374,28 +5487,19 @@ function initConsolePage() {
     }
   }
 
-  function commitVoiceContextSettingsFromBlur() {
+  function commitOpenclawContextTokensFromBlur() {
     window.setTimeout(() => {
       const active = document.activeElement;
-      if (
-        active === els.voiceContextTurnsInput ||
-        active === els.voiceContextCharsInput
-      ) {
+      if (active === els.openclawContextTokensInput) {
         return;
       }
-      if (state.voiceContextDirty) {
-        void applyVoiceContextSettings();
+      if (state.openclawContextTokensDirty) {
+        void applyOpenclawContextTokens();
         return;
       }
-      if (
-        els.voiceContextTurnsInput &&
-        els.voiceContextCharsInput &&
-        (!els.voiceContextTurnsInput.value.trim() ||
-          !els.voiceContextCharsInput.value.trim())
-      ) {
-        updateVoiceContextDisplay(
-          state.currentVoiceContextTurnsValue,
-          state.currentVoiceContextCharsValue,
+      if (els.openclawContextTokensInput && !els.openclawContextTokensInput.value.trim()) {
+        updateOpenclawContextTokensDisplay(
+          state.currentOpenclawContextTokensValue,
           { forceInput: true }
         );
       }
@@ -5774,9 +5878,19 @@ function initConsolePage() {
           { pollIntervalMs: nextPollIntervalMs }
         );
       }
+      const warning =
+        payload && payload.warning
+          ? String(payload.warning)
+          : buildLowPollIntervalWarning(nextPollIntervalMs);
+      const toastMessage =
+        payload && payload.message
+          ? String(payload.message)
+          : warning
+            ? `轮询间隔已更新为 ${nextPollIntervalMs}ms。${warning}`
+            : "轮询间隔已更新。";
       showToast(
-        payload && payload.message ? payload.message : "轮询间隔已更新。",
-        "success"
+        toastMessage,
+        warning ? "warn" : "success"
       );
       await refreshBootstrap(true);
     } catch (error) {
@@ -6320,40 +6434,21 @@ function initConsolePage() {
     });
   }
 
-  if (els.voiceContextTurnsInput) {
-    els.voiceContextTurnsInput.addEventListener("input", () => {
-      state.voiceContextDirty = true;
-      els.voiceContextTurnsInput.value = normalizeIntegerText(
-        els.voiceContextTurnsInput.value,
-        MAX_VOICE_CONTEXT_TURNS
+  if (els.openclawContextTokensInput) {
+    els.openclawContextTokensInput.addEventListener("input", () => {
+      state.openclawContextTokensDirty = true;
+      els.openclawContextTokensInput.value = normalizeIntegerText(
+        els.openclawContextTokensInput.value,
+        MAX_OPENCLAW_CONTEXT_TOKENS
       );
     });
-    els.voiceContextTurnsInput.addEventListener("blur", () => {
-      commitVoiceContextSettingsFromBlur();
+    els.openclawContextTokensInput.addEventListener("blur", () => {
+      commitOpenclawContextTokensFromBlur();
     });
-    els.voiceContextTurnsInput.addEventListener("keydown", (event) => {
+    els.openclawContextTokensInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        void applyVoiceContextSettings();
-      }
-    });
-  }
-
-  if (els.voiceContextCharsInput) {
-    els.voiceContextCharsInput.addEventListener("input", () => {
-      state.voiceContextDirty = true;
-      els.voiceContextCharsInput.value = normalizeIntegerText(
-        els.voiceContextCharsInput.value,
-        MAX_VOICE_CONTEXT_CHARS
-      );
-    });
-    els.voiceContextCharsInput.addEventListener("blur", () => {
-      commitVoiceContextSettingsFromBlur();
-    });
-    els.voiceContextCharsInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        void applyVoiceContextSettings();
+        void applyOpenclawContextTokens();
       }
     });
   }
@@ -6402,11 +6497,9 @@ function initConsolePage() {
   updateVolumeDisplay(0);
   state.hasVolumeSnapshot = false;
   updateDialogWindowDisplay(DEFAULT_DIALOG_WINDOW_SECONDS);
-  updateVoiceContextDisplay(
-    DEFAULT_VOICE_CONTEXT_TURNS,
-    DEFAULT_VOICE_CONTEXT_CHARS,
-    { forceInput: true }
-  );
+  updateOpenclawContextTokensDisplay(DEFAULT_OPENCLAW_CONTEXT_TOKENS, {
+    forceInput: true,
+  });
   renderThinkingToggle(false);
   renderDebugLogToggle(true);
   renderCalibrationControl();

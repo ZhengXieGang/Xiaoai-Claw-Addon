@@ -36,6 +36,7 @@ export interface PersistedCloudProfile {
 
 export interface PersistedSpeakerAudioLatencyProfile {
     statusProbeEstimateMs?: number;
+    pauseCommandEstimateMs?: number;
     pauseSettleEstimateMs?: number;
     stopSettleEstimateMs?: number;
     playbackDetectEstimateMs?: number;
@@ -69,6 +70,7 @@ export interface PersistedConversationInterceptCalibrationSummary {
     successCount?: number;
     failureCount?: number;
     fallbackRounds?: number;
+    strategy?: "observable" | "fallback-only" | "mixed";
     pollIntervalMs?: number;
     recommendedPollIntervalMs?: number;
     startedAt?: string;

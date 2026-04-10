@@ -53,8 +53,8 @@ https://github.com/ZhengXieGang/Xiaoai-Claw-Addon
 - 专属 `xiaoai` agent 已创建
 - `xiaoai` agent 没有抢占现有默认 agent 或已有渠道入口
 - 插件通知渠道与目标已经正确推断；如果无法唯一推断，请明确提示我去控制台或通过对话手动设置
-- 如果设备已经就绪，再调用 `xiaoai_run_calibration` 自动跑一遍校准；默认先用 `mode=audio`。如果还要跑 `mode=conversation`，先明确告诉我测试期间音箱可能真实出声，不要把静音能力当成前置条件；如果设备暂时还没就绪，就在我登录并选好音箱后补跑
 - 最后调用 `xiaoai_console_open`，把控制台链接发给我
+- 提示我去控制台登录并选择设备，询问我是否完成配置，我回答配置好了以后，再调用 `xiaoai_run_calibration` 自动跑一遍校准；默认先用 `mode=audio`。跑 `mode=conversation`前，先明确告诉我测试期间音箱可能真实出声，不要把静音能力当成前置条件；如果设备暂时还没就绪，提示我在我登录并选好音箱后补跑
 
 如果你已经尽力自动修复，仍然无法安装，请：
 - 明确告诉我卡在哪一步
@@ -212,7 +212,7 @@ uninstall.cmd
 1. 安装完成后让OpenClaw打开小爱控制台，OpenClaw会调用 `xiaoai_console_open`，返回控制台网页链接。
 2. 打开控制台，先登录小米账号
 3. 在概览页选择要接管的音箱
-4. 到控制页设置模式、音量、唤醒词、通知渠道、上下文记忆和必要时的非流式兜底（一般不需要）
+4. 到控制页校准音频和拦击延迟，设置模式、音量、唤醒词、通知渠道、上下文记忆和必要时的非流式兜底（一般不需要）
 5. 这些控制页配置除了网页里可以改，也可以直接通过和 OpenClaw 对话修改；复杂项统一由 `xiaoai_update_settings` 处理，包括通知渠道、模型、上下文记忆，以及 `AGENTS.md`、`IDENTITY.md`、`TOOLS.md`、`HEARTBEAT.md`、`BOOT.md`、`MEMORY.md` 这些 workspace 提示文件的编辑或禁用。`AGENTS.md` 作为核心提示文件会保留启用，其余文件会按 OpenClaw 的 workspace 语义启用或禁用。这些文件只写入 `xiaoai` 专属 agent 的 workspace；如果专属 agent 缺少显式 workspace，插件会直接报错，不会回退去读写主 agent 的默认 workspace
 
 

@@ -189,11 +189,13 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
           RELEASE_TITLE: ${{ steps.meta.outputs.title }}
         run: |
+          : > empty-release-notes.md
+
           gh release create "$RELEASE_TAG" \
             openclaw-plugin-xiaoai-cloud-bundle.zip \
             install.sh \
             install.cmd \
             release-assets.sha256 \
             --title "$RELEASE_TITLE" \
-            --notes "" \
+            --notes-file empty-release-notes.md \
             --target "$GITHUB_SHA"

@@ -274,6 +274,9 @@ function runCommand(command, args, runOptions = {}) {
 }
 
 function createOpenclawRunner(options) {
+    const safeWorkingDirectory = path.resolve(
+        expandHome(options.stateDir) || os.homedir()
+    );
     return (args, runOptions = {}) => {
         const commandArgs = [];
         if (options.profile) {
@@ -293,6 +296,7 @@ function createOpenclawRunner(options) {
 
         const result = runCommand(options.openclawBin, commandArgs, {
             ...runOptions,
+            cwd: runOptions.cwd || safeWorkingDirectory,
             env: {
                 ...(runOptions.env ?? {}),
                 ...(options.stateDir ? { OPENCLAW_STATE_DIR: options.stateDir } : {}),

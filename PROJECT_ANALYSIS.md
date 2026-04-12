@@ -1754,6 +1754,54 @@ Linux 安装脚本会在非 dev install 下对安装后的插件目录做 owner 
 - 宿主因 suspicious ownership 直接拒绝加载插件
 - 控制台路由直接消失
 
+### 31.8 不能假设 OpenClaw CLI 和 systemd 入口永远稳定
+
+`2026-04-12` 这次云端复测又确认了一类更隐蔽、但破坏力很大的问题：
+
+- OpenClaw 本体升级了
+- 并不等于 `openclaw` CLI 一定还在 PATH
+- 也不等于 systemd service 里写死的旧入口路径还有效
+
+当时远端真实出现的是：
+
+- `npm install -g openclaw@2026.4.11` 过程中全局目录一度进入半坏状态
+- `openclaw-gateway.service` 仍然写着旧的
+  `/usr/lib/node_modules/openclaw/dist/index.js`
+- 结果每次“更新 OpenClaw”后，看起来像 Gateway 卡死
+- 实际上是服务启动后立刻退出，再被 systemd 反复拉起
+
+另外，远端还出现过另一种状态：
+
+- OpenClaw 包文件已经在
+- 但 `openclaw` 这个 CLI 可执行入口没有落到 PATH
+- 此时安装脚本和卸载脚本都会直接报 `spawnSync openclaw ENOENT`
+
+所以安装链路现在必须额外记住两条工程原则：
+
+1. 安装/卸载脚本不能只假设 `openclaw` 一定在 PATH
+   - 必要时要允许显式指定 `--openclaw-bin`
+   - README 提示词也要把“修复 CLI 入口”写进排障项
+2. systemd service 不应该长期硬绑某个历史版本的 `dist/index.js` 绝对路径
+   - 更稳妥的是直接走 `openclaw gateway ...`
+   - 让服务入口跟随当前 CLI 解析结果，而不是跟随某次历史安装目录
+
+这类问题最容易把人误导成：
+
+- “插件把云端弄炸了”
+- “OpenClaw 更新后不兼容插件”
+
+但更准确的说法应该是：
+
+- OpenClaw 升级链路和服务入口没有被一起收敛
+- 插件脚本只是把这个宿主级问题更早暴露出来了
+
+所以以后如果用户反馈“每次更新 OpenClaw 后就卡死”，优先排查顺序应该是：
+
+1. `openclaw --version` 是否还能直接执行
+2. `openclaw-gateway.service` 的 `ExecStart` 是否仍然指向真实可执行入口
+3. 全局安装目录是否存在半坏状态目录（例如 `.openclaw-*` / `openclaw.broken.*`）
+4. Gateway 失败到底是插件加载失败，还是宿主入口根本没有启动成功
+
 ## 32. 发布打包与 CI
 
 当前 GitHub Actions 做的事情包括：
@@ -1808,6 +1856,54 @@ release bundle 里会包含：
 - 仓库安装脚本负责的是“把插件装好并把外围配置收拾完整”
 
 所以 README 里仍然推荐普通用户优先走仓库或 release 自带的安装脚本。
+
+### 32.2 2026-04-12 云端 OpenClaw 更新与 README 提示词复测
+
+`2026-04-12` 这次不是只验证插件本身，而是把“宿主更新 + 插件卸载 + 通过 OpenClaw 安装”整条链路重新走了一遍。
+
+实际确认到的结果包括：
+
+1. OpenClaw 成功更新到 `2026.4.11`
+2. `openclaw-gateway.service` 改成了更稳妥的：
+   - `ExecStart=/usr/bin/openclaw gateway --port 18798`
+3. 卸载插件时，选择“删除 `xiaoai` agent，但保留历史记录”
+   - 历史会正确备份到 `plugin-backups/`
+4. 再用 README 里的“通过 OpenClaw 安装”提示词触发安装
+   - 插件成功重新装回
+   - `xiaoai` agent 成功重建
+   - `main` 仍然保持默认 agent
+   - 通知渠道和目标成功自动推断回原来的 Telegram 私聊目标
+
+但这次也确认了一条很重要的产品行为边界：
+
+- 通过 OpenClaw 提示词安装时，任务不一定会直接走到“控制台完全可用”
+- 如果插件此时还没有可用的小米登录态，它会先生成一个临时登录入口
+- 然后等待用户完成登录和选设备
+
+也就是说：
+
+- “安装成功”
+  和
+- “登录态已就绪、可以继续自动校准”
+
+不是同一个完成点。
+
+这也是为什么 README 里的提示词后来又补了一条约束：
+
+- 把登录入口或控制台链接发给用户后，先停下来
+- 不要让当前任务一直挂着等登录
+- 用户明确回复“配置好了”以后，再继续跑校准
+
+否则就会出现一个很差的体验：
+
+- 插件其实已经装好了
+- 但 `main` agent 的任务一直占着会话不结束
+- 后续普通 `ping` 或其它测试消息都会被堵在同一个会话锁后面
+
+这次复测后可以把结论收敛成：
+
+- README 提示词安装链路本身是通的
+- 真正需要收敛的是“首次登录前后，任务该不该继续挂住”的行为设计
 
 ## 33. 典型问题复盘
 
@@ -2326,6 +2422,103 @@ deadline 提前量现在按下面的思路动态计算：
 - 插件目录 owner 与 OpenClaw 运行用户一致
 
 否则只是“目录看起来在”，不代表服务真的在跑。
+
+### 33.12 OpenClaw 更新后看起来“卡死”，其实是 service 入口失效
+
+`2026-04-12` 这次云端更新里，用户表面看到的是：
+
+- 刚更新完 OpenClaw
+- 后台就进不去
+- 服务像“卡死”了一样
+
+但真正抓到的根因是：
+
+- `openclaw-gateway.service` 仍然写着旧的 `ExecStart`
+- 指向的是历史版本的 `/usr/lib/node_modules/openclaw/dist/index.js`
+- 升级后如果全局安装目录结构变动，或者安装过程一度半坏
+- 这个路径就可能失效
+- systemd 会不断自动重试
+- 用户体感上就会变成“Gateway 卡死”
+
+这类问题的关键点在于：
+
+- 它不是插件逻辑把进程拖死
+- 而是宿主服务入口本身已经失效
+
+这次最终收敛后的修法是：
+
+- 恢复 `/usr/bin/openclaw`
+- 把 service 改成直接执行 `openclaw gateway --port ...`
+- 不再长期硬绑某个具体 `dist/index.js` 绝对路径
+
+所以以后只要再次出现“更新 OpenClaw 后后台就挂了”，优先先看 systemd service，而不要先怀疑控制台代码或插件 HTTP 路由。
+
+### 33.13 `openclaw` 已安装但不在 PATH，安装/卸载脚本会直接报 `ENOENT`
+
+这次实测还暴露出另一个宿主层问题：
+
+- OpenClaw 包已经装在全局目录里
+- 但 `openclaw` 这个命令并没有真正出现在 PATH
+
+此时最直观的表面症状就是：
+
+- `install.sh` / `uninstall.sh` 一启动就失败
+- 错误通常是 `spawnSync openclaw ENOENT`
+
+这不是插件脚本逻辑本身坏了，而是：
+
+- 脚本默认把 `openclaw` 当成可执行命令
+- 宿主环境却没有把它暴露出来
+
+工程上正确的收敛方式不是“假装没这回事”，而是同时做两层兜底：
+
+1. 脚本层保留 `--openclaw-bin`
+   - 允许用户或自动化环境显式指定真实 CLI 路径
+2. 文档和提示词层明确写出
+   - 如果 `openclaw` 不可用，要先修复 CLI 入口
+   - 或者显式指定 `--openclaw-bin`
+
+也就是说，`openclaw CLI 可执行` 现在已经不是一个可以再默认忽略的前置条件，而是安装/卸载链路必须显式检查的一部分。
+
+### 33.14 卸载脚本不能在已删除插件目录里继续重启 Gateway
+
+这次真实卸载还抓到一个脚本级 bug：
+
+- `uninstall.sh` 入口本身是在插件目录里执行的
+- 卸载过程中插件目录已经被删掉
+- 但脚本后面还继续在这个已删除的工作目录里调用
+  `openclaw gateway restart` / `openclaw gateway start`
+- Node 在读取当前工作目录时会直接报：
+  `uv_cwd ENOENT`
+
+这里最容易误解的点是：
+
+- 看到最后一步报错，会以为整个卸载都失败了
+
+但真实情况通常是：
+
+- 插件主体已经卸掉
+- 历史备份也已经写进 `plugin-backups/`
+- 真正失败的是“卸载后的显式服务恢复步骤”
+
+这类 bug 的正确修法不是去改 Gateway，而是：
+
+- 卸载脚本调用 OpenClaw CLI 时，默认切到一个稳定存在的目录
+- 例如 `stateDir` 或用户 home 目录
+- 不能继续继承那个随时可能被删掉的插件目录作为 `cwd`
+
+这次已经把 `configure-openclaw-uninstall.mjs` 改成了这种更稳妥的做法。
+
+所以以后如果再次看到：
+
+- 卸载日志前面都正常
+- 最后在 `gateway restart/start` 时突然抛 `uv_cwd ENOENT`
+
+优先应该判断：
+
+- 插件和 agent 是否其实已经按预期移除
+- 历史是否已经备份成功
+- 然后再看是不是仅仅卡在“最后一步服务恢复”
 
 ## 34. 当前明确的边界与取舍
 

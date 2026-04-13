@@ -342,7 +342,8 @@ jobs:
 
           $log = Join-Path $PWD "windows-old-version.log"
           cmd /d /c "call ""$root\install.cmd"" --skip-npm-install --openclaw-bin ""$fake"" > ""$log"" 2>&1"
-          if ($LASTEXITCODE -lt 1) {
+          $installExitCode = $LASTEXITCODE
+          if ($installExitCode -lt 1) {
             if (Test-Path $log) {
               Get-Content $log
             }
@@ -354,6 +355,9 @@ jobs:
             Write-Host $logContent
             throw "Expected old-version rejection message was not found in windows-old-version.log"
           }
+
+          $global:LASTEXITCODE = 0
+          exit 0
 
   create-release:
     runs-on: ubuntu-latest

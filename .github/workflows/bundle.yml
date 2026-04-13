@@ -305,31 +305,55 @@ jobs:
           }
 
       - name: Smoke test extracted Windows helpers
-        shell: cmd
+        shell: powershell
         run: |
-          set "ROOT=%CD%\smoke-test\zip\openclaw-plugin-xiaoai-cloud"
-          call "%ROOT%\install.cmd" --help >NUL
-          call "%ROOT%\uninstall.cmd" --help >NUL
-          node "%ROOT%\scripts\configure-openclaw-install.mjs" --help >NUL
-          node "%ROOT%\scripts\configure-openclaw-uninstall.mjs" --help >NUL
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $PWD "smoke-test\zip\openclaw-plugin-xiaoai-cloud"
 
-          > "%CD%\fake-openclaw-old.cmd" (
-            echo @echo off
-            echo if "%%~1"=="--version" ^(
-            echo   echo OpenClaw 2026.3.23 ^(smoke-test^)
-            echo   exit /b 0
-            echo ^)
-            echo echo unsupported fake openclaw invocation: %%* 1^>^&2
-            echo exit /b 1
+          cmd /d /c "call ""$root\install.cmd"" --help >NUL"
+          if ($LASTEXITCODE -ne 0) { throw "install.cmd --help failed with exit code $LASTEXITCODE" }
+
+          cmd /d /c "call ""$root\uninstall.cmd"" --help >NUL"
+          if ($LASTEXITCODE -ne 0) { throw "uninstall.cmd --help failed with exit code $LASTEXITCODE" }
+
+          node "$root\scripts\configure-openclaw-install.mjs" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "configure-openclaw-install.mjs --help failed with exit code $LASTEXITCODE" }
+
+          node "$root\scripts\configure-openclaw-uninstall.mjs" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "configure-openclaw-uninstall.mjs --help failed with exit code $LASTEXITCODE" }
+
+          $fake = Join-Path $PWD "fake-openclaw-old.cmd"
+          $fakeLines = @(
+            '@echo off'
+            'if "%~1"=="--version" ('
+            '  echo OpenClaw 2026.3.23 ^(smoke-test^)'
+            '  exit /b 0'
+            ')'
+            'echo unsupported fake openclaw invocation: %* 1>&2'
+            'exit /b 1'
           )
+          [System.IO.File]::WriteAllText($fake, (($fakeLines -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
 
-          call "%ROOT%\install.cmd" --skip-npm-install --openclaw-bin "%CD%\fake-openclaw-old.cmd" > "%CD%\windows-old-version.log" 2>&1
-          if not errorlevel 1 (
-            echo Expected install.cmd to reject an old OpenClaw version
-            exit /b 1
-          )
+          $fakeVersion = cmd /d /c "call ""$fake"" --version"
+          if ($LASTEXITCODE -ne 0) { throw "fake-openclaw-old.cmd --version failed with exit code $LASTEXITCODE" }
+          if (($fakeVersion -join "`n") -notmatch "OpenClaw 2026\.3\.23") {
+            throw "Unexpected fake-openclaw-old.cmd version output: $($fakeVersion -join ' | ')"
+          }
 
-          findstr /c:"requires OpenClaw 2026.03.24 or newer" "%CD%\windows-old-version.log" >NUL
+          $log = Join-Path $PWD "windows-old-version.log"
+          cmd /d /c "call ""$root\install.cmd"" --skip-npm-install --openclaw-bin ""$fake"" > ""$log"" 2>&1"
+          if ($LASTEXITCODE -lt 1) {
+            if (Test-Path $log) {
+              Get-Content $log
+            }
+            throw "Expected install.cmd to reject an old OpenClaw version"
+          }
+
+          $logContent = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
+          if ($logContent -notmatch "(requires OpenClaw 2026\.03\.24 or newer|is too old)") {
+            Write-Host $logContent
+            throw "Expected old-version rejection message was not found in windows-old-version.log"
+          }
 
   create-release:
     runs-on: ubuntu-latest

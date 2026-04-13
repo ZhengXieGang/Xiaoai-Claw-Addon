@@ -206,6 +206,7 @@ uninstall.cmd
 
 #### 环境要求（安装过程中会自动安装依赖）
 
+- Openclaw 2026.03.24 +
 - Node.js `>= 22`
 - 可执行的 `openclaw` CLI
 - 建议安装 Python 3 + `requests`

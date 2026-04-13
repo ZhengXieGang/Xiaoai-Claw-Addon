@@ -313,8 +313,7 @@ ensure_supported_openclaw() {
   version_output=$(
     "$OPENCLAW_BIN" --version 2>&1 | tr -d '\r' | awk 'NF { line = $0 } END { print line }'
   )
-  openclaw_version_status=$(
-    node -e '
+  if node -e '
 const raw = (process.argv[1] || "").trim();
 const min = [2026, 3, 24];
 const match = raw.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/);
@@ -331,9 +330,11 @@ for (let index = 0; index < min.length; index += 1) {
   }
 }
 process.exit(0);
-' "$version_output" >/dev/null 2>&1
-    printf '%s' "$?"
-  )
+' "$version_output" >/dev/null 2>&1; then
+    openclaw_version_status=0
+  else
+    openclaw_version_status=$?
+  fi
   if [ "$openclaw_version_status" -eq 0 ]; then
     return 0
   fi

@@ -1,16 +1,23 @@
-name: Manual Test Bundle
+name: Bundle / Release
 
 on:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: Create GitHub release after all checks pass
+        required: false
+        default: true
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  BUNDLE_ARTIFACT_NAME: openclaw-plugin-xiaoai-cloud-bundle
 
 concurrency:
-  group: test-bundle-${{ github.ref }}
+  group: bundle-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -36,8 +43,10 @@ jobs:
       - name: Verify publishable package
         run: npm pack --dry-run
 
-      - name: Verify install helpers
+      - name: Verify source install helpers
         run: |
+          set -eu
+
           sh -n install.sh
           sh -n uninstall.sh
           sh install.sh --help >/dev/null
@@ -68,7 +77,7 @@ jobs:
       - name: Verify publishable package
         run: npm pack --dry-run
 
-      - name: Verify Windows install helper
+      - name: Verify source Windows install helper
         shell: cmd
         run: |
           call install.cmd --help >NUL
@@ -98,7 +107,7 @@ jobs:
       - name: Build plugin
         run: npm run build
 
-      - name: Create test bundle
+      - name: Create bundle
         run: |
           set -eu
 
@@ -144,7 +153,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
-          name: openclaw-plugin-xiaoai-cloud-test-bundle
+          name: ${{ env.BUNDLE_ARTIFACT_NAME }}
           path: |
             openclaw-plugin-xiaoai-cloud-bundle.zip
             install.sh
@@ -152,7 +161,7 @@ jobs:
             release-assets.sha256
           if-no-files-found: error
 
-  smoke-test-bundle:
+  smoke-test-bundle-linux:
     runs-on: ubuntu-latest
     needs: bundle
 
@@ -165,7 +174,7 @@ jobs:
       - name: Download workflow artifact
         uses: actions/download-artifact@v8
         with:
-          name: openclaw-plugin-xiaoai-cloud-test-bundle
+          name: ${{ env.BUNDLE_ARTIFACT_NAME }}
           path: .
 
       - name: Extract and verify bundle contents
@@ -206,11 +215,11 @@ jobs:
           test ! -e "$root/PROJECT_ANALYSIS.md"
           test ! -e "$root/CROSS_CLAW_ADAPTATION_PLAN.md"
 
-      - name: Smoke test extracted install helpers
+      - name: Smoke test extracted Linux helpers
         run: |
           set -eu
 
-          root="smoke-test/zip/openclaw-plugin-xiaoai-cloud"
+          root="$PWD/smoke-test/zip/openclaw-plugin-xiaoai-cloud"
           sh -n "$root/install.sh"
           sh -n "$root/uninstall.sh"
           sh "$root/install.sh" --help >/dev/null
@@ -218,3 +227,152 @@ jobs:
           node "$root/scripts/configure-openclaw-install.mjs" --help >/dev/null
           node "$root/scripts/configure-openclaw-uninstall.mjs" --help >/dev/null
           node --check "$root/scripts/probe-xiaomi-status.mjs"
+
+          cat > "$PWD/fake-openclaw-old" <<'EOF'
+          #!/usr/bin/env sh
+          if [ "${1:-}" = "--version" ]; then
+            echo "OpenClaw 2026.3.23 (smoke-test)"
+            exit 0
+          fi
+          echo "unsupported fake openclaw invocation: $*" >&2
+          exit 1
+          EOF
+          chmod +x "$PWD/fake-openclaw-old"
+
+          if sh "$root/install.sh" --skip-npm-install --openclaw-bin "$PWD/fake-openclaw-old" > "$PWD/linux-old-version.log" 2>&1; then
+            echo "Expected install.sh to reject an old OpenClaw version" >&2
+            exit 1
+          fi
+
+          grep -q "requires OpenClaw 2026.03.24 or newer" "$PWD/linux-old-version.log"
+
+  smoke-test-bundle-windows:
+    runs-on: windows-latest
+    needs: bundle
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download workflow artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT_NAME }}
+          path: .
+
+      - name: Extract and verify bundle contents
+        shell: powershell
+        run: |
+          Remove-Item -Recurse -Force smoke-test -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path smoke-test\zip | Out-Null
+          Expand-Archive -LiteralPath openclaw-plugin-xiaoai-cloud-bundle.zip -DestinationPath smoke-test\zip -Force
+
+          $root = "smoke-test\zip\openclaw-plugin-xiaoai-cloud"
+          @(
+            "$root\install.sh",
+            "$root\install.cmd",
+            "$root\uninstall.sh",
+            "$root\uninstall.cmd",
+            "$root\openclaw.plugin.json",
+            "$root\package.json",
+            "$root\package-lock.json",
+            "$root\dist\index.js",
+            "$root\dist\src\provider.js",
+            "$root\assets\ui\xiaoai-console.css",
+            "$root\assets\ui\xiaoai-console.js",
+            "$root\assets\ui\favicon.svg",
+            "$root\assets\fonts\manrope\wght.css",
+            "$root\assets\fonts\noto-sans-sc\wght.css",
+            "$root\scripts\configure-openclaw-install.mjs",
+            "$root\scripts\configure-openclaw-uninstall.mjs",
+            "$root\scripts\probe-xiaomi-status.mjs"
+          ) | ForEach-Object {
+            if (-not (Test-Path $_)) {
+              throw "Missing expected bundle file: $_"
+            }
+          }
+
+          @(
+            "$root\README.md",
+            "$root\PROJECT_ANALYSIS.md",
+            "$root\CROSS_CLAW_ADAPTATION_PLAN.md"
+          ) | ForEach-Object {
+            if (Test-Path $_) {
+              throw "Unexpected file found in bundle: $_"
+            }
+          }
+
+      - name: Smoke test extracted Windows helpers
+        shell: cmd
+        run: |
+          set "ROOT=%CD%\smoke-test\zip\openclaw-plugin-xiaoai-cloud"
+          call "%ROOT%\install.cmd" --help >NUL
+          call "%ROOT%\uninstall.cmd" --help >NUL
+          node "%ROOT%\scripts\configure-openclaw-install.mjs" --help >NUL
+          node "%ROOT%\scripts\configure-openclaw-uninstall.mjs" --help >NUL
+
+          > "%CD%\fake-openclaw-old.cmd" (
+            echo @echo off
+            echo if "%%~1"=="--version" ^(
+            echo   echo OpenClaw 2026.3.23 ^(smoke-test^)
+            echo   exit /b 0
+            echo ^)
+            echo echo unsupported fake openclaw invocation: %%* 1^>^&2
+            echo exit /b 1
+          )
+
+          call "%ROOT%\install.cmd" --skip-npm-install --openclaw-bin "%CD%\fake-openclaw-old.cmd" > "%CD%\windows-old-version.log" 2>&1
+          if not errorlevel 1 (
+            echo Expected install.cmd to reject an old OpenClaw version
+            exit /b 1
+          )
+
+          findstr /c:"requires OpenClaw 2026.03.24 or newer" "%CD%\windows-old-version.log" >NUL
+
+  create-release:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.create_release }}
+    needs:
+      - smoke-test-bundle-linux
+      - smoke-test-bundle-windows
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download workflow artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT_NAME }}
+          path: .
+
+      - name: Generate release metadata
+        id: meta
+        run: |
+          set -eu
+
+          stamp=$(date -u +"%Y%m%d-%H%M%S")
+          tag="${stamp}"
+          title="${stamp}"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.title }}
+        run: |
+          : > empty-release-notes.md
+
+          gh release create "$RELEASE_TAG" \
+            openclaw-plugin-xiaoai-cloud-bundle.zip \
+            install.sh \
+            install.cmd \
+            release-assets.sha256 \
+            --title "$RELEASE_TITLE" \
+            --notes-file empty-release-notes.md \
+            --target "$GITHUB_SHA"

@@ -11,6 +11,7 @@ set "STATE_DIR=%OPENCLAW_STATE_DIR%"
 set "SKIP_NPM_INSTALL=0"
 set "PACKAGE_MANAGER=auto"
 set "OPENCLAW_BIN=%OPENCLAW_BIN%"
+set "MIN_OPENCLAW_VERSION=2026.03.24"
 set "HAS_SOURCE_TREE=0"
 set "EXIT_CODE=0"
 set "LOG_FILE=%XIAOAI_INSTALL_LOG_FILE%"
@@ -110,6 +111,7 @@ call :ensure_node_supported || (set "EXIT_CODE=1" & goto cleanup_and_exit)
 call :detect_package_manager || (set "EXIT_CODE=1" & goto cleanup_and_exit)
 where %PKG_MANAGER% >nul 2>nul || (echo Missing required command: %PKG_MANAGER% & set "EXIT_CODE=1" & goto cleanup_and_exit)
 call :ensure_openclaw_bin || (set "EXIT_CODE=1" & goto cleanup_and_exit)
+call :ensure_supported_openclaw || (set "EXIT_CODE=1" & goto cleanup_and_exit)
 call :detect_source_tree
 
 cd /d "%SOURCE_DIR%" || (echo Failed to enter source directory: %SOURCE_DIR% & set "EXIT_CODE=1" & goto cleanup_and_exit)
@@ -225,6 +227,7 @@ echo   - Older .tar.gz / .tgz release bundles are still supported for backward c
 echo   - If your OpenClaw gateway runs in Docker or on a remote server, run this script
 echo     inside that same container / host environment.
 echo   - If OpenClaw is not on PATH, pass --openclaw-bin with a local wrapper script path.
+echo   - Requires OpenClaw %MIN_OPENCLAW_VERSION% or newer.
 echo   - On failure, the script will print the failing stage and the installer log path.
 exit /b 0
 
@@ -420,6 +423,24 @@ exit /b 1
 if exist "%OPENCLAW_BIN%" exit /b 0
 where "%OPENCLAW_BIN%" >nul 2>nul && exit /b 0
 echo OpenClaw CLI not found: %OPENCLAW_BIN%
+exit /b 1
+
+:ensure_supported_openclaw
+set "OPENCLAW_VERSION_OUTPUT="
+for /f "usebackq delims=" %%v in (`call "%OPENCLAW_BIN%" --version 2^>^&1`) do set "OPENCLAW_VERSION_OUTPUT=%%v"
+if not defined OPENCLAW_VERSION_OUTPUT (
+  echo Failed to detect OpenClaw version from %OPENCLAW_BIN%.
+  exit /b 1
+)
+node -e "const raw=(process.argv[1]||'').trim(); const min=[2026,3,24]; const match=raw.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/); if (!match) process.exit(2); const current=match.slice(1).map(Number); for (let i=0; i<min.length; i+=1) { if (current[i] > min[i]) process.exit(0); if (current[i] < min[i]) process.exit(1); } process.exit(0);" "%OPENCLAW_VERSION_OUTPUT%" >nul 2>nul
+set "OPENCLAW_VERSION_STATUS=%ERRORLEVEL%"
+if "%OPENCLAW_VERSION_STATUS%"=="0" exit /b 0
+if "%OPENCLAW_VERSION_STATUS%"=="2" (
+  echo Failed to parse OpenClaw version from: %OPENCLAW_VERSION_OUTPUT%
+  echo This installer requires OpenClaw %MIN_OPENCLAW_VERSION% or newer.
+  exit /b 1
+)
+echo OpenClaw %OPENCLAW_VERSION_OUTPUT% is too old. This plugin requires OpenClaw %MIN_OPENCLAW_VERSION% or newer because it depends on the new plugin SDK / Gateway runtime.
 exit /b 1
 
 :run_openclaw

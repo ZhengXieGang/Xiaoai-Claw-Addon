@@ -10,6 +10,7 @@ STATE_DIR="${OPENCLAW_STATE_DIR:-}"
 SKIP_NPM_INSTALL=0
 PACKAGE_MANAGER="auto"
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
+MIN_OPENCLAW_VERSION="2026.03.24"
 HAS_SOURCE_TREE=0
 LOG_FILE="${XIAOAI_INSTALL_LOG_FILE:-}"
 CURRENT_STAGE="bootstrap"
@@ -43,6 +44,7 @@ Notes:
     running `bash ./install.sh` is equally valid.
   - If your OpenClaw gateway runs in Docker or on a remote server, run this script
     inside that same container / host environment.
+  - Requires OpenClaw 2026.03.24 or newer.
   - On failure, the script will print the failing stage and the installer log path.
 EOF
 }
@@ -305,6 +307,43 @@ ensure_supported_node() {
     error "Node.js $(node -p 'process.versions.node') is too old. OpenClaw 官方文档要求插件环境使用 Node.js 22 或更高版本。"
     exit 1
   fi
+}
+
+ensure_supported_openclaw() {
+  version_output=$(
+    "$OPENCLAW_BIN" --version 2>&1 | tr -d '\r' | awk 'NF { line = $0 } END { print line }'
+  )
+  openclaw_version_status=$(
+    node -e '
+const raw = (process.argv[1] || "").trim();
+const min = [2026, 3, 24];
+const match = raw.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/);
+if (!match) {
+  process.exit(2);
+}
+const current = match.slice(1).map(Number);
+for (let index = 0; index < min.length; index += 1) {
+  if (current[index] > min[index]) {
+    process.exit(0);
+  }
+  if (current[index] < min[index]) {
+    process.exit(1);
+  }
+}
+process.exit(0);
+' "$version_output" >/dev/null 2>&1
+    printf '%s' "$?"
+  )
+  if [ "$openclaw_version_status" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$openclaw_version_status" -eq 2 ]; then
+    error "Failed to parse OpenClaw version from: ${version_output:-<empty>}"
+    error "This installer requires OpenClaw ${MIN_OPENCLAW_VERSION} or newer."
+    exit 1
+  fi
+  error "OpenClaw ${version_output:-<unknown>} is too old. This plugin requires OpenClaw ${MIN_OPENCLAW_VERSION} or newer because it depends on the new plugin SDK / Gateway runtime."
+  exit 1
 }
 
 run_pkg() {
@@ -656,6 +695,7 @@ if [ ! -x "$OPENCLAW_BIN" ] && ! command -v "$OPENCLAW_BIN" >/dev/null 2>&1; the
   error "PATH=$PATH"
   exit 1
 fi
+ensure_supported_openclaw
 
 detect_source_tree
 

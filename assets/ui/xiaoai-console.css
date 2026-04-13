@@ -6810,6 +6810,26 @@ body[data-page="console"] .control-card .toggle-pill-btn {
   color: var(--text-faint);
 }
 
+.control-metric-slider {
+  gap: 10px;
+}
+
+.control-metric-slider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.calibration-offset-shell {
+  grid-column: 1 / -1;
+}
+
+.calibration-offset-shell .range-field {
+  width: 100%;
+  margin: 0;
+}
+
 button.soft-btn,
 button.tonal-btn,
 button.primary-btn,

@@ -246,6 +246,7 @@ interface ConsoleConversationInterceptLatencyProfile {
     conversationVisibleEstimateMs?: number;
     nativePlaybackStartEstimateMs?: number;
     interceptLeadEstimateMs?: number;
+    manualOffsetMs?: number;
     updatedAt?: string;
 }
 
@@ -253,6 +254,7 @@ interface ConsoleConversationInterceptCalibrationState {
     running: boolean;
     pollIntervalMs: number;
     recommendedPollIntervalMs?: number;
+    manualOffsetMs: number;
     currentProfile?: ConsoleConversationInterceptLatencyProfile;
     lastRun?: PersistedConversationInterceptCalibrationSummary;
     prompt?: ConsoleCalibrationPrompt;
@@ -479,7 +481,58 @@ interface ConversationInterceptLatencyProfile {
     conversationVisibleEstimateMs?: number;
     nativePlaybackStartEstimateMs?: number;
     interceptLeadEstimateMs?: number;
+    manualOffsetMs?: number;
     updatedAtMs: number;
+}
+
+interface ConversationInterceptHint {
+    answersPresent?: boolean;
+    answerCount?: number;
+    recordAgeMs?: number;
+}
+
+interface ConversationInterceptRuntimeState {
+    updatedAtMs: number;
+    lateRecordScore: number;
+    playbackReboundScore: number;
+    lastPlaybackDetectedElapsedMs?: number;
+}
+
+type SpeakerAudioLatencyKey =
+    | "statusProbeEstimateMs"
+    | "pauseCommandEstimateMs"
+    | "pauseSettleEstimateMs"
+    | "stopSettleEstimateMs"
+    | "playbackDetectEstimateMs";
+
+type ConversationInterceptLatencyKey =
+    | "conversationVisibleEstimateMs"
+    | "nativePlaybackStartEstimateMs"
+    | "interceptLeadEstimateMs";
+
+interface ConversationFetchLatencyProfile {
+    estimateMs: number;
+    updatedAtMs: number;
+}
+
+interface ConversationInterceptGuardPlan {
+    aggressive: boolean;
+    silenceMode: "pause" | "fast-stop";
+    manualOffsetMs: number;
+    estimatedSpeechOnsetMs: number;
+    primaryLeadReserveMs: number;
+    primarySilenceDelayMs: number;
+    suppressTransitionPrompt: boolean;
+    guardDelaysMs: number[];
+    lateRecordFollowUpDelayMs: number;
+    runtimeMonitorPollMs: number;
+    runtimeMonitorDurationMs: number;
+    transitionGraceMs: number;
+}
+
+interface ConversationInterceptSupplementalGuardState {
+    attemptsUsed: number;
+    lastAttemptAtMs: number;
 }
 
 const DEFAULT_TRANSITION_PHRASES = ["让我想想", "嗯，稍等一下", "好的，我想想"];
@@ -614,7 +667,29 @@ const CONVERSATION_INTERCEPT_CALIBRATION_SETTLE_MS = 450;
 const CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT = 10;
 const CONVERSATION_INTERCEPT_CALIBRATION_POST_VISIBLE_OBSERVE_MIN_MS = 220;
 const CONVERSATION_INTERCEPT_CALIBRATION_POST_VISIBLE_OBSERVE_MAX_MS = 480;
-const CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS = 900;
+const CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS = 1_800;
+const CONVERSATION_INTERCEPT_MAX_SUPPLEMENTAL_ATTEMPTS = 2;
+const CONVERSATION_INTERCEPT_SUPPLEMENTAL_MIN_SPACING_MS = 180;
+const CONVERSATION_INTERCEPT_RUNTIME_MAX_INTERVENTIONS = 1;
+const CONVERSATION_INTERCEPT_LATE_RECORD_BURST_DELAY_MS = 120;
+const CONVERSATION_INTERCEPT_LATE_RECORD_FORWARD_GATE_DELAYS_MS = [
+    0, 60, 140, 240, 360,
+];
+const MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS = -900;
+const MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS = 900;
+const CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS = 25;
+const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_MIN_MS = 1400;
+const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_MAX_MS = 3200;
+const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_POLL_MS = 120;
+const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_AGGRESSIVE_POLL_MS = 90;
+const CONVERSATION_INTERCEPT_TRANSITION_GRACE_MIN_MS = 320;
+const CONVERSATION_INTERCEPT_TRANSITION_GRACE_MAX_MS = 1200;
+const CONVERSATION_FETCH_ESTIMATE_DEFAULT_MS = 320;
+const CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS = 70;
+const CONVERSATION_FETCH_HEDGE_MAX_DELAY_MS = 140;
+const MAX_CONVERSATION_FETCH_INFLIGHT = 2;
+const CONVERSATION_STARTUP_STALE_RECORD_IGNORE_MS = 45_000;
+const SPEAKER_INTERRUPT_BURST_VERIFY_DELAYS_MS = [0, 40, 80, 140, 220];
 const CONVERSATION_INTERCEPT_CALIBRATION_QUERIES = [
     "现在几点",
     "今天星期几",
@@ -660,6 +735,79 @@ class HttpError extends Error {
 
 function clamp(value: number, min: number, max: number) {
     return Math.max(min, Math.min(max, value));
+}
+
+function percentileFromSorted(values: readonly number[], percentile: number) {
+    if (!values.length) {
+        return undefined;
+    }
+    const safePercentile = clamp(percentile, 0, 1);
+    if (values.length === 1) {
+        return values[0];
+    }
+    const index = (values.length - 1) * safePercentile;
+    const lowerIndex = Math.floor(index);
+    const upperIndex = Math.ceil(index);
+    if (lowerIndex === upperIndex) {
+        return values[lowerIndex];
+    }
+    const lower = values[lowerIndex] ?? values[0];
+    const upper = values[upperIndex] ?? values[values.length - 1];
+    const weight = index - lowerIndex;
+    return lower + (upper - lower) * weight;
+}
+
+function appendTimingSample<K extends string>(
+    buckets: Partial<Record<K, number[]>> | undefined,
+    key: K,
+    observedMs?: number,
+    maxMs = 20_000
+) {
+    const value = readNumber(observedMs);
+    if (
+        !buckets ||
+        typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value <= 0
+    ) {
+        return;
+    }
+    const next = buckets[key] || [];
+    next.push(clamp(Math.round(value), 1, maxMs));
+    buckets[key] = next.slice(-18);
+}
+
+function buildRobustTimingEstimate(
+    values: readonly number[] | undefined,
+    options?: {
+        cap?: number;
+        percentile?: number;
+        headroom?: number;
+    }
+) {
+    const normalized = (values || [])
+        .map((value) => clamp(Math.round(Number(value) || 0), 1, options?.cap || 20_000))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .sort((left, right) => left - right);
+    if (!normalized.length) {
+        return undefined;
+    }
+    const trimCount =
+        normalized.length >= 5
+            ? Math.min(2, Math.floor((normalized.length - 1) / 4))
+            : 0;
+    const core =
+        trimCount > 0 && normalized.length > trimCount * 2
+            ? normalized.slice(trimCount, normalized.length - trimCount)
+            : normalized;
+    const percentileValue =
+        percentileFromSorted(core, options?.percentile ?? 0.6) ??
+        core[Math.floor(core.length / 2)] ??
+        normalized[Math.floor(normalized.length / 2)];
+    const estimate = Math.round(
+        percentileValue * Math.max(1, Number(options?.headroom) || 1)
+    );
+    return clamp(estimate, 1, options?.cap || 20_000);
 }
 
 function normalizeSpeakerVolumePercent(raw: number, min?: number, max?: number) {
@@ -1764,6 +1912,27 @@ function normalizePollIntervalMs(value: any, fallback = DEFAULT_POLL_INTERVAL_MS
     return clamp(Math.round(parsed), MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS);
 }
 
+function normalizeConversationInterceptManualOffsetMs(
+    value: any,
+    fallback = 0
+) {
+    const resolvedFallback = clamp(
+        Math.round(Number(fallback) || 0),
+        MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS,
+        MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS
+    );
+    const parsed = readNumber(value);
+    if (typeof parsed !== "number" || !Number.isFinite(parsed)) {
+        return resolvedFallback;
+    }
+    return clamp(
+        Math.round(parsed / CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS) *
+            CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS,
+        MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS,
+        MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS
+    );
+}
+
 function normalizeOpenclawContextTokens(
     value: any,
     fallback?: number
@@ -2328,6 +2497,7 @@ class XiaoaiCloudPlugin {
     private pollLoopRunner?: () => void;
     private latestConversationFetchKey?: string;
     private latestConversationFetchPromise?: Promise<any | null>;
+    private conversationFetchInflightCount = 0;
     private openclawVoiceSessionKey?: string;
     private openclawVoiceSessionExpiresAt = 0;
     private voiceContextTurns: VoiceContextTurn[] = [];
@@ -2345,13 +2515,29 @@ class XiaoaiCloudPlugin {
     private readonly audioPlaybackCapability = new Map<string, AudioPlaybackCapabilityEntry>();
     private readonly externalAudioLoopGuards = new Map<string, ExternalAudioLoopGuard>();
     private readonly speakerAudioLatencyProfiles = new Map<string, SpeakerAudioLatencyProfile>();
+    private readonly conversationFetchLatencyProfiles = new Map<
+        string,
+        ConversationFetchLatencyProfile
+    >();
     private readonly conversationInterceptLatencyProfiles = new Map<
         string,
         ConversationInterceptLatencyProfile
     >();
+    private readonly conversationInterceptRuntimeStates = new Map<
+        string,
+        ConversationInterceptRuntimeState
+    >();
     private calibrationProfilesHydrated = false;
     private audioCalibrationRunning = false;
     private conversationInterceptCalibrationRunning = false;
+    private activeSpeakerAudioCalibrationDeviceId?: string;
+    private activeSpeakerAudioCalibrationSamples?: Partial<
+        Record<SpeakerAudioLatencyKey, number[]>
+    >;
+    private activeConversationCalibrationDeviceId?: string;
+    private activeConversationCalibrationSamples?: Partial<
+        Record<ConversationInterceptLatencyKey, number[]>
+    >;
     private lastAudioCalibration?: PersistedAudioCalibrationSummary;
     private lastConversationInterceptCalibration?: PersistedConversationInterceptCalibrationSummary;
     private readonly ttsBridgeInflightAssets = new Map<string, Promise<GeneratedAudioAsset>>();
@@ -2884,6 +3070,13 @@ class XiaoaiCloudPlugin {
                 hasEstimate = true;
             }
         });
+        const manualOffsetMs = readNumber(value.manualOffsetMs);
+        if (typeof manualOffsetMs === "number" && Number.isFinite(manualOffsetMs)) {
+            next.manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+                manualOffsetMs
+            );
+            hasEstimate = true;
+        }
         return hasEstimate ? next : undefined;
     }
 
@@ -2900,6 +3093,7 @@ class XiaoaiCloudPlugin {
             nativePlaybackStartEstimateMs:
                 normalized.nativePlaybackStartEstimateMs,
             interceptLeadEstimateMs: normalized.interceptLeadEstimateMs,
+            manualOffsetMs: normalized.manualOffsetMs,
             updatedAtMs: normalized.updatedAtMs,
         };
     }
@@ -2917,6 +3111,7 @@ class XiaoaiCloudPlugin {
             nativePlaybackStartEstimateMs:
                 normalized.nativePlaybackStartEstimateMs,
             interceptLeadEstimateMs: normalized.interceptLeadEstimateMs,
+            manualOffsetMs: normalized.manualOffsetMs,
             updatedAt:
                 normalized.updatedAtMs > 0
                     ? new Date(normalized.updatedAtMs).toISOString()
@@ -3388,6 +3583,9 @@ class XiaoaiCloudPlugin {
                 DEFAULT_POLL_INTERVAL_MS
             ),
             recommendedPollIntervalMs,
+            manualOffsetMs: normalizeConversationInterceptManualOffsetMs(
+                currentProfile?.manualOffsetMs
+            ),
             currentProfile,
             lastRun: this.buildConsoleConversationInterceptCalibrationSummary(
                 this.lastConversationInterceptCalibration
@@ -5602,7 +5800,42 @@ class XiaoaiCloudPlugin {
                             : `轮询间隔已更新为 ${result.pollIntervalMs}ms`
                         : lowPollIntervalWarning
                             ? `当前轮询间隔保持 ${result.pollIntervalMs}ms。${lowPollIntervalWarning}`
-                            : `当前轮询间隔保持 ${result.pollIntervalMs}ms`,
+                        : `当前轮询间隔保持 ${result.pollIntervalMs}ms`,
+                });
+                return true;
+            }
+            if (
+                requestMethod === "POST" &&
+                action === "device/conversation-intercept-offset"
+            ) {
+                const body = await readJsonBody(request);
+                const manualOffsetMs = readNumber(
+                    body?.manualOffsetMs ?? body?.milliseconds ?? body?.ms
+                );
+                if (
+                    typeof manualOffsetMs !== "number" ||
+                    !Number.isFinite(manualOffsetMs)
+                ) {
+                    sendJson(response, 400, { error: "对话拦截微调参数无效。" });
+                    return true;
+                }
+                const result =
+                    await this.updateConversationInterceptManualOffsetMs(
+                        manualOffsetMs
+                    );
+                await this.appendConsoleEvent(
+                    "console.conversation_intercept_offset",
+                    "控制台微调对话拦截",
+                    `${result.previousManualOffsetMs}ms -> ${result.manualOffsetMs}ms`,
+                    "success"
+                );
+                sendJson(response, 200, {
+                    ok: true,
+                    manualOffsetMs: result.manualOffsetMs,
+                    calibration: this.buildConsoleConversationInterceptCalibrationState(),
+                    message: result.changed
+                        ? `对话拦截微调已更新为 ${result.manualOffsetMs}ms`
+                        : `当前对话拦截微调保持 ${result.manualOffsetMs}ms`,
                 });
                 return true;
             }
@@ -7054,6 +7287,37 @@ class XiaoaiCloudPlugin {
         };
     }
 
+    private async updateConversationInterceptManualOffsetMs(msInput: number) {
+        const config = await this.loadConfig(false);
+        const deviceId = readString(this.device?.minaDeviceId);
+        if (!deviceId) {
+            throw new Error("当前还没有选定可写入画像的设备。");
+        }
+        const currentProfile = this.readConversationInterceptLatencyProfile(deviceId) || {
+            updatedAtMs: 0,
+        };
+        const previousManualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+            currentProfile.manualOffsetMs
+        );
+        const manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+            msInput,
+            previousManualOffsetMs
+        );
+        const nextProfile: ConversationInterceptLatencyProfile = {
+            ...currentProfile,
+            manualOffsetMs,
+            updatedAtMs: Date.now(),
+        };
+        this.conversationInterceptLatencyProfiles.set(deviceId, nextProfile);
+        await this.persistResolvedProfile(config, this.device, true);
+        return {
+            deviceId,
+            manualOffsetMs,
+            previousManualOffsetMs,
+            changed: manualOffsetMs !== previousManualOffsetMs,
+        };
+    }
+
     private async updateAudioTailPaddingMs(msInput: number) {
         const config = await this.loadConfig(false);
         const previousTailPaddingMs = this.getAudioRelayTailPaddingMs(config);
@@ -7715,23 +7979,100 @@ class XiaoaiCloudPlugin {
         );
     }
 
-    private async fetchLatestConversationFor(
+    private noteConversationFetchLatency(deviceId?: string, observedMs?: number) {
+        const normalizedDeviceId = readString(deviceId);
+        const nextObservedMs = readNumber(observedMs);
+        if (
+            !normalizedDeviceId ||
+            typeof nextObservedMs !== "number" ||
+            !Number.isFinite(nextObservedMs) ||
+            nextObservedMs <= 0
+        ) {
+            return undefined;
+        }
+        const boundedObservedMs = clamp(Math.round(nextObservedMs), 40, 5_000);
+        const current = this.conversationFetchLatencyProfiles.get(normalizedDeviceId);
+        const previousEstimate = readNumber(current?.estimateMs);
+        const nextEstimate =
+            typeof previousEstimate === "number" && Number.isFinite(previousEstimate)
+                ? boundedObservedMs >= previousEstimate
+                    ? clamp(
+                        Math.round(
+                            previousEstimate * 0.72 +
+                                Math.min(
+                                    boundedObservedMs,
+                                    Math.max(
+                                        previousEstimate * 1.8,
+                                        previousEstimate + 240
+                                    )
+                                ) *
+                                    0.28
+                        ),
+                        40,
+                        5_000
+                    )
+                    : clamp(
+                        Math.round(
+                            previousEstimate * 0.38 + boundedObservedMs * 0.62
+                        ),
+                        40,
+                        5_000
+                    )
+                : boundedObservedMs;
+        this.conversationFetchLatencyProfiles.set(normalizedDeviceId, {
+            estimateMs: nextEstimate,
+            updatedAtMs: Date.now(),
+        });
+        return nextEstimate;
+    }
+
+    private readConversationFetchLatencyEstimate(deviceId?: string) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return readNumber(
+            this.conversationFetchLatencyProfiles.get(normalizedDeviceId)?.estimateMs
+        );
+    }
+
+    private shouldUseHedgedConversationFetch(deviceId?: string) {
+        return Boolean(
+            readString(deviceId) &&
+                (this.conversationInterceptCalibrationRunning ||
+                    this.waitingForResponse ||
+                    Date.now() < this.fastPollUntil)
+        );
+    }
+
+    private computeConversationFetchHedgeDelayMs(deviceId?: string) {
+        const estimateMs =
+            this.readConversationFetchLatencyEstimate(deviceId) ||
+            CONVERSATION_FETCH_ESTIMATE_DEFAULT_MS;
+        const currentPollMs = this.currentPollInterval(this.config);
+        return clamp(
+            Math.round(
+                Math.max(
+                    CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS,
+                    Math.min(estimateMs * 0.33, currentPollMs + 20)
+                )
+            ),
+            CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS,
+            CONVERSATION_FETCH_HEDGE_MAX_DELAY_MS
+        );
+    }
+
+    private async performConversationFetch(
         minaClient: MiNAClient,
         device: DeviceContext
     ): Promise<any | null> {
-        const key = `${device.hardware}:${device.minaDeviceId}`;
-        if (
-            this.latestConversationFetchPromise &&
-            this.latestConversationFetchKey === key
-        ) {
-            return this.latestConversationFetchPromise;
-        }
-
-        const request = (async () => {
+        const startedAtMs = Date.now();
+        this.conversationFetchInflightCount += 1;
+        try {
             const response = await minaClient.fetchConversation(
                 device.hardware,
                 device.minaDeviceId,
-                1
+                3
             );
             const rawData = response?.data;
             const payload =
@@ -7739,8 +8080,119 @@ class XiaoaiCloudPlugin {
                     ? readJsonObject<Record<string, any>>(rawData, "小爱最新会话 data")
                     : rawData;
             const records = Array.isArray(payload?.records) ? payload.records : [];
-            return records.length > 0 ? records[0] : null;
-        })();
+            this.noteConversationFetchLatency(
+                device.minaDeviceId,
+                Date.now() - startedAtMs
+            );
+            return this.selectLatestConversationCandidate(records);
+        } finally {
+            this.conversationFetchInflightCount = Math.max(
+                0,
+                this.conversationFetchInflightCount - 1
+            );
+        }
+    }
+
+    private selectLatestConversationCandidate(records: any[]): any | null {
+        if (!Array.isArray(records) || records.length <= 0) {
+            return null;
+        }
+        const candidates = records
+            .map((record, index) => ({
+                record,
+                normalized: this.normalizeConversationRecord(record, index),
+                timestamp: readNumber(record?.time) || 0,
+            }))
+            .filter((item) => item.normalized.query)
+            .sort((left, right) => {
+                if (left.timestamp !== right.timestamp) {
+                    return right.timestamp - left.timestamp;
+                }
+                return left.normalized.answers.length - right.normalized.answers.length;
+            });
+        if (candidates.length <= 0) {
+            return records[0] || null;
+        }
+        const freshestTimestamp = candidates[0]?.timestamp || 0;
+        const nearFreshCandidates = candidates.filter((item) => {
+            if (freshestTimestamp <= 0 || item.timestamp <= 0) {
+                return true;
+            }
+            return freshestTimestamp - item.timestamp <= 2500;
+        });
+        const earliestVisibleCandidate = nearFreshCandidates.find(
+            (item) => item.normalized.answers.length <= 0
+        );
+        return (
+            earliestVisibleCandidate?.record ||
+            nearFreshCandidates[0]?.record ||
+            candidates[0]?.record ||
+            records[0] ||
+            null
+        );
+    }
+
+    private async fetchLatestConversationFor(
+        minaClient: MiNAClient,
+        device: DeviceContext,
+        options?: {
+            hedged?: boolean;
+        }
+    ): Promise<any | null> {
+        const key = `${device.hardware}:${device.minaDeviceId}`;
+        const allowHedge =
+            options?.hedged === true &&
+            this.shouldUseHedgedConversationFetch(device.minaDeviceId) &&
+            this.conversationFetchInflightCount < MAX_CONVERSATION_FETCH_INFLIGHT - 1;
+        if (allowHedge) {
+            const primaryStartedAtMs = Date.now();
+            const primary = this.performConversationFetch(minaClient, device).then(
+                (record) => ({
+                    record,
+                    source: "primary" as const,
+                    elapsedMs: Math.max(0, Date.now() - primaryStartedAtMs),
+                })
+            );
+            const hedgeDelayMs = this.computeConversationFetchHedgeDelayMs(
+                device.minaDeviceId
+            );
+            const hedge = (async () => {
+                await sleep(hedgeDelayMs);
+                if (
+                    this.conversationFetchInflightCount >=
+                    MAX_CONVERSATION_FETCH_INFLIGHT
+                ) {
+                    return primary;
+                }
+                const hedgeStartedAtMs = Date.now();
+                const record = await this.performConversationFetch(minaClient, device);
+                return {
+                    record,
+                    source: "hedge" as const,
+                    elapsedMs: Math.max(0, Date.now() - hedgeStartedAtMs),
+                };
+            })();
+            const winner = await Promise.race([primary, hedge]);
+            if (winner.source === "hedge") {
+                void this.appendDebugTrace("conversation_fetch_hedged_won", {
+                    deviceId: device.minaDeviceId,
+                    hedgeDelayMs,
+                    elapsedMs: winner.elapsedMs,
+                    estimateMs: this.readConversationFetchLatencyEstimate(
+                        device.minaDeviceId
+                    ),
+                });
+            }
+            return winner.record;
+        }
+        if (
+            this.latestConversationFetchPromise &&
+            this.latestConversationFetchKey === key
+        ) {
+            return this.latestConversationFetchPromise;
+        }
+
+        const request = this.performConversationFetch(minaClient, device);
 
         this.latestConversationFetchKey = key;
         this.latestConversationFetchPromise = request;
@@ -7762,7 +8214,8 @@ class XiaoaiCloudPlugin {
         try {
             const latest = await this.fetchLatestConversationFor(
                 this.minaClient,
-                this.device
+                this.device,
+                { hedged: true }
             );
             if (!latest) {
                 return;
@@ -7789,7 +8242,9 @@ class XiaoaiCloudPlugin {
             throw new Error("小爱云后端尚未初始化。");
         }
 
-        return this.fetchLatestConversationFor(this.minaClient, this.device);
+        return this.fetchLatestConversationFor(this.minaClient, this.device, {
+            hedged: true,
+        });
     }
 
     private startPolling() {
@@ -7873,10 +8328,14 @@ class XiaoaiCloudPlugin {
         const latestTimestamp = Number(latest.time || 0);
         const latestRequestId = String(latest.requestId || "");
         const latestQuery = String(latest.query || "").trim();
+        const recordAgeMs =
+            latestTimestamp > 0 ? Math.max(0, Date.now() - latestTimestamp) : 0;
 
         if (!latestQuery) {
             return;
         }
+
+        const normalizedConversation = this.normalizeConversationRecord(latest);
 
         const isDuplicate =
             latestTimestamp < this.lastConversationTimestamp ||
@@ -7895,11 +8354,25 @@ class XiaoaiCloudPlugin {
         this.lastConversationRequestId = latestRequestId;
         this.lastConversationQuery = latestQuery;
 
-        if (this.shouldIgnoreSelfTriggeredQuery(latestQuery, latestTimestamp || Date.now())) {
+        if (
+            this.shouldIgnoreStartupStaleConversationRecord(
+                recordAgeMs,
+                normalizedConversation.answers.length > 0
+            )
+        ) {
+            await this.appendDebugTrace("conversation_record_ignored", {
+                reason: "startup_stale_answered_record",
+                requestId: latestRequestId || undefined,
+                query: latestQuery,
+                recordAgeMs,
+                answerCount: normalizedConversation.answers.length,
+            });
             return;
         }
 
-        const normalizedConversation = this.normalizeConversationRecord(latest);
+        if (this.shouldIgnoreSelfTriggeredQuery(latestQuery, latestTimestamp || Date.now())) {
+            return;
+        }
         this.recordConsoleEvent(
             "conversation.user",
             "用户对小爱说",
@@ -7916,10 +8389,17 @@ class XiaoaiCloudPlugin {
         }
 
         console.log(`<- [语音识别/云端] "${latestQuery}" | 当前模式: ${this.currentMode}`);
-        await this.handleIncomingQuery(latestQuery);
+        await this.handleIncomingQuery(latestQuery, {
+            answersPresent: normalizedConversation.answers.length > 0,
+            answerCount: normalizedConversation.answers.length,
+            recordAgeMs,
+        });
     }
 
-    private async handleIncomingQuery(query: string) {
+    private async handleIncomingQuery(
+        query: string,
+        hint?: ConversationInterceptHint
+    ) {
         switch (this.currentMode) {
             case "silent":
                 console.log("   [静默] 跳过，不拦截");
@@ -7934,6 +8414,7 @@ class XiaoaiCloudPlugin {
                     }
                     await this.interceptAndForward(query, {
                         renewVoiceSession,
+                        interceptHint: hint,
                     });
                 }
                 return;
@@ -7957,6 +8438,7 @@ class XiaoaiCloudPlugin {
                     }
                     await this.interceptAndForward(query, {
                         renewVoiceSession,
+                        interceptHint: hint,
                     });
                 } else {
                     const windowState =
@@ -9889,7 +10371,8 @@ class XiaoaiCloudPlugin {
         command: string,
         startedAtMs: number,
         baselineTimestamp: number,
-        baselineRequestId?: string
+        baselineRequestId?: string,
+        anchorAtMs?: number
     ) {
         const deadlineAtMs =
             startedAtMs + CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS;
@@ -9898,7 +10381,7 @@ class XiaoaiCloudPlugin {
             comparableDirectiveText(command) ||
             command;
         while (Date.now() < deadlineAtMs) {
-            const latest = await this.fetchLatestConversationFor(mina, device).catch(
+            const latest = await this.performConversationFetch(mina, device).catch(
                 () => null
             );
             if (latest && this.isNewerConversationRecord(latest, baselineTimestamp, baselineRequestId)) {
@@ -9911,9 +10394,13 @@ class XiaoaiCloudPlugin {
                     comparableDirectiveText(normalizedQuery) ||
                     normalizedQuery;
                 if (comparable && comparable === expectedComparable) {
+                    const anchorMs =
+                        typeof anchorAtMs === "number" && Number.isFinite(anchorAtMs)
+                            ? anchorAtMs
+                            : startedAtMs;
                     return {
                         record: latest,
-                        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                        elapsedMs: Math.max(0, Date.now() - anchorMs),
                     };
                 }
             }
@@ -9929,7 +10416,8 @@ class XiaoaiCloudPlugin {
         baselineSnapshot?: SpeakerPlaybackSnapshot | null,
         command?: string,
         timeoutMs = CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS,
-        cancelState?: { cancelled?: boolean }
+        cancelState?: { cancelled?: boolean },
+        anchorAtMs?: number
     ) {
         const safeTimeoutMs = clamp(
             Math.round(
@@ -9941,6 +10429,10 @@ class XiaoaiCloudPlugin {
         const deadlineAtMs = startedAtMs + safeTimeoutMs;
         let lastSnapshot = baselineSnapshot || null;
         const samples: Record<string, any>[] = [];
+        const elapsedAnchorMs =
+            typeof anchorAtMs === "number" && Number.isFinite(anchorAtMs)
+                ? anchorAtMs
+                : startedAtMs;
         while (Date.now() < deadlineAtMs) {
             if (cancelState?.cancelled) {
                 return null;
@@ -9957,7 +10449,7 @@ class XiaoaiCloudPlugin {
                 );
             if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
                 samples.push({
-                    elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                    elapsedMs: Math.max(0, Date.now() - elapsedAnchorMs),
                     reason: reason || "",
                     snapshot: this.summarizeSpeakerPlaybackSnapshot(snapshot),
                 });
@@ -9969,7 +10461,7 @@ class XiaoaiCloudPlugin {
                         deviceId,
                         command,
                         reason,
-                        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                        elapsedMs: Math.max(0, Date.now() - elapsedAnchorMs),
                         baselineSnapshot: this.summarizeSpeakerPlaybackSnapshot(
                             baselineSnapshot || null
                         ),
@@ -9979,7 +10471,7 @@ class XiaoaiCloudPlugin {
                 );
                 return {
                     snapshot,
-                    elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                    elapsedMs: Math.max(0, Date.now() - elapsedAnchorMs),
                     reason,
                 };
             }
@@ -10096,6 +10588,8 @@ class XiaoaiCloudPlugin {
         let lastError: string | undefined;
 
         this.conversationInterceptCalibrationRunning = true;
+        this.activeConversationCalibrationDeviceId = device.minaDeviceId;
+        this.activeConversationCalibrationSamples = {};
         try {
             await this.stopSpeaker({ fast: true }).catch(() => false);
             await this.clearConsoleAudioPlaybackState().catch(() => undefined);
@@ -10125,6 +10619,7 @@ class XiaoaiCloudPlugin {
                     if (!ok) {
                         throw new Error("测试问句没有成功发给小爱。");
                     }
+                    const commandAcceptedAtMs = Date.now();
 
                     const playbackCancelState = { cancelled: false };
                     const calibrationPauseGuardTask =
@@ -10137,7 +10632,7 @@ class XiaoaiCloudPlugin {
                                     mina,
                                     miio,
                                 },
-                                startedAtMs,
+                                commandAcceptedAtMs,
                                 playbackCancelState
                             ).catch((error) => {
                                 void this.appendDebugTrace(
@@ -10158,7 +10653,8 @@ class XiaoaiCloudPlugin {
                             baselinePlaybackSnapshot,
                             command,
                             playbackWaitMs,
-                            playbackCancelState
+                            playbackCancelState,
+                            commandAcceptedAtMs
                         ).catch(() => null);
                     const conversationResult =
                         await this.waitForConversationInterceptCalibrationRecord(
@@ -10167,7 +10663,8 @@ class XiaoaiCloudPlugin {
                             command,
                             startedAtMs,
                             baselineTimestamp,
-                            baselineRequestId
+                            baselineRequestId,
+                            commandAcceptedAtMs
                         );
                     const conversationVisibleMs = Math.max(
                         1,
@@ -10280,6 +10777,10 @@ class XiaoaiCloudPlugin {
                         {
                             deviceId: device.minaDeviceId,
                             command,
+                            commandDispatchMs: Math.max(
+                                0,
+                                commandAcceptedAtMs - startedAtMs
+                            ),
                             conversationVisibleMs,
                             nativePlaybackStartMs,
                             interceptLeadMs,
@@ -10314,6 +10815,9 @@ class XiaoaiCloudPlugin {
             if (successCount > 0 && nextPollIntervalMs !== finalPollIntervalMs) {
                 const updated = await this.updatePollIntervalMs(nextPollIntervalMs);
                 finalPollIntervalMs = updated.pollIntervalMs;
+            }
+            if (successCount > 0) {
+                this.applyConversationInterceptCalibrationSamples(device.minaDeviceId);
             }
 
             const summary: PersistedConversationInterceptCalibrationSummary = {
@@ -10371,6 +10875,8 @@ class XiaoaiCloudPlugin {
             return summary;
         } finally {
             this.conversationInterceptCalibrationRunning = false;
+            this.activeConversationCalibrationDeviceId = undefined;
+            this.activeConversationCalibrationSamples = undefined;
         }
     }
 
@@ -10385,6 +10891,8 @@ class XiaoaiCloudPlugin {
         let lastError: string | undefined;
 
         this.audioCalibrationRunning = true;
+        this.activeSpeakerAudioCalibrationDeviceId = device.minaDeviceId;
+        this.activeSpeakerAudioCalibrationSamples = {};
         try {
             await this.stopSpeaker({ fast: true }).catch(() => false);
             await this.clearConsoleAudioPlaybackState().catch(() => undefined);
@@ -10424,6 +10932,9 @@ class XiaoaiCloudPlugin {
                     await sleep(AUDIO_CALIBRATION_ROUND_SETTLE_MS);
                 }
             }
+            if (successCount > 0) {
+                this.applySpeakerAudioCalibrationSamples(device.minaDeviceId);
+            }
 
             const summary: PersistedAudioCalibrationSummary = {
                 deviceId: device.minaDeviceId,
@@ -10462,6 +10973,8 @@ class XiaoaiCloudPlugin {
             return summary;
         } finally {
             this.audioCalibrationRunning = false;
+            this.activeSpeakerAudioCalibrationDeviceId = undefined;
+            this.activeSpeakerAudioCalibrationSamples = undefined;
         }
     }
 
@@ -10513,14 +11026,183 @@ class XiaoaiCloudPlugin {
         return undefined;
     }
 
+    private collectSpeakerAudioCalibrationSample(
+        deviceId: string,
+        key: SpeakerAudioLatencyKey,
+        observedMs?: number
+    ) {
+        if (
+            !this.audioCalibrationRunning ||
+            this.activeSpeakerAudioCalibrationDeviceId !== deviceId
+        ) {
+            return;
+        }
+        appendTimingSample(
+            this.activeSpeakerAudioCalibrationSamples,
+            key,
+            observedMs,
+            10_000
+        );
+    }
+
+    private applySpeakerAudioCalibrationSamples(deviceId: string) {
+        if (
+            !deviceId ||
+            this.activeSpeakerAudioCalibrationDeviceId !== deviceId ||
+            !this.activeSpeakerAudioCalibrationSamples
+        ) {
+            return undefined;
+        }
+        const current = this.speakerAudioLatencyProfiles.get(deviceId) || {
+            updatedAtMs: 0,
+        };
+        const nextProfile: SpeakerAudioLatencyProfile = {
+            ...current,
+            updatedAtMs: Date.now(),
+        };
+        const nextStatusProbe = buildRobustTimingEstimate(
+            this.activeSpeakerAudioCalibrationSamples.statusProbeEstimateMs,
+            {
+                cap: 10_000,
+                percentile: 0.62,
+                headroom: 1.1,
+            }
+        );
+        if (typeof nextStatusProbe === "number") {
+            nextProfile.statusProbeEstimateMs = nextStatusProbe;
+        }
+        const nextPauseCommand = buildRobustTimingEstimate(
+            this.activeSpeakerAudioCalibrationSamples.pauseCommandEstimateMs,
+            {
+                cap: 10_000,
+                percentile: 0.58,
+                headroom: 1.08,
+            }
+        );
+        if (typeof nextPauseCommand === "number") {
+            nextProfile.pauseCommandEstimateMs = nextPauseCommand;
+        }
+        const nextPauseSettle = buildRobustTimingEstimate(
+            this.activeSpeakerAudioCalibrationSamples.pauseSettleEstimateMs,
+            {
+                cap: 10_000,
+                percentile: 0.6,
+                headroom: 1.08,
+            }
+        );
+        if (typeof nextPauseSettle === "number") {
+            nextProfile.pauseSettleEstimateMs = nextPauseSettle;
+        }
+        const nextStopSettle = buildRobustTimingEstimate(
+            this.activeSpeakerAudioCalibrationSamples.stopSettleEstimateMs,
+            {
+                cap: 10_000,
+                percentile: 0.6,
+                headroom: 1.08,
+            }
+        );
+        if (typeof nextStopSettle === "number") {
+            nextProfile.stopSettleEstimateMs = nextStopSettle;
+        }
+        const nextPlaybackDetect = buildRobustTimingEstimate(
+            this.activeSpeakerAudioCalibrationSamples.playbackDetectEstimateMs,
+            {
+                cap: 10_000,
+                percentile: 0.58,
+                headroom: 1.05,
+            }
+        );
+        if (typeof nextPlaybackDetect === "number") {
+            nextProfile.playbackDetectEstimateMs = nextPlaybackDetect;
+        }
+        this.speakerAudioLatencyProfiles.set(deviceId, nextProfile);
+        return nextProfile;
+    }
+
+    private collectConversationInterceptCalibrationSample(
+        deviceId: string,
+        key: ConversationInterceptLatencyKey,
+        observedMs?: number
+    ) {
+        if (
+            !this.conversationInterceptCalibrationRunning ||
+            this.activeConversationCalibrationDeviceId !== deviceId
+        ) {
+            return;
+        }
+        appendTimingSample(
+            this.activeConversationCalibrationSamples,
+            key,
+            observedMs,
+            20_000
+        );
+    }
+
+    private applyConversationInterceptCalibrationSamples(deviceId: string) {
+        if (
+            !deviceId ||
+            this.activeConversationCalibrationDeviceId !== deviceId ||
+            !this.activeConversationCalibrationSamples
+        ) {
+            return undefined;
+        }
+        const current = this.conversationInterceptLatencyProfiles.get(deviceId) || {
+            updatedAtMs: 0,
+        };
+        const nextProfile: ConversationInterceptLatencyProfile = {
+            ...current,
+            updatedAtMs: Date.now(),
+        };
+        const nextConversationVisible = buildRobustTimingEstimate(
+            this.activeConversationCalibrationSamples.conversationVisibleEstimateMs,
+            {
+                cap: 20_000,
+                percentile: 0.6,
+                headroom: 1.05,
+            }
+        );
+        if (typeof nextConversationVisible === "number") {
+            nextProfile.conversationVisibleEstimateMs = nextConversationVisible;
+        }
+        const nextNativePlaybackStart = buildRobustTimingEstimate(
+            this.activeConversationCalibrationSamples.nativePlaybackStartEstimateMs,
+            {
+                cap: 20_000,
+                percentile: 0.58,
+                headroom: 1.04,
+            }
+        );
+        if (typeof nextNativePlaybackStart === "number") {
+            nextProfile.nativePlaybackStartEstimateMs = nextNativePlaybackStart;
+        }
+        const nextInterceptLead = buildRobustTimingEstimate(
+            this.activeConversationCalibrationSamples.interceptLeadEstimateMs,
+            {
+                cap: 20_000,
+                percentile: 0.38,
+                headroom: 1,
+            }
+        );
+        if (typeof nextInterceptLead === "number") {
+            nextProfile.interceptLeadEstimateMs = clamp(nextInterceptLead, 120, 20_000);
+        }
+        if (
+            typeof nextProfile.conversationVisibleEstimateMs === "number" &&
+            typeof nextProfile.interceptLeadEstimateMs === "number"
+        ) {
+            nextProfile.nativePlaybackStartEstimateMs = Math.max(
+                readNumber(nextProfile.nativePlaybackStartEstimateMs) || 0,
+                nextProfile.conversationVisibleEstimateMs +
+                    nextProfile.interceptLeadEstimateMs
+            );
+        }
+        this.conversationInterceptLatencyProfiles.set(deviceId, nextProfile);
+        return nextProfile;
+    }
+
     private updateSpeakerAudioLatencyEstimate(
         deviceId: string,
-        key:
-            | "statusProbeEstimateMs"
-            | "pauseCommandEstimateMs"
-            | "pauseSettleEstimateMs"
-            | "stopSettleEstimateMs"
-            | "playbackDetectEstimateMs",
+        key: SpeakerAudioLatencyKey,
         observedMs?: number
     ) {
         const nextObservedMs = readNumber(observedMs);
@@ -10533,16 +11215,40 @@ class XiaoaiCloudPlugin {
             return undefined;
         }
         const boundedObservedMs = clamp(Math.round(nextObservedMs), 1, 10_000);
+        this.collectSpeakerAudioCalibrationSample(
+            deviceId,
+            key,
+            boundedObservedMs
+        );
         const current = this.speakerAudioLatencyProfiles.get(deviceId) || {
             updatedAtMs: 0,
         };
         const previousEstimate = readNumber(current[key]);
         const nextEstimate =
             typeof previousEstimate === "number" && Number.isFinite(previousEstimate)
-                ? Math.max(
-                    boundedObservedMs,
-                    clamp(Math.round(previousEstimate * 0.92), 1, 10_000)
-                )
+                ? boundedObservedMs >= previousEstimate
+                    ? clamp(
+                        Math.round(
+                            previousEstimate * 0.72 +
+                                Math.min(
+                                    boundedObservedMs,
+                                    Math.max(
+                                        previousEstimate * 1.7,
+                                        previousEstimate + 220
+                                    )
+                                ) *
+                                    0.28
+                        ),
+                        1,
+                        10_000
+                    )
+                    : clamp(
+                        Math.round(
+                            previousEstimate * 0.35 + boundedObservedMs * 0.65
+                        ),
+                        1,
+                        10_000
+                    )
                 : boundedObservedMs;
         const nextProfile: SpeakerAudioLatencyProfile = {
             ...current,
@@ -10563,10 +11269,7 @@ class XiaoaiCloudPlugin {
 
     private updateConversationInterceptLatencyEstimate(
         deviceId: string,
-        key:
-            | "conversationVisibleEstimateMs"
-            | "nativePlaybackStartEstimateMs"
-            | "interceptLeadEstimateMs",
+        key: ConversationInterceptLatencyKey,
         observedMs?: number
     ) {
         const nextObservedMs = readNumber(observedMs);
@@ -10579,6 +11282,11 @@ class XiaoaiCloudPlugin {
             return undefined;
         }
         const boundedObservedMs = clamp(Math.round(nextObservedMs), 1, 20_000);
+        this.collectConversationInterceptCalibrationSample(
+            deviceId,
+            key,
+            boundedObservedMs
+        );
         const current = this.conversationInterceptLatencyProfiles.get(deviceId) || {
             updatedAtMs: 0,
         };
@@ -10586,16 +11294,57 @@ class XiaoaiCloudPlugin {
         let nextEstimate = boundedObservedMs;
         if (typeof previousEstimate === "number" && Number.isFinite(previousEstimate)) {
             if (key === "interceptLeadEstimateMs") {
-                // 对拦截提前量采用保守估计，宁可更积极轮询，也不要被偶发高样本拉大。
-                nextEstimate = Math.min(
-                    boundedObservedMs,
-                    clamp(Math.round(previousEstimate * 1.04), 1, 20_000)
-                );
+                nextEstimate =
+                    boundedObservedMs >= previousEstimate
+                        ? clamp(
+                            Math.round(
+                                previousEstimate * 0.82 +
+                                    Math.min(
+                                        boundedObservedMs,
+                                        Math.max(
+                                            previousEstimate * 1.12,
+                                            previousEstimate + 60
+                                        )
+                                    ) *
+                                        0.18
+                            ),
+                            1,
+                            20_000
+                        )
+                        : clamp(
+                            Math.round(
+                                previousEstimate * 0.32 +
+                                    boundedObservedMs * 0.68
+                            ),
+                            1,
+                            20_000
+                        );
             } else {
-                nextEstimate = Math.max(
-                    boundedObservedMs,
-                    clamp(Math.round(previousEstimate * 0.92), 1, 20_000)
-                );
+                nextEstimate =
+                    boundedObservedMs >= previousEstimate
+                        ? clamp(
+                            Math.round(
+                                previousEstimate * 0.74 +
+                                    Math.min(
+                                        boundedObservedMs,
+                                        Math.max(
+                                            previousEstimate * 1.6,
+                                            previousEstimate + 260
+                                        )
+                                    ) *
+                                        0.26
+                            ),
+                            1,
+                            20_000
+                        )
+                        : clamp(
+                            Math.round(
+                                previousEstimate * 0.42 +
+                                    boundedObservedMs * 0.58
+                            ),
+                            1,
+                            20_000
+                        );
             }
         }
         const nextProfile: ConversationInterceptLatencyProfile = {
@@ -10615,6 +11364,93 @@ class XiaoaiCloudPlugin {
         return this.conversationInterceptLatencyProfiles.get(normalizedDeviceId);
     }
 
+    private readConversationInterceptRuntimeState(deviceId?: string) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return this.conversationInterceptRuntimeStates.get(normalizedDeviceId);
+    }
+
+    private updateConversationInterceptRuntimeState(
+        deviceId: string,
+        updater: (
+            current: ConversationInterceptRuntimeState
+        ) => ConversationInterceptRuntimeState
+    ) {
+        if (!deviceId) {
+            return undefined;
+        }
+        const current =
+            this.conversationInterceptRuntimeStates.get(deviceId) || {
+                updatedAtMs: 0,
+                lateRecordScore: 0,
+                playbackReboundScore: 0,
+            };
+        const next = updater(current);
+        const normalized: ConversationInterceptRuntimeState = {
+            updatedAtMs: Date.now(),
+            lateRecordScore: clamp(
+                Math.round(readNumber(next.lateRecordScore) || 0),
+                0,
+                8
+            ),
+            playbackReboundScore: clamp(
+                Math.round(readNumber(next.playbackReboundScore) || 0),
+                0,
+                8
+            ),
+            lastPlaybackDetectedElapsedMs: (() => {
+                const elapsedMs = readNumber(next.lastPlaybackDetectedElapsedMs);
+                return typeof elapsedMs === "number" && Number.isFinite(elapsedMs) && elapsedMs > 0
+                    ? clamp(Math.round(elapsedMs), 1, 20_000)
+                    : undefined;
+            })(),
+        };
+        this.conversationInterceptRuntimeStates.set(deviceId, normalized);
+        return normalized;
+    }
+
+    private noteConversationInterceptLateRecord(
+        deviceId?: string,
+        answersPresent = false
+    ) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return this.updateConversationInterceptRuntimeState(
+            normalizedDeviceId,
+            (current) => ({
+                ...current,
+                lateRecordScore:
+                    current.lateRecordScore + (answersPresent ? 2 : -1),
+            })
+        );
+    }
+
+    private noteConversationInterceptPlaybackRebound(
+        deviceId?: string,
+        detected = false,
+        elapsedMs?: number
+    ) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return this.updateConversationInterceptRuntimeState(
+            normalizedDeviceId,
+            (current) => ({
+                ...current,
+                playbackReboundScore:
+                    current.playbackReboundScore + (detected ? 2 : -1),
+                lastPlaybackDetectedElapsedMs: detected
+                    ? readNumber(elapsedMs) || current.lastPlaybackDetectedElapsedMs
+                    : current.lastPlaybackDetectedElapsedMs,
+            })
+        );
+    }
+
     private shouldRunConversationInterceptPauseGuard(deviceId?: string) {
         const normalizedDeviceId = readString(deviceId);
         const summary = this.lastConversationInterceptCalibration;
@@ -10631,7 +11467,224 @@ class XiaoaiCloudPlugin {
         return strategy === "fallback-only" || strategy === "mixed";
     }
 
-    private computeConversationInterceptFallbackGuardDelaysMs(deviceId?: string) {
+    private buildConversationInterceptGuardPlan(
+        deviceId?: string,
+        hint?: ConversationInterceptHint
+    ): ConversationInterceptGuardPlan {
+        const normalizedDeviceId = readString(deviceId);
+        const summary =
+            normalizedDeviceId &&
+            this.lastConversationInterceptCalibration &&
+            readString(this.lastConversationInterceptCalibration.deviceId) ===
+                normalizedDeviceId
+                ? this.lastConversationInterceptCalibration
+                : undefined;
+        const strategy =
+            summary?.strategy ||
+            this.classifyConversationInterceptCalibrationStrategy(summary);
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const interceptProfile = this.readConversationInterceptLatencyProfile(deviceId);
+        const runtimeState = this.readConversationInterceptRuntimeState(deviceId);
+        const answersPresent = Boolean(hint?.answersPresent);
+        const lateRecordScore = readNumber(runtimeState?.lateRecordScore) || 0;
+        const playbackReboundScore =
+            readNumber(runtimeState?.playbackReboundScore) || 0;
+        const interceptLeadMs =
+            readNumber(interceptProfile?.interceptLeadEstimateMs) ||
+            this.estimateFallbackConversationInterceptLeadMs(deviceId);
+        const manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+            interceptProfile?.manualOffsetMs
+        );
+        const conversationVisibleEstimateMs =
+            readNumber(interceptProfile?.conversationVisibleEstimateMs) || 0;
+        const nativePlaybackStartEstimateMs =
+            readNumber(interceptProfile?.nativePlaybackStartEstimateMs) || 0;
+        const pauseCommandEstimateMs =
+            readNumber(speakerProfile?.pauseCommandEstimateMs) || 0;
+        const stopSettleEstimateMs =
+            readNumber(speakerProfile?.stopSettleEstimateMs) || 0;
+        const pauseSettleEstimateMs =
+            readNumber(speakerProfile?.pauseSettleEstimateMs) || 0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        const lastPlaybackDetectedElapsedMs =
+            readNumber(runtimeState?.lastPlaybackDetectedElapsedMs) || 0;
+
+        let urgency = 0;
+        if (strategy === "fallback-only") {
+            urgency += 2;
+        } else if (strategy === "mixed") {
+            urgency += 1;
+        }
+        if (answersPresent) {
+            urgency += 3;
+        }
+        urgency += Math.min(3, lateRecordScore * 0.45);
+        urgency += Math.min(3, playbackReboundScore * 0.55);
+        if (
+            interceptLeadMs > 0 &&
+            pauseCommandEstimateMs > 0 &&
+            pauseCommandEstimateMs >= interceptLeadMs * 0.9
+        ) {
+            urgency += 1;
+        }
+        if (
+            interceptLeadMs > 0 &&
+            statusProbeEstimateMs > 0 &&
+            statusProbeEstimateMs >= interceptLeadMs * 2.4
+        ) {
+            urgency += 1;
+        }
+        if (
+            lastPlaybackDetectedElapsedMs > 0 &&
+            lastPlaybackDetectedElapsedMs <= 1000
+        ) {
+            urgency += 1;
+        }
+
+        const aggressive = urgency >= 3;
+        const predictedSpeechOnsetMs = Math.max(
+            interceptLeadMs > 0 ? interceptLeadMs : 0,
+            nativePlaybackStartEstimateMs > 0 && conversationVisibleEstimateMs > 0
+                ? Math.max(
+                    0,
+                    nativePlaybackStartEstimateMs - conversationVisibleEstimateMs
+                )
+                : 0,
+            lastPlaybackDetectedElapsedMs > 0
+                ? lastPlaybackDetectedElapsedMs
+                : 0,
+            answersPresent ? 0 : 220
+        );
+        const primaryLeadReserveMs = Math.max(
+            aggressive ? 120 : 90,
+            pauseCommandEstimateMs > 0
+                ? Math.round(pauseCommandEstimateMs * 0.85)
+                : 0,
+            stopSettleEstimateMs > 0
+                ? Math.round(stopSettleEstimateMs * 0.18)
+                : 0,
+            statusProbeEstimateMs > 0
+                ? Math.round(statusProbeEstimateMs * 0.1)
+                : 0
+        );
+        let primarySilenceDelayMs = clamp(
+            Math.round(Math.max(0, predictedSpeechOnsetMs - primaryLeadReserveMs)),
+            0,
+            CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+        );
+        if (answersPresent) {
+            primarySilenceDelayMs = 0;
+        } else if (
+            strategy === "fallback-only" &&
+            interceptLeadMs > 0 &&
+            pauseCommandEstimateMs > 0 &&
+            interceptLeadMs <= pauseCommandEstimateMs * 1.15
+        ) {
+            primarySilenceDelayMs = 0;
+        } else if (
+            lastPlaybackDetectedElapsedMs > 0 &&
+            lastPlaybackDetectedElapsedMs < primarySilenceDelayMs
+        ) {
+            primarySilenceDelayMs = clamp(
+                Math.round(Math.max(0, lastPlaybackDetectedElapsedMs - 110)),
+                0,
+                CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+            );
+        } else if (lateRecordScore >= 2 || playbackReboundScore >= 2) {
+            primarySilenceDelayMs = Math.min(primarySilenceDelayMs, aggressive ? 80 : 140);
+        }
+        primarySilenceDelayMs = clamp(
+            primarySilenceDelayMs + manualOffsetMs,
+            0,
+            CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+        );
+        const suppressTransitionPrompt = false;
+        const guardDelaysMs =
+            this.computeConversationInterceptFallbackGuardDelaysMs(deviceId, {
+                aggressive,
+                answersPresent,
+                lateRecordScore,
+                playbackReboundScore,
+                primarySilenceDelayMs,
+                manualOffsetMs,
+            });
+        const lateRecordFollowUpDelayMs = clamp(
+            Math.round(
+                CONVERSATION_INTERCEPT_LATE_RECORD_BURST_DELAY_MS +
+                    manualOffsetMs * 0.35
+            ),
+            0,
+            420
+        );
+        const runtimeMonitorDurationMs = clamp(
+            Math.round(
+                Math.max(
+                    CONVERSATION_INTERCEPT_RUNTIME_MONITOR_MIN_MS,
+                    answersPresent ? 2000 : 0,
+                    aggressive ? 1700 : 0,
+                    interceptLeadMs > 0 ? interceptLeadMs + 1100 : 0,
+                    pauseSettleEstimateMs > 0
+                        ? pauseSettleEstimateMs * 0.55
+                        : 0,
+                    statusProbeEstimateMs > 0
+                        ? statusProbeEstimateMs * 1.5
+                        : 0,
+                    lastPlaybackDetectedElapsedMs > 0
+                        ? lastPlaybackDetectedElapsedMs + 900
+                        : 0
+                )
+            ),
+            CONVERSATION_INTERCEPT_RUNTIME_MONITOR_MIN_MS,
+            CONVERSATION_INTERCEPT_RUNTIME_MONITOR_MAX_MS
+        );
+        const transitionGraceMs = clamp(
+            Math.round(
+                Math.max(
+                    CONVERSATION_INTERCEPT_TRANSITION_GRACE_MIN_MS,
+                    aggressive ? 520 : 0,
+                    answersPresent ? 900 : 0,
+                    pauseSettleEstimateMs > 0
+                        ? pauseSettleEstimateMs * 0.2
+                        : 0,
+                    statusProbeEstimateMs > 0
+                        ? statusProbeEstimateMs * 0.15
+                        : 0
+                )
+            ),
+            CONVERSATION_INTERCEPT_TRANSITION_GRACE_MIN_MS,
+            CONVERSATION_INTERCEPT_TRANSITION_GRACE_MAX_MS
+        );
+
+        return {
+            aggressive,
+            silenceMode: "fast-stop",
+            manualOffsetMs,
+            estimatedSpeechOnsetMs: predictedSpeechOnsetMs,
+            primaryLeadReserveMs,
+            primarySilenceDelayMs,
+            suppressTransitionPrompt,
+            guardDelaysMs,
+            lateRecordFollowUpDelayMs,
+            runtimeMonitorPollMs: aggressive
+                ? CONVERSATION_INTERCEPT_RUNTIME_MONITOR_AGGRESSIVE_POLL_MS
+                : CONVERSATION_INTERCEPT_RUNTIME_MONITOR_POLL_MS,
+            runtimeMonitorDurationMs,
+            transitionGraceMs,
+        };
+    }
+
+    private computeConversationInterceptFallbackGuardDelaysMs(
+        deviceId?: string,
+        options?: {
+            aggressive?: boolean;
+            answersPresent?: boolean;
+            lateRecordScore?: number;
+            playbackReboundScore?: number;
+            primarySilenceDelayMs?: number;
+            manualOffsetMs?: number;
+        }
+    ) {
         const interceptProfile = this.readConversationInterceptLatencyProfile(deviceId);
         const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
         const interceptLeadMs =
@@ -10642,94 +11695,185 @@ class XiaoaiCloudPlugin {
             readNumber(speakerProfile?.pauseCommandEstimateMs) || 0;
         const pauseSettleEstimateMs =
             readNumber(speakerProfile?.pauseSettleEstimateMs) || 0;
-        const delays = new Set<number>();
-        const earlyGuardDelayMs = clamp(
-            clamp(
-                Math.round(
-                    Math.max(
-                        120,
-                        interceptLeadMs > 0 ? interceptLeadMs * 0.55 : 0,
-                        statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.18 : 0,
-                        pauseCommandEstimateMs > 0
-                            ? pauseCommandEstimateMs * 1.7
-                            : 0
-                    )
-                ),
-                120,
-                240
-            ),
-            120,
-            240
+        const primarySilenceDelayMs = clamp(
+            Math.round(readNumber(options?.primarySilenceDelayMs) || 0),
+            0,
+            CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
         );
-        delays.add(earlyGuardDelayMs);
-        const interceptWindowDelayMs = clamp(
+        const manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+            options?.manualOffsetMs
+        );
+        const urgencyBoost = Math.max(
+            0,
             Math.round(
-                Math.max(
-                    earlyGuardDelayMs + 80,
-                    interceptLeadMs > 0
-                        ? interceptLeadMs -
-                            Math.max(
-                                30,
-                                Math.round(pauseCommandEstimateMs * 0.35)
-                            )
-                        : 0,
-                    statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.28 : 0
-                )
-            ),
-            200,
-            420
-        );
-        delays.add(interceptWindowDelayMs);
-        const lateGuardDelayMs = clamp(
-            Math.round(
-                Math.max(
-                    interceptWindowDelayMs + 110,
-                    interceptLeadMs > 0
-                        ? interceptLeadMs +
-                            Math.max(
-                                80,
-                                Math.round(pauseCommandEstimateMs * 0.7)
-                            )
-                        : 0,
-                    statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.52 : 0
-                )
-            ),
-            360,
-            700
-        );
-        delays.add(lateGuardDelayMs);
-        delays.add(
-            clamp(
-                Math.round(
-                    Math.max(
-                        lateGuardDelayMs + 160,
-                        interceptLeadMs > 0 ? interceptLeadMs + 320 : 0,
-                        statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.85 : 0,
-                        pauseSettleEstimateMs > 0
-                            ? pauseSettleEstimateMs * 0.65
-                            : 0
-                    )
-                ),
-                520,
-                CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+                (readNumber(options?.lateRecordScore) || 0) +
+                    (readNumber(options?.playbackReboundScore) || 0)
             )
         );
+        const delays = new Set<number>();
+        if (options?.answersPresent && primarySilenceDelayMs <= 0) {
+            delays.add(
+                clamp(
+                    Math.round(
+                        Math.max(
+                            240,
+                            pauseCommandEstimateMs > 0
+                                ? pauseCommandEstimateMs * 0.52
+                                : 0,
+                            statusProbeEstimateMs > 0
+                                ? statusProbeEstimateMs * 0.26
+                                : 0,
+                            220 + urgencyBoost * 10
+                        )
+                    ),
+                    220,
+                    320
+                )
+            );
+            delays.add(
+                clamp(
+                    Math.round(
+                        Math.max(
+                            520,
+                            pauseSettleEstimateMs > 0
+                                ? pauseSettleEstimateMs * 0.34
+                                : 0,
+                            statusProbeEstimateMs > 0
+                                ? statusProbeEstimateMs * 0.62
+                                : 0,
+                            520 + urgencyBoost * 14
+                        )
+                    ),
+                    420,
+                    760
+                )
+            );
+            return Array.from(delays)
+                .map((value) =>
+                    clamp(
+                        value + manualOffsetMs,
+                        0,
+                        CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+                    )
+                )
+                .filter((value) => Number.isFinite(value) && value >= 0)
+                .sort((left, right) => left - right);
+        }
+        const firstGuardMaxDelayMs = Math.max(
+            620,
+            Math.min(
+                CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS,
+                primarySilenceDelayMs > 0
+                    ? primarySilenceDelayMs + 320
+                    : 620
+            )
+        );
+        const firstGuardDelayMs = clamp(
+            Math.round(
+                Math.max(
+                    primarySilenceDelayMs + 180,
+                    interceptLeadMs > 0
+                        ? interceptLeadMs +
+                            Math.max(120, Math.round(pauseCommandEstimateMs * 0.32))
+                        : 0,
+                    statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.5 : 0,
+                    options?.answersPresent ? 260 : 0,
+                    options?.aggressive ? 320 : 260,
+                    240 + urgencyBoost * 14
+                )
+            ),
+            primarySilenceDelayMs > 0 ? primarySilenceDelayMs + 120 : 220,
+            firstGuardMaxDelayMs
+        );
+        delays.add(firstGuardDelayMs);
+        const secondGuardMaxDelayMs = Math.max(
+            900,
+            Math.min(
+                CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS,
+                primarySilenceDelayMs > 0
+                    ? primarySilenceDelayMs + 620
+                    : CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+            )
+        );
+        const secondGuardDelayMs = clamp(
+            Math.round(
+                Math.max(
+                    firstGuardDelayMs + 220,
+                    primarySilenceDelayMs +
+                        Math.max(
+                            420,
+                            pauseSettleEstimateMs > 0
+                                ? Math.round(pauseSettleEstimateMs * 0.4)
+                                : 0
+                        ),
+                    interceptLeadMs > 0 ? interceptLeadMs + 360 : 0,
+                    statusProbeEstimateMs > 0 ? statusProbeEstimateMs * 0.9 : 0,
+                    520 + urgencyBoost * 18
+                )
+            ),
+            primarySilenceDelayMs > 0 ? primarySilenceDelayMs + 320 : 420,
+            secondGuardMaxDelayMs
+        );
+        delays.add(secondGuardDelayMs);
         return Array.from(delays)
+            .map((value) =>
+                clamp(
+                    value + manualOffsetMs,
+                    0,
+                    CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS
+                )
+            )
             .filter((value) => Number.isFinite(value) && value >= 0)
             .sort((left, right) => left - right);
     }
 
+    private claimConversationSupplementalIntervention(
+        state?: ConversationInterceptSupplementalGuardState,
+        nowMs = Date.now()
+    ) {
+        if (!state) {
+            return {
+                ok: true,
+            };
+        }
+        if (state.attemptsUsed >= CONVERSATION_INTERCEPT_MAX_SUPPLEMENTAL_ATTEMPTS) {
+            return {
+                ok: false,
+                reason: "budget_exhausted",
+            };
+        }
+        if (
+            state.lastAttemptAtMs > 0 &&
+            nowMs - state.lastAttemptAtMs <
+                CONVERSATION_INTERCEPT_SUPPLEMENTAL_MIN_SPACING_MS
+        ) {
+            return {
+                ok: false,
+                reason: "spacing_guard",
+            };
+        }
+        state.attemptsUsed += 1;
+        state.lastAttemptAtMs = nowMs;
+        return {
+            ok: true,
+        };
+    }
+
     private async runConversationInterceptFallbackPauseGuard(
         interceptStartedAtMs?: number,
-        actionContextPromise?: Promise<ActionContext>
+        actionContextPromise?: Promise<ActionContext>,
+        plan?: ConversationInterceptGuardPlan,
+        guardState?: ConversationInterceptSupplementalGuardState
     ) {
         const { device, mina, miio } = actionContextPromise
             ? await actionContextPromise
             : await this.ensureActionContext();
         const delaysMs =
-            this.computeConversationInterceptFallbackGuardDelaysMs(
-                device.minaDeviceId
-            );
+            Array.isArray(plan?.guardDelaysMs) && plan.guardDelaysMs.length > 0
+                ? plan.guardDelaysMs
+                : this.computeConversationInterceptFallbackGuardDelaysMs(
+                    device.minaDeviceId
+                );
         const startedAtMs =
             typeof interceptStartedAtMs === "number" &&
             Number.isFinite(interceptStartedAtMs)
@@ -10749,9 +11893,21 @@ class XiaoaiCloudPlugin {
                 });
                 break;
             }
+            const claim = this.claimConversationSupplementalIntervention(guardState);
+            if (!claim.ok) {
+                attempts.push({
+                    delayMs: targetDelayMs,
+                    skipped: claim.reason,
+                });
+                if (claim.reason === "budget_exhausted") {
+                    break;
+                }
+                continue;
+            }
 
             let ok = false;
             let errorMessage = "";
+            let action = "pause";
             try {
                 await this.sendPauseCommand(device, mina, miio, {
                     singleAttempt: true,
@@ -10762,6 +11918,7 @@ class XiaoaiCloudPlugin {
             }
             attempts.push({
                 delayMs: targetDelayMs,
+                action,
                 ok,
                 error: errorMessage || undefined,
             });
@@ -10771,8 +11928,392 @@ class XiaoaiCloudPlugin {
             deviceId: device.minaDeviceId,
             startedAtMs,
             delaysMs,
+            primarySilenceDelayMs: readNumber(plan?.primarySilenceDelayMs) || 0,
+            aggressive: plan?.aggressive === true,
             attempts,
         });
+    }
+
+    private async runConversationInterceptLateRecordFollowUpBurst(
+        interceptStartedAtMs: number,
+        actionContextPromise?: Promise<ActionContext>,
+        plan?: ConversationInterceptGuardPlan,
+        guardState?: ConversationInterceptSupplementalGuardState
+    ) {
+        if (!plan?.aggressive || (readNumber(plan.primarySilenceDelayMs) || 0) > 0) {
+            return;
+        }
+        const { device, mina, miio } = actionContextPromise
+            ? await actionContextPromise
+            : await this.ensureActionContext();
+        const targetDelayMs = clamp(
+            Math.round(readNumber(plan.lateRecordFollowUpDelayMs) || 0),
+            0,
+            420
+        );
+        const waitMs = interceptStartedAtMs + targetDelayMs - Date.now();
+        if (waitMs > 0) {
+            await sleep(waitMs);
+        }
+        if (!this.waitingForResponse) {
+            await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                delayMs: targetDelayMs,
+                skipped: "waiting_for_response_cleared",
+            });
+            return;
+        }
+        const claim = this.claimConversationSupplementalIntervention(guardState);
+        if (!claim.ok) {
+            await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                delayMs: targetDelayMs,
+                skipped: claim.reason,
+            });
+            return;
+        }
+        let accepted = false;
+        let acceptedCount = 0;
+        let attemptedCount = 0;
+        let errorMessage = "";
+        try {
+            const burst = await this.dispatchSpeakerInterruptBurst(device, mina, miio);
+            accepted = burst.accepted;
+            acceptedCount = burst.acceptedCount;
+            attemptedCount = burst.attemptedCount;
+        } catch (error) {
+            errorMessage = this.errorMessage(error);
+        }
+        await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+            deviceId: device.minaDeviceId,
+            startedAtMs: interceptStartedAtMs,
+            delayMs: targetDelayMs,
+            accepted,
+            acceptedCount: acceptedCount || undefined,
+            attemptedCount: attemptedCount || undefined,
+            error: errorMessage || undefined,
+        });
+    }
+
+    private async runConversationInterceptRuntimeMonitor(
+        interceptStartedAtMs: number,
+        plan: ConversationInterceptGuardPlan,
+        actionContextPromise?: Promise<ActionContext>,
+        guardState?: ConversationInterceptSupplementalGuardState
+    ) {
+        const { device, mina, miio } = actionContextPromise
+            ? await actionContextPromise
+            : await this.ensureActionContext();
+        const deadlineAtMs =
+            interceptStartedAtMs + plan.runtimeMonitorDurationMs;
+        const samples: Record<string, any>[] = [];
+        let baselineSnapshot =
+            (await this.readSpeakerPlaybackSnapshotWithTiming(
+                mina,
+                device.minaDeviceId
+            ).catch(() => null)) || null;
+        let previousSnapshot = baselineSnapshot;
+        let detectedPlayback = false;
+        let interventionCount = 0;
+        let lastInterventionAtMs = 0;
+
+        while (Date.now() < deadlineAtMs) {
+            if (!this.waitingForResponse) {
+                samples.push({
+                    elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
+                    skipped: "waiting_for_response_cleared",
+                });
+                break;
+            }
+            if (samples.length > 0) {
+                await sleep(plan.runtimeMonitorPollMs);
+            }
+            if (!this.waitingForResponse) {
+                samples.push({
+                    elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
+                    skipped: "waiting_for_response_cleared",
+                });
+                break;
+            }
+
+            const snapshot =
+                (await this.readSpeakerPlaybackSnapshotWithTiming(
+                    mina,
+                    device.minaDeviceId
+                ).catch(() => null)) || null;
+            const elapsedMs = Math.max(0, Date.now() - interceptStartedAtMs);
+            const reason =
+                this.detectConversationInterceptCalibrationPlaybackReason(
+                    baselineSnapshot,
+                    previousSnapshot,
+                    snapshot
+                );
+            const active = this.isSpeakerPlaybackActivelyPlaying(snapshot);
+
+            if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
+                samples.push({
+                    elapsedMs,
+                    active,
+                    reason: reason || "",
+                    snapshot: this.summarizeSpeakerPlaybackSnapshot(snapshot),
+                });
+            }
+
+            previousSnapshot = snapshot;
+            if (!active && !reason) {
+                continue;
+            }
+
+            detectedPlayback = true;
+            this.noteConversationInterceptPlaybackRebound(
+                device.minaDeviceId,
+                true,
+                elapsedMs
+            );
+            if (!this.waitingForResponse) {
+                break;
+            }
+            if (
+                interventionCount >= CONVERSATION_INTERCEPT_RUNTIME_MAX_INTERVENTIONS ||
+                Date.now() - lastInterventionAtMs < 120
+            ) {
+                continue;
+            }
+            const claim = this.claimConversationSupplementalIntervention(guardState);
+            if (!claim.ok) {
+                if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
+                    samples.push({
+                        elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
+                        interventionSkipped: claim.reason,
+                    });
+                }
+                if (claim.reason === "budget_exhausted") {
+                    break;
+                }
+                continue;
+            }
+
+            let fastStopped = false;
+            let pauseAccepted = false;
+            let errorMessage = "";
+            try {
+                fastStopped = await this.stopSpeaker({
+                    fast: true,
+                    preserveLoopGuard: false,
+                });
+                if (!fastStopped && this.waitingForResponse) {
+                    await this.sendPauseCommand(device, mina, miio, {
+                        singleAttempt: true,
+                    });
+                    pauseAccepted = true;
+                }
+            } catch (error) {
+                errorMessage = this.errorMessage(error);
+            }
+            interventionCount += 1;
+            lastInterventionAtMs = Date.now();
+            baselineSnapshot = snapshot;
+            if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
+                samples.push({
+                    elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
+                    intervention: true,
+                    fastStopped,
+                    pauseAccepted,
+                    error: errorMessage || undefined,
+                });
+            }
+        }
+
+        if (!detectedPlayback) {
+            this.noteConversationInterceptPlaybackRebound(
+                device.minaDeviceId,
+                false
+            );
+        }
+
+        await this.appendDebugTrace("conversation_intercept_runtime_monitor", {
+            deviceId: device.minaDeviceId,
+            startedAtMs: interceptStartedAtMs,
+            aggressive: plan.aggressive,
+            manualOffsetMs: plan.manualOffsetMs,
+            estimatedSpeechOnsetMs: plan.estimatedSpeechOnsetMs,
+            primaryLeadReserveMs: plan.primaryLeadReserveMs,
+            primarySilenceDelayMs: plan.primarySilenceDelayMs,
+            runtimeMonitorPollMs: plan.runtimeMonitorPollMs,
+            runtimeMonitorDurationMs: plan.runtimeMonitorDurationMs,
+            detectedPlayback,
+            interventionCount,
+            samples,
+        });
+    }
+
+    private async maybeSendConversationTransitionPrompt(
+        interceptStartedAtMs: number,
+        plan: ConversationInterceptGuardPlan,
+        actionContextPromise?: Promise<ActionContext>
+    ) {
+        if (plan.suppressTransitionPrompt) {
+            await this.appendDebugTrace("conversation_transition_prompt_skipped", {
+                reason: "suppressed_by_plan",
+                aggressive: plan.aggressive,
+                transitionGraceMs: plan.transitionGraceMs,
+            });
+            return;
+        }
+
+        const waitMs = interceptStartedAtMs + plan.transitionGraceMs - Date.now();
+        if (waitMs > 0) {
+            await sleep(waitMs);
+        }
+        if (!this.waitingForResponse) {
+            return;
+        }
+
+        const { device, mina } = actionContextPromise
+            ? await actionContextPromise
+            : await this.ensureActionContext();
+        const settled = await this.verifySpeakerCommandState(
+            mina,
+            device.minaDeviceId,
+            (snapshot) => this.isSpeakerPlaybackPausedOrStopped(snapshot),
+            plan.aggressive
+                ? [0, ...SPEAKER_COMMAND_FAST_VERIFY_DELAYS_MS, 220]
+                : [0, ...SPEAKER_COMMAND_FAST_VERIFY_DELAYS_MS]
+        );
+        if (!this.waitingForResponse) {
+            return;
+        }
+        if (!settled.ok) {
+            await this.appendDebugTrace("conversation_transition_prompt_skipped", {
+                reason: "speaker_not_quiet",
+                aggressive: plan.aggressive,
+                transitionGraceMs: plan.transitionGraceMs,
+                snapshot: this.summarizeSpeakerPlaybackSnapshot(settled.snapshot),
+            });
+            return;
+        }
+
+        await this.sendTransitionPrompt();
+    }
+
+    private evaluateLateRecordForwarding(
+        deviceId?: string,
+        hint?: ConversationInterceptHint,
+        plan?: ConversationInterceptGuardPlan
+    ) {
+        const normalizedDeviceId = readString(deviceId);
+        const answersPresent = Boolean(hint?.answersPresent);
+        const recordAgeMs = readNumber(hint?.recordAgeMs) || 0;
+        if (!answersPresent || recordAgeMs <= 0) {
+            return {
+                skip: false,
+                cutoffMs: 0,
+                deferUntilSilenced: false,
+            };
+        }
+        const summary =
+            normalizedDeviceId &&
+            this.lastConversationInterceptCalibration &&
+            readString(this.lastConversationInterceptCalibration.deviceId) ===
+                normalizedDeviceId
+                ? this.lastConversationInterceptCalibration
+                : undefined;
+        const strategy =
+            summary?.strategy ||
+            this.classifyConversationInterceptCalibrationStrategy(summary);
+        const speakerProfile = this.readSpeakerAudioLatencyProfile(deviceId);
+        const runtimeState = this.readConversationInterceptRuntimeState(deviceId);
+        const pauseCommandEstimateMs =
+            readNumber(speakerProfile?.pauseCommandEstimateMs) || 0;
+        const stopSettleEstimateMs =
+            readNumber(speakerProfile?.stopSettleEstimateMs) || 0;
+        const statusProbeEstimateMs =
+            readNumber(speakerProfile?.statusProbeEstimateMs) || 0;
+        const lateRecordScore = readNumber(runtimeState?.lateRecordScore) || 0;
+        const playbackReboundScore =
+            readNumber(runtimeState?.playbackReboundScore) || 0;
+        let cutoffMs = clamp(
+            Math.round(
+                Math.max(
+                    520,
+                    (readNumber(plan?.estimatedSpeechOnsetMs) || 0) +
+                        Math.max(
+                            180,
+                            pauseCommandEstimateMs > 0
+                                ? pauseCommandEstimateMs * 0.72
+                                : 0,
+                            stopSettleEstimateMs > 0
+                                ? stopSettleEstimateMs * 0.28
+                                : 0,
+                            statusProbeEstimateMs > 0
+                                ? statusProbeEstimateMs * 0.18
+                                : 0
+                        )
+                )
+            ),
+            520,
+            2_400
+        );
+        if (lateRecordScore >= 2 || playbackReboundScore >= 2) {
+            cutoffMs = Math.max(420, cutoffMs - 120);
+        }
+        const deferUntilSilenced =
+            strategy === "fallback-only" || recordAgeMs >= cutoffMs;
+        if (!deferUntilSilenced) {
+            return {
+                skip: false,
+                cutoffMs,
+                deferUntilSilenced: false,
+            };
+        }
+        return {
+            skip: false,
+            cutoffMs,
+            deferUntilSilenced: true,
+            reason:
+                strategy === "fallback-only"
+                    ? "当前设备/网络画像通常只能拿到晚记录，本轮会先立即强拦截，确认静音后马上转发 OpenClaw 播报"
+                    : `检测到会话记录已晚到 ${recordAgeMs}ms，本轮会先立即强拦截，确认静音后马上转发 OpenClaw 播报`,
+        };
+    }
+
+    private shouldIgnoreStartupStaleConversationRecord(
+        recordAgeMs: number,
+        answersPresent: boolean
+    ) {
+        if (!answersPresent || recordAgeMs <= CONVERSATION_STARTUP_STALE_RECORD_IGNORE_MS) {
+            return false;
+        }
+        if (this.pollingStartedAt <= 0) {
+            return false;
+        }
+        return Date.now() - this.pollingStartedAt <= STARTUP_POLL_GRACE_MS;
+    }
+
+    private async confirmLateRecordForwardAllowed(
+        actionContextPromise?: Promise<ActionContext>,
+        plan?: ConversationInterceptGuardPlan
+    ) {
+        const startedAtMs = Date.now();
+        const { device, mina } = actionContextPromise
+            ? await actionContextPromise
+            : await this.ensureActionContext();
+        const settled = await this.verifySpeakerCommandState(
+            mina,
+            device.minaDeviceId,
+            (snapshot) => this.isSpeakerPlaybackPausedOrStopped(snapshot),
+            CONVERSATION_INTERCEPT_LATE_RECORD_FORWARD_GATE_DELAYS_MS
+        );
+        await this.appendDebugTrace("conversation_intercept_late_record_forward_gate", {
+            deviceId: device.minaDeviceId,
+            ok: settled.ok,
+            elapsedMs: Math.max(0, Date.now() - startedAtMs),
+            manualOffsetMs: readNumber(plan?.manualOffsetMs) || 0,
+            snapshot: this.summarizeSpeakerPlaybackSnapshot(settled.snapshot),
+        });
+        return settled.ok;
     }
 
     private async runConversationInterceptCalibrationPauseGuard(
@@ -10807,6 +12348,7 @@ class XiaoaiCloudPlugin {
 
             let ok = false;
             let errorMessage = "";
+            let action = "pause";
             try {
                 await this.sendPauseCommand(device, mina, miio, {
                     singleAttempt: true,
@@ -10817,6 +12359,7 @@ class XiaoaiCloudPlugin {
             }
             attempts.push({
                 delayMs: targetDelayMs,
+                action,
                 ok,
                 error: errorMessage || undefined,
             });
@@ -13709,6 +15252,121 @@ class XiaoaiCloudPlugin {
         return Promise.any(attempts);
     }
 
+    private async trySpeakerInterruptBurst(
+        device: DeviceContext,
+        mina: MiNAClient,
+        miio: MiIOClient,
+        options?: {
+            expectedAudioId?: string;
+            preserveLoopGuard?: boolean;
+            fast?: boolean;
+        }
+    ) {
+        const expectedAudioId = readString(options?.expectedAudioId);
+        const burstStartedAtMs = Date.now();
+        const attempts: Promise<unknown>[] = [];
+
+        attempts.push(mina.playerPause(device.minaDeviceId).catch(() => undefined));
+        attempts.push(mina.playerStop(device.minaDeviceId).catch(() => undefined));
+
+        if (device.speakerFeatures.pause) {
+            attempts.push(
+                miio
+                    .miotAction(
+                        device.miDid,
+                        device.speakerFeatures.pause.siid,
+                        device.speakerFeatures.pause.aiid,
+                        []
+                    )
+                    .catch(() => undefined)
+            );
+        }
+        if (device.speakerFeatures.stop) {
+            attempts.push(
+                miio
+                    .miotAction(
+                        device.miDid,
+                        device.speakerFeatures.stop.siid,
+                        device.speakerFeatures.stop.aiid,
+                        []
+                    )
+                    .catch(() => undefined)
+            );
+        }
+
+        const settled = await this.verifySpeakerCommandState(
+            mina,
+            device.minaDeviceId,
+            (snapshot) =>
+                this.isSpeakerPlaybackPausedOrStopped(snapshot) ||
+                Boolean(
+                    expectedAudioId &&
+                        snapshot &&
+                        !this.speakerSnapshotHasAudioId(snapshot, expectedAudioId)
+                ),
+            SPEAKER_INTERRUPT_BURST_VERIFY_DELAYS_MS
+        );
+        await Promise.allSettled(attempts);
+        if (!settled.ok) {
+            await this.appendDebugTrace("speaker_interrupt_burst_unconfirmed", {
+                deviceId: device.minaDeviceId,
+                expectedAudioId,
+                snapshot: settled.snapshot,
+            });
+            return false;
+        }
+
+        this.updateSpeakerAudioLatencyEstimate(
+            device.minaDeviceId,
+            "stopSettleEstimateMs",
+            Date.now() - burstStartedAtMs
+        );
+        await this.finalizeSpeakerStopSuccess(mina, device.minaDeviceId, options);
+        return true;
+    }
+
+    private async dispatchSpeakerInterruptBurst(
+        device: DeviceContext,
+        mina: MiNAClient,
+        miio: MiIOClient
+    ) {
+        const commands: Promise<unknown>[] = [
+            mina.playerPause(device.minaDeviceId),
+            mina.playerStop(device.minaDeviceId),
+        ];
+
+        if (device.speakerFeatures.pause) {
+            commands.push(
+                miio.miotAction(
+                    device.miDid,
+                    device.speakerFeatures.pause.siid,
+                    device.speakerFeatures.pause.aiid,
+                    []
+                )
+            );
+        }
+        if (device.speakerFeatures.stop) {
+            commands.push(
+                miio.miotAction(
+                    device.miDid,
+                    device.speakerFeatures.stop.siid,
+                    device.speakerFeatures.stop.aiid,
+                    []
+                )
+            );
+        }
+
+        const results = await Promise.allSettled(commands);
+        const acceptedCount = results.filter(
+            (item) => item.status === "fulfilled"
+        ).length;
+        return {
+            accepted: acceptedCount > 0,
+            acceptedCount,
+            attemptedCount: results.length,
+        };
+    }
+
     private async stopSpeaker(options?: {
         preserveLoopGuard?: boolean;
         fast?: boolean;
@@ -13717,6 +15375,16 @@ class XiaoaiCloudPlugin {
         const { device, mina, miio } = await this.ensureActionContext();
         try {
             if (options?.fast) {
+                const burstStopped = await this.trySpeakerInterruptBurst(
+                    device,
+                    mina,
+                    miio,
+                    options
+                ).catch(() => false);
+                if (burstStopped) {
+                    return true;
+                }
+
                 const fastPauseStartedAtMs = Date.now();
                 let pauseAccepted = false;
                 let pauseError: string | undefined;
@@ -14273,12 +15941,23 @@ class XiaoaiCloudPlugin {
         return true;
     }
 
-    private async silenceSpeaker() {
-        console.log("-> [拦截] 发送 pause 指令");
-        const startedAt = Date.now();
-        const interrupted = await this.pauseSpeaker().catch(() => false);
+    private async silenceSpeaker(options?: {
+        aggressive?: boolean;
+        reason?: string;
+    }) {
+        const mode = options?.aggressive ? "fast-stop" : "pause";
         console.log(
-            `-> [拦截] pause ${interrupted ? "成功" : "失败"} | ${Date.now() - startedAt}ms`
+            `-> [拦截] 发送 ${mode} 指令${options?.reason ? ` | ${options.reason}` : ""}`
+        );
+        const startedAt = Date.now();
+        const interrupted = options?.aggressive
+            ? await this.stopSpeaker({
+                fast: true,
+                preserveLoopGuard: false,
+            }).catch(() => false)
+            : await this.pauseSpeaker().catch(() => false);
+        console.log(
+            `-> [拦截] ${mode} ${interrupted ? "成功" : "失败"} | ${Date.now() - startedAt}ms`
         );
         return interrupted;
     }
@@ -15077,39 +16756,212 @@ class XiaoaiCloudPlugin {
 
     private async interceptAndForward(
         text: string,
-        options?: { renewVoiceSession?: boolean }
+        options?: {
+            renewVoiceSession?: boolean;
+            interceptHint?: ConversationInterceptHint;
+        }
     ) {
         const interceptStartedAtMs = Date.now();
         this.waitingForResponse = true;
         this.armFastPolling();
         const deviceId = this.device?.minaDeviceId;
-        const shouldRunFallbackPauseGuard =
-            this.shouldRunConversationInterceptPauseGuard(deviceId);
+        const interceptHint = options?.interceptHint;
+        if (deviceId) {
+            this.noteConversationInterceptLateRecord(
+                deviceId,
+                Boolean(interceptHint?.answersPresent)
+            );
+        }
+        const guardPlan = this.buildConversationInterceptGuardPlan(
+            deviceId,
+            interceptHint
+        );
+        void this.appendDebugTrace("conversation_intercept_guard_plan", {
+            deviceId,
+            answersPresent: Boolean(interceptHint?.answersPresent),
+            answerCount: readNumber(interceptHint?.answerCount) || 0,
+            recordAgeMs: readNumber(interceptHint?.recordAgeMs) || undefined,
+            aggressive: guardPlan.aggressive,
+            silenceMode: guardPlan.silenceMode,
+            manualOffsetMs: guardPlan.manualOffsetMs,
+            estimatedSpeechOnsetMs: guardPlan.estimatedSpeechOnsetMs,
+            primaryLeadReserveMs: guardPlan.primaryLeadReserveMs,
+            primarySilenceDelayMs: guardPlan.primarySilenceDelayMs,
+            guardDelaysMs: guardPlan.guardDelaysMs,
+            lateRecordFollowUpDelayMs: guardPlan.lateRecordFollowUpDelayMs,
+            runtimeMonitorPollMs: guardPlan.runtimeMonitorPollMs,
+            runtimeMonitorDurationMs: guardPlan.runtimeMonitorDurationMs,
+        }).catch(() => undefined);
+        const shouldRunFallbackPauseGuard = Boolean(
+            deviceId &&
+                (this.shouldRunConversationInterceptPauseGuard(deviceId) ||
+                    guardPlan.aggressive ||
+                    interceptHint?.answersPresent)
+        );
+        const lateRecordForwarding = this.evaluateLateRecordForwarding(
+            deviceId,
+            interceptHint,
+            guardPlan
+        );
+        const supplementalGuardState: ConversationInterceptSupplementalGuardState = {
+            attemptsUsed: 0,
+            lastAttemptAtMs: 0,
+        };
         const actionContextPromise =
             shouldRunFallbackPauseGuard ? this.ensureActionContext() : undefined;
 
-        const silenceTask = this.silenceSpeaker().catch((error) => {
-            console.error(`[XiaoAI Cloud] 暂停打断失败: ${this.errorMessage(error)}`);
-            return false;
-        });
+        const silenceTask = (async () => {
+            const waitMs =
+                interceptStartedAtMs + guardPlan.primarySilenceDelayMs - Date.now();
+            if (waitMs > 0) {
+                await sleep(waitMs);
+            }
+            if (!this.waitingForResponse) {
+                return false;
+            }
+            return this.silenceSpeaker({
+                aggressive: guardPlan.silenceMode === "fast-stop",
+                reason: lateRecordForwarding.skip
+                    ? lateRecordForwarding.reason
+                    : interceptHint?.answersPresent
+                        ? "检测到会话记录已带答案，立即强拦截并准备转发 OpenClaw"
+                    : guardPlan.primarySilenceDelayMs > 0
+                        ? `按预计原生起播窗口延后 ${guardPlan.primarySilenceDelayMs}ms 拦截`
+                        : guardPlan.aggressive
+                            ? "当前设备进入动态激进拦截"
+                            : undefined,
+            }).catch((error) => {
+                console.error(`[XiaoAI Cloud] 暂停打断失败: ${this.errorMessage(error)}`);
+                return false;
+            });
+        })();
         const fallbackPauseGuardTask =
             shouldRunFallbackPauseGuard && this.waitingForResponse
                 ? this.runConversationInterceptFallbackPauseGuard(
                     interceptStartedAtMs,
-                    actionContextPromise
+                    actionContextPromise,
+                    guardPlan,
+                    supplementalGuardState
                 ).catch((error) => {
                     console.warn(
                         `[XiaoAI Cloud] fallback 拦截补偿失败: ${this.errorMessage(error)}`
                     );
                 })
                 : Promise.resolve();
-        this.forwardToOpenclaw(text, options);
+        const lateRecordFollowUpTask =
+            shouldRunFallbackPauseGuard &&
+            this.waitingForResponse &&
+            interceptHint?.answersPresent
+                ? this.runConversationInterceptLateRecordFollowUpBurst(
+                    interceptStartedAtMs,
+                    actionContextPromise,
+                    guardPlan,
+                    supplementalGuardState
+                ).catch((error) => {
+                    console.warn(
+                        `[XiaoAI Cloud] 晚记录快速补拦截失败: ${this.errorMessage(error)}`
+                    );
+                })
+                : Promise.resolve();
+        const runtimeMonitorTask =
+            shouldRunFallbackPauseGuard && this.waitingForResponse
+                ? this.runConversationInterceptRuntimeMonitor(
+                    interceptStartedAtMs,
+                    guardPlan,
+                    actionContextPromise,
+                    supplementalGuardState
+                ).catch((error) => {
+                    console.warn(
+                        `[XiaoAI Cloud] 运行时拦截监测失败: ${this.errorMessage(error)}`
+                    );
+                })
+                : Promise.resolve();
+        const shouldGateLateRecordForward = Boolean(
+            interceptHint?.answersPresent &&
+                lateRecordForwarding.deferUntilSilenced !== true
+        );
+        const lateRecordForwardGateTask = shouldGateLateRecordForward
+            ? this.confirmLateRecordForwardAllowed(
+                actionContextPromise,
+                guardPlan
+            ).catch((error) => {
+                console.warn(
+                    `[XiaoAI Cloud] 晚记录转发门控失败: ${this.errorMessage(error)}`
+                );
+                return false;
+            })
+            : Promise.resolve(false);
+        void this.appendDebugTrace("conversation_intercept_forward_policy", {
+            deviceId,
+            answersPresent: Boolean(interceptHint?.answersPresent),
+            answerCount: readNumber(interceptHint?.answerCount) || 0,
+            recordAgeMs: readNumber(interceptHint?.recordAgeMs) || undefined,
+            manualOffsetMs: guardPlan.manualOffsetMs,
+            skip: lateRecordForwarding.skip,
+            deferUntilSilenced:
+                lateRecordForwarding.deferUntilSilenced === true || undefined,
+            reason: lateRecordForwarding.reason || undefined,
+            cutoffMs: lateRecordForwarding.cutoffMs || undefined,
+            gated: shouldGateLateRecordForward,
+        }).catch(() => undefined);
+        let forwardIssued = false;
+        const issueForwardOnce = (trigger: string) => {
+            if (forwardIssued || !this.waitingForResponse) {
+                return false;
+            }
+            this.forwardToOpenclaw(text, options);
+            forwardIssued = true;
+            void this.appendDebugTrace("conversation_intercept_forward_issued", {
+                deviceId,
+                trigger,
+                answersPresent: Boolean(interceptHint?.answersPresent),
+                answerCount: readNumber(interceptHint?.answerCount) || 0,
+                recordAgeMs: readNumber(interceptHint?.recordAgeMs) || undefined,
+                manualOffsetMs: guardPlan.manualOffsetMs,
+                deferUntilSilenced:
+                    lateRecordForwarding.deferUntilSilenced === true || undefined,
+            }).catch(() => undefined);
+            return true;
+        };
+        const lateRecordForwardGateRunner = shouldGateLateRecordForward
+            ? lateRecordForwardGateTask.then((lateRecordForwardAllowed) => {
+                if (lateRecordForwardAllowed) {
+                    issueForwardOnce("late_record_gate_open");
+                }
+                return lateRecordForwardAllowed;
+            })
+            : Promise.resolve(false);
+        if (!interceptHint?.answersPresent) {
+            issueForwardOnce("immediate");
+        }
         await silenceTask;
-        await fallbackPauseGuardTask;
+        if (!forwardIssued) {
+            issueForwardOnce(
+                interceptHint?.answersPresent
+                    ? lateRecordForwarding.deferUntilSilenced
+                        ? "speaker_silenced_immediate_forward"
+                        : "late_record_gate_closed_immediate_forward"
+                    : "post_silence_fallback"
+            );
+        }
+        if (!forwardIssued) {
+            this.waitingForResponse = false;
+            return;
+        }
+        await Promise.all([
+            lateRecordForwardGateRunner,
+            lateRecordFollowUpTask,
+            fallbackPauseGuardTask,
+            runtimeMonitorTask,
+        ]);
         if (!this.waitingForResponse) {
             return;
         }
-        await this.sendTransitionPrompt().catch((error) => {
+        await this.maybeSendConversationTransitionPrompt(
+            interceptStartedAtMs,
+            guardPlan,
+            actionContextPromise
+        ).catch((error) => {
             console.error(`[XiaoAI Cloud] 过渡播报失败: ${this.errorMessage(error)}`);
         });
     }

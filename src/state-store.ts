@@ -60,6 +60,7 @@ export interface PersistedConversationInterceptLatencyProfile {
     conversationVisibleEstimateMs?: number;
     nativePlaybackStartEstimateMs?: number;
     interceptLeadEstimateMs?: number;
+    manualOffsetMs?: number;
     updatedAtMs?: number;
 }
 

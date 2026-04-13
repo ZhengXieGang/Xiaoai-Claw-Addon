@@ -9,6 +9,10 @@ const DEFAULT_CONVERSATION_POLL_INTERVAL_MS = 320;
 const MIN_CONVERSATION_POLL_INTERVAL_MS = 80;
 const MIN_RECOMMENDED_CONVERSATION_POLL_INTERVAL_MS = 120;
 const MAX_CONVERSATION_POLL_INTERVAL_MS = 10000;
+const DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS = 0;
+const MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS = -900;
+const MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS = 900;
+const CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS = 25;
 const DEFAULT_AUDIO_TAIL_PADDING_MS = 1500;
 const MAX_AUDIO_TAIL_PADDING_MS = 10000;
 const DEFAULT_OPENCLAW_CONTEXT_TOKENS = 32000;
@@ -285,6 +289,10 @@ function initConsolePage() {
       window.location.href
     ),
     pollInterval: new URL("./api/device/poll-interval", window.location.href),
+    conversationInterceptOffset: new URL(
+      "./api/device/conversation-intercept-offset",
+      window.location.href
+    ),
     audioTailPadding: new URL("./api/device/audio-tail-padding", window.location.href),
     openclawModel: new URL("./api/openclaw/model", window.location.href),
     openclawRoute: new URL("./api/openclaw/route", window.location.href),
@@ -365,6 +373,11 @@ function initConsolePage() {
     pollIntervalEditing: false,
     pollIntervalDirty: false,
     pollIntervalSaving: false,
+    currentConversationInterceptManualOffsetMs:
+      DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS,
+    confirmedConversationInterceptManualOffsetMs:
+      DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS,
+    conversationInterceptManualOffsetSaving: false,
     currentAudioTailPaddingMs: DEFAULT_AUDIO_TAIL_PADDING_MS,
     confirmedAudioTailPaddingMs: DEFAULT_AUDIO_TAIL_PADDING_MS,
     audioTailPaddingEditing: false,
@@ -470,6 +483,9 @@ function initConsolePage() {
     conversationVisibleValue: byId("conversationVisibleValue"),
     nativePlaybackStartValue: byId("nativePlaybackStartValue"),
     interceptLeadValue: byId("interceptLeadValue"),
+    conversationInterceptOffsetSlider: byId("conversationInterceptOffsetSlider"),
+    conversationInterceptOffsetValue: byId("conversationInterceptOffsetValue"),
+    conversationInterceptOffsetNote: byId("conversationInterceptOffsetNote"),
     audioTailPaddingValue: byId("audioTailPaddingValue"),
     audioTailPaddingNote: byId("audioTailPaddingNote"),
     audioCalibrationPlaybackDetectValue: byId("audioCalibrationPlaybackDetectValue"),
@@ -725,7 +741,8 @@ function initConsolePage() {
       state.audioCalibrationRunning ||
       state.conversationInterceptCalibrationRunning ||
       state.audioTailPaddingSaving ||
-      state.pollIntervalSaving;
+      state.pollIntervalSaving ||
+      state.conversationInterceptManualOffsetSaving;
     syncCalibrationModePicker();
   }
 
@@ -735,6 +752,9 @@ function initConsolePage() {
     els.conversationVisibleValue = null;
     els.nativePlaybackStartValue = null;
     els.interceptLeadValue = null;
+    els.conversationInterceptOffsetSlider = null;
+    els.conversationInterceptOffsetValue = null;
+    els.conversationInterceptOffsetNote = null;
     els.audioTailPaddingValue = null;
     els.audioTailPaddingNote = null;
     els.audioCalibrationPlaybackDetectValue = null;
@@ -2471,6 +2491,27 @@ function initConsolePage() {
     return `${Math.round(safe)} ms`;
   }
 
+  function normalizeConversationInterceptManualOffsetMs(value) {
+    const safe = Number(value);
+    if (!Number.isFinite(safe)) {
+      return DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS;
+    }
+    return clamp(
+      Math.round(safe / CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS) *
+        CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS,
+      MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS,
+      MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS
+    );
+  }
+
+  function formatConversationInterceptManualOffset(value) {
+    const safe = normalizeConversationInterceptManualOffsetMs(value);
+    if (safe === 0) {
+      return "0 ms";
+    }
+    return `${safe > 0 ? "+" : ""}${safe} ms`;
+  }
+
   function dateKey(value) {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) {
@@ -2822,6 +2863,17 @@ function initConsolePage() {
     }
   }
 
+  function syncConversationInterceptManualOffsetDisplay(value) {
+    const safe = normalizeConversationInterceptManualOffsetMs(value);
+    if (els.conversationInterceptOffsetSlider) {
+      els.conversationInterceptOffsetSlider.value = String(safe);
+    }
+    if (els.conversationInterceptOffsetValue) {
+      els.conversationInterceptOffsetValue.textContent =
+        formatConversationInterceptManualOffset(safe);
+    }
+  }
+
   function updateVolumeDisplay(value, options) {
     const safe = clamp(Number(value) || 0, 0, 100);
     state.currentVolumeValue = safe;
@@ -2864,6 +2916,16 @@ function initConsolePage() {
     syncPollIntervalMetricText(safe, {
       force: Boolean(options && options.forceText),
     });
+    return safe;
+  }
+
+  function updateConversationInterceptManualOffsetDisplay(value, options) {
+    const safe = normalizeConversationInterceptManualOffsetMs(value);
+    state.currentConversationInterceptManualOffsetMs = safe;
+    if (Boolean(options && options.forceValue)) {
+      state.confirmedConversationInterceptManualOffsetMs = safe;
+    }
+    syncConversationInterceptManualOffsetDisplay(safe);
     return safe;
   }
 
@@ -3508,6 +3570,17 @@ function initConsolePage() {
     els.pollIntervalValue.classList.toggle("is-disabled", effectiveDisabled);
   }
 
+  function syncConversationInterceptManualOffsetAvailability(disabled) {
+    if (!els.conversationInterceptOffsetSlider) {
+      return;
+    }
+    const effectiveDisabled =
+      Boolean(disabled) ||
+      state.conversationInterceptCalibrationRunning ||
+      state.conversationInterceptManualOffsetSaving;
+    els.conversationInterceptOffsetSlider.disabled = effectiveDisabled;
+  }
+
   function bindPollIntervalEditor() {
     if (!els.pollIntervalValue || els.pollIntervalValue.dataset.bound === "true") {
       return;
@@ -3591,6 +3664,28 @@ function initConsolePage() {
     });
   }
 
+  function bindConversationInterceptOffsetSlider() {
+    if (
+      !els.conversationInterceptOffsetSlider ||
+      els.conversationInterceptOffsetSlider.dataset.bound === "true"
+    ) {
+      return;
+    }
+    els.conversationInterceptOffsetSlider.dataset.bound = "true";
+    els.conversationInterceptOffsetSlider.addEventListener("input", () => {
+      updateConversationInterceptManualOffsetDisplay(
+        els.conversationInterceptOffsetSlider.value
+      );
+      if (els.conversationInterceptOffsetNote) {
+        els.conversationInterceptOffsetNote.textContent =
+          "向左更早拦截，向右更晚拦截";
+      }
+    });
+    els.conversationInterceptOffsetSlider.addEventListener("change", () => {
+      void applyConversationInterceptManualOffset();
+    });
+  }
+
   function ensureConversationInterceptCalibrationMetricsShell() {
     if (!els.calibrationMetrics) {
       return;
@@ -3632,6 +3727,23 @@ function initConsolePage() {
         <strong class="control-metric-value" id="interceptLeadValue">-</strong>
         <span class="control-metric-note">看到会话到原生起播之间的余量</span>
       </div>
+      <div class="control-metric control-metric-slider calibration-offset-shell">
+        <div class="control-metric-slider-head">
+          <span class="control-metric-label">体感微调</span>
+          <strong class="control-metric-value" id="conversationInterceptOffsetValue">0 ms</strong>
+        </div>
+        <input
+          id="conversationInterceptOffsetSlider"
+          class="range-field"
+          type="range"
+          min="${escapeHtml(String(MIN_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS))}"
+          max="${escapeHtml(String(MAX_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS))}"
+          step="${escapeHtml(String(CONVERSATION_INTERCEPT_MANUAL_OFFSET_STEP_MS))}"
+          value="${escapeHtml(String(DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS))}"
+          aria-label="对话拦截体感微调"
+        />
+        <span class="control-metric-note" id="conversationInterceptOffsetNote">向左更早拦截，向右更晚拦截</span>
+      </div>
     `;
     els.calibrationMetrics.dataset.mode = "conversation";
     els.pollIntervalValue = byId("pollIntervalValue");
@@ -3639,7 +3751,11 @@ function initConsolePage() {
     els.conversationVisibleValue = byId("conversationVisibleValue");
     els.nativePlaybackStartValue = byId("nativePlaybackStartValue");
     els.interceptLeadValue = byId("interceptLeadValue");
+    els.conversationInterceptOffsetSlider = byId("conversationInterceptOffsetSlider");
+    els.conversationInterceptOffsetValue = byId("conversationInterceptOffsetValue");
+    els.conversationInterceptOffsetNote = byId("conversationInterceptOffsetNote");
     bindPollIntervalEditor();
+    bindConversationInterceptOffsetSlider();
   }
 
   function renderConversationInterceptCalibrationControl(calibration) {
@@ -3661,6 +3777,16 @@ function initConsolePage() {
       nextCalibration.pollIntervalMs,
       state.confirmedPollIntervalMs || DEFAULT_CONVERSATION_POLL_INTERVAL_MS
     );
+    const manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+      getFiniteNumber(
+        nextCalibration.manualOffsetMs,
+        getFiniteNumber(
+          currentProfile && currentProfile.manualOffsetMs,
+          state.confirmedConversationInterceptManualOffsetMs ||
+            DEFAULT_CONVERSATION_INTERCEPT_MANUAL_OFFSET_MS
+        )
+      )
+    );
     const recommendedPollIntervalMs = getFiniteNumber(
       nextCalibration.recommendedPollIntervalMs,
       pollIntervalMs
@@ -3671,6 +3797,9 @@ function initConsolePage() {
         forceText: !state.pollIntervalEditing,
       });
     }
+    updateConversationInterceptManualOffsetDisplay(manualOffsetMs, {
+      forceValue: true,
+    });
 
     if (els.calibrationRunBtn) {
       const anyCalibrationRunning =
@@ -3716,6 +3845,12 @@ function initConsolePage() {
         : recommendedPollIntervalMs < pollIntervalMs
           ? `建议收紧到 ${recommendedPollIntervalMs}ms`
           : "拦截主轮询节奏，回车或失焦保存";
+    }
+    if (els.conversationInterceptOffsetNote) {
+      els.conversationInterceptOffsetNote.textContent =
+        state.conversationInterceptManualOffsetSaving
+          ? "正在保存..."
+          : "向左更早拦截，向右更晚拦截";
     }
     if (els.calibrationDetail) {
       const detailParts = [];
@@ -3775,6 +3910,9 @@ function initConsolePage() {
       els.calibrationDetail.textContent = detailParts.join(" · ");
     }
     syncPollIntervalAvailability(!(state.bootstrap && state.bootstrap.ready));
+    syncConversationInterceptManualOffsetAvailability(
+      !(state.bootstrap && state.bootstrap.ready)
+    );
     syncCalibrationModeAvailability(!(state.bootstrap && state.bootstrap.ready));
     scheduleControlMasonryLayout();
   }
@@ -5902,6 +6040,55 @@ function initConsolePage() {
       await refreshBootstrap(true);
     } finally {
       state.pollIntervalSaving = false;
+      renderCalibrationControl();
+    }
+  }
+
+  async function applyConversationInterceptManualOffset() {
+    if (state.conversationInterceptManualOffsetSaving) {
+      return;
+    }
+    const manualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+      state.currentConversationInterceptManualOffsetMs
+    );
+    state.conversationInterceptManualOffsetSaving = true;
+    renderCalibrationControl();
+    try {
+      const payload = await postJson(API.conversationInterceptOffset, {
+        manualOffsetMs,
+      });
+      const nextManualOffsetMs = normalizeConversationInterceptManualOffsetMs(
+        getFiniteNumber(payload && payload.manualOffsetMs, manualOffsetMs)
+      );
+      updateConversationInterceptManualOffsetDisplay(nextManualOffsetMs, {
+        forceValue: true,
+      });
+      if (state.bootstrap) {
+        state.bootstrap.conversationInterceptCalibration = Object.assign(
+          {},
+          state.bootstrap.conversationInterceptCalibration,
+          payload && payload.calibration,
+          { manualOffsetMs: nextManualOffsetMs }
+        );
+      }
+      showToast(
+        payload && payload.message
+          ? String(payload.message)
+          : `对话拦截微调已更新为 ${formatConversationInterceptManualOffset(
+              nextManualOffsetMs
+            )}。`,
+        "success"
+      );
+      await refreshBootstrap(true);
+    } catch (error) {
+      updateConversationInterceptManualOffsetDisplay(
+        state.confirmedConversationInterceptManualOffsetMs,
+        { forceValue: true }
+      );
+      showToast(error.message || String(error), "error");
+      await refreshBootstrap(true);
+    } finally {
+      state.conversationInterceptManualOffsetSaving = false;
       renderCalibrationControl();
     }
   }

@@ -6834,12 +6834,20 @@ button.soft-btn,
 button.tonal-btn,
 button.primary-btn,
 button.theme-btn,
-button.segment-btn,
-button.mode-btn {
+button.segment-btn {
   white-space: nowrap;
   text-wrap: nowrap;
   overflow-wrap: normal;
   word-break: keep-all;
+}
+
+body[data-page="console"] .mode-btn,
+body[data-page="console"] .mode-btn strong,
+body[data-page="console"] .mode-btn span {
+  white-space: normal;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @media (min-width: 961px) {
@@ -6873,12 +6881,15 @@ button.mode-btn {
   .calibration-metrics-grid .control-metric {
     padding: 10px 12px;
   }
-}
 
-@media (max-width: 720px) {
   .calibration-card-head {
     grid-template-columns: minmax(0, 1fr);
     gap: 10px;
+  }
+
+  .calibration-card-head .card-copy {
+    width: 100%;
+    min-width: 0;
   }
 
   .calibration-card-actions {
@@ -6887,6 +6898,7 @@ button.mode-btn {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
     justify-items: stretch;
+    align-items: stretch;
     align-self: stretch;
   }
 

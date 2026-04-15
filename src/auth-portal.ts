@@ -131,21 +131,57 @@ function normalizeHttpPath(value: string) {
 }
 
 function getCandidateHosts(listenHost: string): string[] {
-    const urls = new Set<string>();
+    const externalHosts = new Set<string>();
+    const loopbackHosts = new Set<string>();
+    const normalizedListenHost = listenHost.trim().toLowerCase();
+    const addHost = (value: string | undefined) => {
+        const host = (value || "").trim().toLowerCase();
+        if (!host) {
+            return;
+        }
+        if (host === "localhost" || host === "::1" || host.startsWith("127.")) {
+            loopbackHosts.add(host === "::1" ? "127.0.0.1" : host);
+            return;
+        }
+        externalHosts.add(host);
+    };
+
     if (listenHost === "0.0.0.0" || listenHost === "::") {
-        urls.add("127.0.0.1");
         const interfaces = networkInterfaces();
         for (const values of Object.values(interfaces)) {
             for (const item of values || []) {
                 if (item.family === "IPv4" && !item.internal) {
-                    urls.add(item.address);
+                    addHost(item.address);
                 }
             }
         }
+        loopbackHosts.add("127.0.0.1");
+        loopbackHosts.add("localhost");
     } else {
-        urls.add(listenHost);
+        addHost(normalizedListenHost);
+        if (
+            normalizedListenHost === "localhost" ||
+            normalizedListenHost === "::1" ||
+            normalizedListenHost.startsWith("127.")
+        ) {
+            loopbackHosts.add("127.0.0.1");
+            loopbackHosts.add("localhost");
+        }
     }
-    return Array.from(urls);
+    return [...externalHosts, ...loopbackHosts];
+}
+
+function normalizePortalBaseUrl(value: string | undefined) {
+    if (!value) {
+        return undefined;
+    }
+    try {
+        const parsed = new URL(value);
+        parsed.hash = "";
+        return parsed.toString().replace(/\/+$/, "");
+    } catch {
+        return undefined;
+    }
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<any> {
@@ -758,6 +794,11 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       if (!verification || !verification.verifyUrl || openVerifyPageInFlight || loginInFlight || verifyInFlight || sessionCompleted) {
         return;
       }
+      const openedWindow = window.open("about:blank", "_blank", "noopener");
+      if (!openedWindow) {
+        setStatus("err", "浏览器拦截了验证页面，请允许弹窗后重试。");
+        return;
+      }
       openVerifyPageInFlight = true;
       updateActionButtons();
       setStatus("", "正在打开官方验证页面，请稍候…");
@@ -767,12 +808,12 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
         if (!openUrl) {
           throw new Error("当前没有可用的官方验证页面。");
         }
-        const openedWindow = window.open(openUrl, "_blank", "noopener");
-        if (!openedWindow) {
-          throw new Error("浏览器拦截了验证页面，请允许弹窗后重试。");
-        }
+        openedWindow.location.replace(openUrl);
         setStatus("", "请在官方页面获取验证码，回到这里填写后再点登录。");
       } catch (error) {
+        try {
+          openedWindow.close();
+        } catch (_) {}
         setStatus("err", error.message || String(error));
       } finally {
         openVerifyPageInFlight = false;
@@ -825,6 +866,7 @@ export class LoginPortal {
     private readonly sessions = new Map<string, InternalSession>();
     private server?: Server;
     private standaloneAvailable = false;
+    private baseUrlHints: string[];
 
     constructor(private readonly options: {
         listenHost: string;
@@ -832,6 +874,7 @@ export class LoginPortal {
         publicBaseUrl?: string;
         routeBasePath?: string;
         gatewayBaseUrls?: string[];
+        baseUrlHints?: string[];
         standaloneOptional?: boolean;
         onPasswordDiscover: (
             sessionId: string,
@@ -850,7 +893,9 @@ export class LoginPortal {
             payload: VerificationCodeRequestSubmission
         ) => Promise<VerificationPageOpenPayload>;
         onTrace?: (event: string, details: Record<string, any>) => void | Promise<void>;
-    }) {}
+    }) {
+        this.baseUrlHints = this.normalizeBaseUrlHints(options.baseUrlHints);
+    }
 
     async start() {
         if (this.server) {
@@ -958,11 +1003,18 @@ export class LoginPortal {
         return session;
     }
 
-    async createSession(seed: LoginSessionSeed): Promise<LoginPortalSessionSnapshot> {
+    setBaseUrlHints(urls: string[] | undefined) {
+        this.baseUrlHints = this.normalizeBaseUrlHints(urls);
+    }
+
+    async createSession(
+        seed: LoginSessionSeed,
+        options?: { preferredBaseUrls?: string[] }
+    ): Promise<LoginPortalSessionSnapshot> {
         await this.start();
         this.pruneExpiredSessions();
         const id = randomId(12);
-        const baseUrls = this.computeBaseUrls();
+        const baseUrls = this.computeBaseUrls(options?.preferredBaseUrls);
         const primaryUrl = `${baseUrls[0]}/auth/${id}`;
 
         const session: InternalSession = {
@@ -1045,11 +1097,58 @@ export class LoginPortal {
         };
     }
 
-    private computeBaseUrls() {
-        const urls = new Set<string>();
+    private normalizeBaseUrlHints(values: string[] | undefined) {
+        const unique = new Set<string>();
+        for (const value of values || []) {
+            const normalized = normalizePortalBaseUrl(value);
+            if (normalized) {
+                unique.add(normalized);
+            }
+        }
+        return Array.from(unique);
+    }
+
+    private computeBaseUrls(preferredBaseUrls?: string[]) {
+        const preferred: string[] = [];
+        const direct: string[] = [];
+        const loopback: string[] = [];
+        const seen = new Set<string>();
+        const addCandidate = (value: string | undefined, options?: { preferred?: boolean }) => {
+            const normalized = normalizePortalBaseUrl(value);
+            if (!normalized || seen.has(normalized)) {
+                return;
+            }
+            seen.add(normalized);
+            if (options?.preferred) {
+                preferred.push(normalized);
+                return;
+            }
+            try {
+                const host = new URL(normalized).hostname.trim().toLowerCase();
+                if (
+                    host === "localhost" ||
+                    host === "::1" ||
+                    host.startsWith("127.")
+                ) {
+                    loopback.push(normalized);
+                    return;
+                }
+            } catch {
+                // Fall through and keep malformed host checks non-fatal.
+            }
+            direct.push(normalized);
+        };
+
+        for (const item of preferredBaseUrls || []) {
+            addCandidate(item, { preferred: true });
+        }
+        for (const item of this.baseUrlHints) {
+            addCandidate(item, { preferred: true });
+        }
+
         const base = this.options.publicBaseUrl?.trim();
         if (base) {
-            urls.add(base.replace(/\/+$/, ""));
+            addCandidate(base, { preferred: true });
         }
 
         const routeBasePath = this.options.routeBasePath
@@ -1059,19 +1158,23 @@ export class LoginPortal {
             for (const gatewayBase of this.options.gatewayBaseUrls || []) {
                 const trimmed = gatewayBase.trim();
                 if (trimmed) {
-                    urls.add(`${trimmed.replace(/\/+$/, "")}${routeBasePath}`);
+                    addCandidate(`${trimmed.replace(/\/+$/, "")}${routeBasePath}`);
                 }
             }
         }
 
-        if (this.server || this.standaloneAvailable || urls.size === 0) {
+        if (
+            this.server ||
+            this.standaloneAvailable ||
+            (preferred.length === 0 && direct.length === 0 && loopback.length === 0)
+        ) {
             const hosts = getCandidateHosts(this.options.listenHost);
             for (const host of hosts) {
-                urls.add(`http://${host}:${this.options.port}`);
+                addCandidate(`http://${host}:${this.options.port}`);
             }
         }
 
-        return Array.from(urls);
+        return [...preferred, ...direct, ...loopback];
     }
 
     private async trace(event: string, details: Record<string, any>) {

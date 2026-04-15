@@ -2448,6 +2448,7 @@ class XiaoaiCloudPlugin {
     private loginRouteRegisteredPath?: string;
     private loginSessionId?: string;
     private loginNotificationSessionId?: string;
+    private observedGatewayAuthBaseUrls: string[] = [];
     private startServicePromise?: Promise<void>;
     private consoleState?: {
         accessToken?: string;
@@ -4455,8 +4456,13 @@ class XiaoaiCloudPlugin {
         return null;
     }
 
-    private async buildConsoleBootstrap(): Promise<ConsoleBootstrapPayload> {
-        const config = await this.loadConfig(false).catch(() => this.config);
+    private async buildConsoleBootstrap(options?: {
+        request?: any;
+        config?: PluginConfig;
+    }): Promise<ConsoleBootstrapPayload> {
+        const config =
+            options?.config ||
+            (await this.loadConfig(false).catch(() => this.config));
         const [
             helperStatus,
             hasPersistedSession,
@@ -4488,11 +4494,11 @@ class XiaoaiCloudPlugin {
             (item) => item.id === "agents"
         );
         const authenticated = Boolean(this.device) || Boolean(config?.account && hasPersistedSession);
+        const existingSession = this.getLoginSessionSnapshot();
         const session =
-            this.getLoginSessionSnapshot() ||
-            (!this.device && !authenticated
-                ? await this.ensureLoginSession(false).catch(() => null)
-                : null);
+            !this.device && !authenticated
+                ? await this.ensureLoginSession(false).catch(() => existingSession)
+                : existingSession;
         const modeNames: Record<InterceptMode, string> = {
             wake: "唤醒模式",
             proxy: "代理模式",
@@ -4541,7 +4547,11 @@ class XiaoaiCloudPlugin {
                 ? this.isTransientNetworkError(this.lastError)
                 : undefined,
             consoleUrl,
-            loginUrl: authenticated ? undefined : session?.primaryUrl,
+            loginUrl: authenticated
+                ? undefined
+                : config
+                    ? this.resolveSessionUrlForRequest(session, options?.request, config)
+                    : session?.primaryUrl,
             loginHint: authenticated
                 ? this.lastError || "账号已登录，请先在概览页选择要接管的音箱。"
                 : session?.message || session?.error || this.lastError,
@@ -5331,6 +5341,7 @@ class XiaoaiCloudPlugin {
                     ? config.authRoutePath
                     : undefined,
             gatewayBaseUrls,
+            baseUrlHints: this.observedGatewayAuthBaseUrls,
             standaloneOptional: typeof this.api?.registerHttpRoute === "function",
             onPasswordDiscover: async (sessionId, payload) =>
                 this.handlePasswordDiscover(sessionId, payload),
@@ -5390,9 +5401,14 @@ class XiaoaiCloudPlugin {
     }
 
     private resolveConsoleRequestOrigin(request: any, config: PluginConfig) {
-        const forwardedProto = readRequestHeader(request, "x-forwarded-proto")?.toLowerCase();
-        const forwardedHost = readRequestHeader(request, "x-forwarded-host");
-        const host = forwardedHost || readRequestHeader(request, "host");
+        const forwardedProto = readRequestHeader(request, "x-forwarded-proto")
+            ?.split(",")[0]
+            ?.trim()
+            .toLowerCase();
+        const forwardedHost = readRequestHeader(request, "x-forwarded-host")
+            ?.split(",")[0]
+            ?.trim();
+        const host = (forwardedHost || readRequestHeader(request, "host"))?.trim();
         if (!host) {
             return undefined;
         }
@@ -5403,6 +5419,67 @@ class XiaoaiCloudPlugin {
                 ? "https"
                 : "http";
         return `${protocol}://${host}`;
+    }
+
+    private resolveAuthBaseUrlForRequest(request: any, config: PluginConfig) {
+        const origin = this.resolveConsoleRequestOrigin(request, config);
+        if (!origin) {
+            return undefined;
+        }
+        const routePath = normalizeHttpPath(config.authRoutePath, "/api/xiaoai-cloud");
+        return normalizeBaseUrl(`${origin.replace(/\/+$/, "")}${routePath}`);
+    }
+
+    private resolveSessionUrlForRequest(
+        session: LoginPortalSessionSnapshot | null | undefined,
+        request: any,
+        config: PluginConfig
+    ) {
+        if (!session) {
+            return undefined;
+        }
+        const authBaseUrl = this.resolveAuthBaseUrlForRequest(request, config);
+        if (authBaseUrl) {
+            return `${authBaseUrl.replace(/\/+$/, "")}/auth/${session.id}`;
+        }
+        return session.primaryUrl;
+    }
+
+    private rememberGatewayAuthBaseUrlFromRequest(request: any, config: PluginConfig) {
+        const baseUrl = this.resolveAuthBaseUrlForRequest(request, config);
+        if (!baseUrl) {
+            return;
+        }
+        this.observedGatewayAuthBaseUrls = uniqueStrings([
+            baseUrl,
+            ...this.observedGatewayAuthBaseUrls,
+        ]).slice(0, 8);
+        this.loginPortal?.setBaseUrlHints(this.observedGatewayAuthBaseUrls);
+    }
+
+    private shouldRefreshLoginSessionForObservedGatewayBase(
+        session: LoginPortalSessionSnapshot | null
+    ) {
+        if (!session || this.observedGatewayAuthBaseUrls.length === 0) {
+            return false;
+        }
+        const preferred = this.observedGatewayAuthBaseUrls[0];
+        const preferredHost = (() => {
+            try {
+                return new URL(preferred).hostname.trim().toLowerCase();
+            } catch {
+                return "";
+            }
+        })();
+        if (!preferredHost || isLoopbackHostname(preferredHost)) {
+            return false;
+        }
+        try {
+            const currentHost = new URL(session.primaryUrl).hostname.trim().toLowerCase();
+            return isLoopbackHostname(currentHost);
+        } catch {
+            return false;
+        }
     }
 
     private isTrustedConsoleMutationRequest(request: any, config: PluginConfig) {
@@ -5496,7 +5573,14 @@ class XiaoaiCloudPlugin {
         const action = matchedPath.replace(/^\/api\/?/, "");
         try {
             if (requestMethod === "GET" && action === "bootstrap") {
-                sendJson(response, 200, await this.buildConsoleBootstrap());
+                sendJson(
+                    response,
+                    200,
+                    await this.buildConsoleBootstrap({
+                        request,
+                        config,
+                    })
+                );
                 return true;
             }
             if (requestMethod === "GET" && action === "conversations") {
@@ -6302,7 +6386,7 @@ class XiaoaiCloudPlugin {
                 return true;
             }
             if (requestMethod === "POST" && action === "account/logout") {
-                const payload = await this.logoutConsoleAccount();
+                const payload = await this.logoutConsoleAccount(request);
                 sendJson(response, 200, {
                     ok: true,
                     ...payload,
@@ -6452,6 +6536,7 @@ class XiaoaiCloudPlugin {
                     if (!matchedPath) {
                         return false;
                     }
+                    this.rememberGatewayAuthBaseUrlFromRequest(request, config);
 
                     if (
                         await this.handleConsoleHttpRoute(
@@ -6514,13 +6599,20 @@ class XiaoaiCloudPlugin {
         const config = await this.loadConfig(false);
         const portal = await this.ensureLoginPortal();
         const existing = !forceNew ? this.getLoginSessionSnapshot() : null;
-        if (existing && existing.status !== "success") {
+        const refreshForGatewayBase =
+            !forceNew &&
+            existing &&
+            existing.status !== "success" &&
+            this.shouldRefreshLoginSessionForObservedGatewayBase(existing);
+        if (existing && existing.status !== "success" && !refreshForGatewayBase) {
             return existing;
         }
 
-        const session = await portal.createSession(this.buildLoginSeed(config));
+        const session = await portal.createSession(this.buildLoginSeed(config), {
+            preferredBaseUrls: this.observedGatewayAuthBaseUrls,
+        });
         this.loginSessionId = session.id;
-        if (forceNew) {
+        if (forceNew || refreshForGatewayBase) {
             this.loginNotificationSessionId = undefined;
         }
         console.log(
@@ -6531,6 +6623,7 @@ class XiaoaiCloudPlugin {
             primaryUrl: session.primaryUrl,
             expiresAt: session.expiresAt,
             forceNew,
+            refreshedForGatewayBase: refreshForGatewayBase,
             authRoutePath: config.authRoutePath,
         });
         this.recordConsoleEvent(
@@ -7072,7 +7165,7 @@ class XiaoaiCloudPlugin {
         }
     }
 
-    private async logoutConsoleAccount() {
+    private async logoutConsoleAccount(request?: any) {
         const config = await this.loadConfig(false);
         const accountClient = this.accountClient || this.createAccountClientForConfig(config, "logout");
         const previousDevice = this.device
@@ -7112,7 +7205,7 @@ class XiaoaiCloudPlugin {
             message: session?.primaryUrl
                 ? `${message} 需要时可以重新打开登录入口继续授权。`
                 : message,
-            loginUrl: session?.primaryUrl,
+            loginUrl: this.resolveSessionUrlForRequest(session, request, config),
         };
     }
 

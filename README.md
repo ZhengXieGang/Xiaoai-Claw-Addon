@@ -210,6 +210,75 @@ uninstall.cmd
 - 可执行的 `openclaw` CLI
 - 建议安装 Python 3 + `requests`
 
+## CLI 登录调试
+
+当网页里的二次验证链路不好复现时，可以直接走 CLI，把“登录 -> 发验证码 -> 提交验证码/继续登录”拆成三个命令，方便 AI 或终端调试。
+
+先执行：
+
+```bash
+npm run login:cli -- login --account '<小米账号>' --password '<小米密码>' --send-code
+```
+
+如果进入二次验证，CLI 会打印：
+- 官方验证页面地址
+- 验证状态文件路径
+- 下一步可直接复制执行的命令
+
+常见继续方式：
+
+发验证码：
+
+```bash
+npm run login:cli -- send-code --session-file '<verification.json>'
+```
+
+提交短信或邮箱验证码：
+
+```bash
+npm run login:cli -- continue --session-file '<verification.json>' --password '<小米密码>' --ticket '<验证码>'
+```
+
+如果你已经在官方验证页面完成验证，也可以不带 `--ticket` 再继续一次：
+
+```bash
+npm run login:cli -- continue --session-file '<verification.json>' --password '<小米密码>'
+```
+
+如果验证码已经通过，但某个 sid 还没补齐，可以直接刷新现有 token store：
+
+```bash
+npm run login:cli -- refresh --session-file '<verification.json>' --sid micoapi
+```
+
+这在 Windows 上尤其有用。如果 CLI 提示 `micoapi` 依赖 Python 的 `requests`，先补依赖：
+
+```powershell
+py -3 -m pip install requests
+```
+
+再执行：
+
+```powershell
+npm run login:cli -- refresh --session-file '<verification.json>' --sid micoapi
+```
+
+建议优先把账号密码放到环境变量里，避免直接落进 shell history：
+
+```bash
+export XIAOAI_ACCOUNT='<小米账号>'
+export XIAOAI_PASSWORD='<小米密码>'
+npm run login:cli -- login --send-code
+```
+
+Windows PowerShell：
+
+```powershell
+$env:XIAOAI_ACCOUNT='<小米账号>'
+$env:XIAOAI_PASSWORD='<小米密码>'
+npm run login:cli -- login --send-code
+```
+
 
 ## 首次使用
 

@@ -17,6 +17,7 @@
     "assets/fonts/noto-sans-sc/LICENSE",
     "scripts/configure-openclaw-install.mjs",
     "scripts/configure-openclaw-uninstall.mjs",
+    "scripts/xiaomi-login-cli.mjs",
     "scripts/probe-xiaomi-status.mjs",
     "openclaw.plugin.json",
     "README.md",
@@ -31,7 +32,8 @@
     ]
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "login:cli": "npm run build && node scripts/xiaomi-login-cli.mjs"
   },
   "engines": {
     "node": ">=22"

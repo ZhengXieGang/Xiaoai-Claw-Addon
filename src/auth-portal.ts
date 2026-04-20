@@ -484,7 +484,7 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
 
           <div class="portal-simple-actions">
             <button class="soft-btn" type="button" id="openVerifyBtn" hidden>打开验证页面</button>
-            <button class="primary-btn" type="submit" id="submitLoginBtn">登录</button>
+            <button class="primary-btn" type="button" id="submitLoginBtn">登录</button>
           </div>
         </form>
       </section>
@@ -721,17 +721,57 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       return data;
     }
 
-    async function postJson(url, payload) {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "请求失败");
+    async function postJson(url, payload, options) {
+      const timeoutMs = Math.max(
+        1000,
+        Math.round(
+          Number(
+            options && Number.isFinite(Number(options.timeoutMs))
+              ? options.timeoutMs
+              : 15000
+          ) || 15000
+        )
+      );
+      const hasAbortController = typeof AbortController === "function";
+      const controller = hasAbortController ? new AbortController() : null;
+      const timer =
+        controller && typeof setTimeout === "function"
+          ? setTimeout(() => {
+              try {
+                controller.abort();
+              } catch (_) {}
+            }, timeoutMs)
+          : null;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller ? controller.signal : undefined
+        });
+        const rawText = await res.text();
+        let data = {};
+        if (rawText) {
+          try {
+            data = JSON.parse(rawText);
+          } catch {
+            throw new Error("服务端返回了非 JSON 响应（HTTP " + res.status + "）。");
+          }
+        }
+        if (!res.ok) {
+          throw new Error((data && data.error) || ("请求失败（HTTP " + res.status + "）"));
+        }
+        return data;
+      } catch (error) {
+        if (error && typeof error === "object" && error.name === "AbortError") {
+          throw new Error("请求超时（>" + timeoutMs + "ms）");
+        }
+        throw error;
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
       }
-      return data;
     }
 
     async function loginByPassword() {
@@ -767,18 +807,26 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       }
     }
 
-    async function verifyByTicket() {
+    async function verifyByTicket(ticketOverride) {
       if (verifyInFlight || loginInFlight || openVerifyPageInFlight || sessionCompleted) {
         return;
       }
-      const ticket = String(ticketInput.value || "").trim();
-      if (!ticket) {
+      const ticket = typeof ticketOverride === "string"
+        ? ticketOverride.trim()
+        : String(ticketInput.value || "").trim();
+      const externalContinueAttempt = !ticket && Boolean(verification && verification.verifyUrl);
+      if (!ticket && !externalContinueAttempt) {
         setStatus("err", "请先填入短信或邮箱收到的验证码。");
         return;
       }
       verifyInFlight = true;
       updateActionButtons();
-      setStatus("", "正在校验验证码并继续登录，请稍候…");
+      setStatus(
+        "",
+        externalContinueAttempt
+          ? "正在检查官方验证结果并继续登录，请稍候…"
+          : "正在校验验证码并继续登录，请稍候…"
+      );
       try {
         await postJson(verifyTicketUrl, { ticket });
         await fetchStatus();
@@ -803,14 +851,34 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       updateActionButtons();
       setStatus("", "正在打开官方验证页面，请稍候…");
       try {
+        const initialVerifyUrl = String(
+          (verification && verification.verifyUrl) || ""
+        ).trim();
+        if (/^https?:\/\//i.test(initialVerifyUrl)) {
+          // Keep popup navigation within the original click gesture whenever possible.
+          openedWindow.location.href = initialVerifyUrl;
+        }
         const data = await postJson(openVerifyPageApiUrl, {});
         const openUrl = String(data && (data.openUrl || (data.verification && data.verification.verifyUrl) || "") || "").trim();
         if (!openUrl) {
           throw new Error("当前没有可用的官方验证页面。");
         }
-        openedWindow.location.replace(openUrl);
+        openedWindow.location.href = openUrl;
         setStatus("", "请在官方页面获取验证码，回到这里填写后再点登录。");
       } catch (error) {
+        const fallbackVerifyUrl = String(
+          (verification && verification.verifyUrl) || ""
+        ).trim();
+        if (/^https?:\/\//i.test(fallbackVerifyUrl)) {
+          try {
+            openedWindow.location.href = fallbackVerifyUrl;
+            setStatus(
+              "",
+              "验证页面接口异常，已回退为直接打开小米验证页。完成后请回到此页填写验证码。"
+            );
+            return;
+          } catch (_) {}
+        }
         try {
           openedWindow.close();
         } catch (_) {}
@@ -821,27 +889,35 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
       }
     }
 
-    authForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
+    async function handlePrimaryAction() {
       if (verification) {
         if (!String(ticketInput.value || "").trim()) {
-          setStatus(
-            "err",
-            verification.verifyUrl
-              ? "请先点上面的打开验证页面，获取验证码并填写后再点登录。"
-              : "请先填入验证码，再点登录。"
-          );
+          if (verification.verifyUrl) {
+            await verifyByTicket("");
+            return;
+          }
+          setStatus("err", "请先填入验证码，再点登录。");
           return;
         }
         await verifyByTicket();
         return;
       }
       await loginByPassword();
+    }
+
+    authForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await handlePrimaryAction();
     });
 
     if (openVerifyBtn) {
       openVerifyBtn.addEventListener("click", openVerifyPage);
     }
+
+    submitLoginBtn.addEventListener("click", async (event) => {
+      event.preventDefault();
+      await handlePrimaryAction();
+    });
 
     renderVerification(verification);
     updateActionButtons();

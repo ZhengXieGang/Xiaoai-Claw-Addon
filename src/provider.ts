@@ -8310,9 +8310,14 @@ class XiaoaiCloudPlugin {
     private async continueVerifiedLogin(
         accountClient: XiaomiAccountClient,
         sid: XiaomiSid,
-        ticket: string
+        ticket?: string
     ) {
-        await accountClient.completeVerification(sid, ticket);
+        const trimmedTicket = readString(ticket);
+        if (trimmedTicket) {
+            await accountClient.completeVerification(sid, trimmedTicket);
+        } else {
+            await accountClient.login(sid);
+        }
         for (const nextSid of CLOUD_LOGIN_SIDS) {
             if (nextSid === sid) {
                 continue;
@@ -8379,9 +8384,7 @@ class XiaoaiCloudPlugin {
         payload: VerificationTicketSubmission
     ): Promise<LoginDiscoveryPayload | LoginSuccessPayload | LoginVerificationPayload> {
         const ticket = readString(payload.ticket);
-        if (!ticket) {
-            throw new Error("请输入短信或邮箱收到的验证码。");
-        }
+        const attemptedExternalContinue = !ticket;
 
         const pending = this.pendingVerifications.get(sessionId);
         if (!pending) {
@@ -8408,7 +8411,27 @@ class XiaoaiCloudPlugin {
                     sid: error.sid,
                     state: error.state,
                 });
-                return this.createVerificationPayload(error);
+                const verificationPayload = this.createVerificationPayload(error);
+                if (!attemptedExternalContinue) {
+                    return verificationPayload;
+                }
+                return {
+                    ...verificationPayload,
+                    message: [
+                        "官方验证页面的结果还没有同步到当前登录会话。",
+                        "如果页面刚显示 ok，请等待 2-3 秒后再点一次“登录”。",
+                        "如你还保留短信验证码，也可以直接填回当前页后再提交。",
+                    ].join("\n"),
+                };
+            }
+            if (attemptedExternalContinue) {
+                throw new Error(
+                    [
+                        "未能直接确认官方验证结果。",
+                        error instanceof Error ? error.message : this.errorMessage(error),
+                        "请稍后再点一次“登录”；如仍不行，可把短信验证码填回当前页再提交。",
+                    ].join("\n")
+                );
             }
             throw error instanceof Error ? error : new Error(this.errorMessage(error));
         }
@@ -8420,8 +8443,12 @@ class XiaoaiCloudPlugin {
             return {
                 message:
                     devices.length === 1
-                        ? "验证码校验通过，已发现 1 台可用小爱。"
-                        : `验证码校验通过，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`,
+                        ? attemptedExternalContinue
+                            ? "已从官方验证页面继续登录，已发现 1 台可用小爱。"
+                            : "验证码校验通过，已发现 1 台可用小爱。"
+                        : attemptedExternalContinue
+                            ? `已从官方验证页面继续登录，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`
+                            : `验证码校验通过，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`,
                 devices,
             };
         }
@@ -8436,7 +8463,9 @@ class XiaoaiCloudPlugin {
         await this.notifyLoginSuccess(device);
 
         return {
-            message: `验证完成，已接入设备 ${device.name} (${device.hardware}/${device.model})。`,
+            message: attemptedExternalContinue
+                ? `已从官方验证页面继续登录，已接入设备 ${device.name} (${device.hardware}/${device.model})。`
+                : `验证完成，已接入设备 ${device.name} (${device.hardware}/${device.model})。`,
         };
     }
 

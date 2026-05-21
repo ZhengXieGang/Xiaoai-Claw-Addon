@@ -58,7 +58,14 @@
       "serverCountry": {
         "type": "string",
         "description": "云端区域，默认 cn。",
-        "enum": ["cn", "de", "i2", "ru", "sg", "us"]
+        "enum": [
+          "cn",
+          "de",
+          "i2",
+          "ru",
+          "sg",
+          "us"
+        ]
       },
       "hardware": {
         "type": "string",
@@ -132,6 +139,10 @@
         "type": "string",
         "description": "转发回 OpenClaw 时的目标。强烈建议使用自己的私聊目标，不要直接用群聊；若未填写，插件会在 Telegram 仅存在一个 allowFrom 目标时自动推断。"
       },
+      "openclawNotificationsDisabled": {
+        "type": "boolean",
+        "description": "是否关闭插件主动通知渠道。关闭后不影响小爱语音转发到专属 agent，只是不再回推登录入口、控制台链接等通知。"
+      },
       "openclawCliPath": {
         "type": "string",
         "description": "OpenClaw CLI 路径，默认 openclaw。"
@@ -143,6 +154,10 @@
       "openclawForceNonStreaming": {
         "type": "boolean",
         "description": "是否强制把小爱语音转发改走 OpenClaw 官方 /v1/responses 非流式接口。默认 false；适合规避上游 Anthropic 兼容流式事件顺序异常。首次在控制台开启时，会自动启用 gateway.http.endpoints.responses.enabled 并重启网关。"
+      },
+      "openclawVoiceSystemPrompt": {
+        "type": "string",
+        "description": "写入 xiaoai 专属 agent workspace 的 AGENTS.md 内容。留空或未配置时使用插件内置默认提示词。"
       },
       "debugLogEnabled": {
         "type": "boolean",
@@ -175,6 +190,62 @@
           "type": "string"
         }
       }
+    }
+  },
+  "toolMetadata": {
+    "xiaoai_speak": {
+      "optional": true
+    },
+    "xiaoai_play_audio": {
+      "optional": true
+    },
+    "xiaoai_tts_bridge": {
+      "optional": true
+    },
+    "xiaoai_set_volume": {
+      "optional": true
+    },
+    "xiaoai_set_playback_mute": {
+      "optional": true
+    },
+    "xiaoai_get_volume": {
+      "optional": true
+    },
+    "xiaoai_new_session": {
+      "optional": true
+    },
+    "xiaoai_wake_up": {
+      "optional": true
+    },
+    "xiaoai_execute": {
+      "optional": true
+    },
+    "xiaoai_set_mode": {
+      "optional": true
+    },
+    "xiaoai_set_wake_word": {
+      "optional": true
+    },
+    "xiaoai_get_status": {
+      "optional": true
+    },
+    "xiaoai_login_begin": {
+      "optional": true
+    },
+    "xiaoai_login_status": {
+      "optional": true
+    },
+    "xiaoai_console_open": {
+      "optional": true
+    },
+    "xiaoai_run_calibration": {
+      "optional": true
+    },
+    "xiaoai_set_dialog_window": {
+      "optional": true
+    },
+    "xiaoai_update_settings": {
+      "optional": true
     }
   }
 }

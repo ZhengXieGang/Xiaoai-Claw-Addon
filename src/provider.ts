@@ -19546,7 +19546,12 @@ class XiaoaiCloudPlugin {
     }
 
     private registerPluginTools() {
-        this.api.registerTool({
+        const registerOptionalTool = (tool: Record<string, unknown>) => {
+            const optionalTool = { ...tool, optional: true };
+            this.api.registerTool(optionalTool, { optional: true });
+        };
+
+        registerOptionalTool({
             name: "xiaoai_speak",
             description: "通过本地小爱音箱播报语音内容。参数 text 是你要大声说出的中文文本。",
             parameters: schemaObject({
@@ -19630,7 +19635,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_play_audio",
             description:
                 "通过小爱音箱播放音频。支持可直接访问的 http/https URL，也支持插件运行机器上的本地绝对路径（含 file://）。插件会先在本地尽量标准化为统一 MP3 音频，再交给小爱播放。",
@@ -19682,7 +19687,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_tts_bridge",
             description:
                 "使用 OpenClaw 官方 runtime.tts 把文本先合成为音频，再通过小爱音箱播放。适合想走统一 TTS 音频链路，而不是直接文本播报的场景。",
@@ -19761,7 +19766,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_set_volume",
             description: "设置小爱音箱播放音量(0-100)。只改音量数值，不会自动切换播放静音。",
             parameters: schemaObject({
@@ -19786,7 +19791,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_set_playback_mute",
             description:
                 "切换小爱音箱的播放静音开关。它影响音频播放链路，不等同于对话播报音量。",
@@ -19837,7 +19842,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_get_volume",
             description: "获取小爱音箱当前播放音量、播放静音状态和设备状态。",
             parameters: schemaObject({}),
@@ -19865,7 +19870,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_new_session",
             description:
                 "重置小爱语音入口的上下文，并让下一次通过小爱进入的 OpenClaw 对话切换到新的会话。",
@@ -19894,7 +19899,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_wake_up",
             description: "远程唤醒小爱音箱，效果等同于说唤醒词。",
             parameters: schemaObject({}),
@@ -19918,7 +19923,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_execute",
             description: "向小爱音箱发送一条执行指令，由小爱本地系统执行。",
             parameters: schemaObject({
@@ -19945,7 +19950,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_set_mode",
             description:
                 "切换插件工作模式。\n" +
@@ -19993,7 +19998,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_set_wake_word",
             description:
                 "修改插件当前使用的唤醒词规则。pattern 可以直接写固定短语，也可以写正则源码；如果只是普通文字，插件会自动按字面匹配。",
@@ -20024,7 +20029,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_get_status",
             description: "获取当前插件完整状态，包括设备、模式、登录入口与会话监听状态。",
             parameters: schemaObject({}),
@@ -20099,7 +20104,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_login_begin",
             description: "生成新的小米登录入口，并通过 OpenClaw 再次发给用户。",
             parameters: schemaObject({}),
@@ -20117,7 +20122,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_login_status",
             description: "查看当前登录会话状态。如果还没有登录会话，会自动生成一个。",
             parameters: schemaObject({}),
@@ -20157,7 +20162,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_console_open",
             description: "生成并转发小爱控制台后台链接，便于查看对话记录、事件流和直接向小爱发消息。",
             parameters: schemaObject({}),
@@ -20192,7 +20197,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_run_calibration",
             description:
                 "运行小爱插件的延迟校准。mode=all 会顺序完成音频时序校准和对话拦截校准；请求单项时，如果当前设备另一项仍未校准，也会自动补跑。对话校准会发送无副作用测试问句，测试期间音箱可能真实出声。",
@@ -20263,7 +20268,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_set_dialog_window",
             description: "设置唤醒模式下的免唤醒对话窗口时长（秒）。",
             parameters: schemaObject({
@@ -20281,7 +20286,7 @@ class XiaoaiCloudPlugin {
             },
         });
 
-        this.api.registerTool({
+        registerOptionalTool({
             name: "xiaoai_update_settings",
             description:
                 "批量修改小爱插件的高级设置。适合调整通知渠道、OpenClaw 模型、xiaoai agent 上下文窗口、thinking、非流式、workspace 提示文件、过渡播报词和调试日志等控制台配置。",

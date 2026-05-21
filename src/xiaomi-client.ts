@@ -39,6 +39,11 @@ interface XiaomiResponseLike {
     text(): Promise<string>;
 }
 
+interface XiaomiRequestOptions {
+    timeoutMs?: number;
+    maxAttempts?: number;
+}
+
 interface XiaomiNestedErrorDetail {
     name?: string;
     code?: string;
@@ -51,6 +56,7 @@ const DEBUG_LOG_MAX_BYTES = 768 * 1024;
 const DEBUG_LOG_KEEP_BYTES = 384 * 1024;
 const DEBUG_LOG_PRUNE_INTERVAL_MS = 60_000;
 const XIAOMI_FETCH_TIMEOUT_MS = 12_000;
+const XIAOMI_MIN_FETCH_TIMEOUT_MS = 300;
 const XIAOMI_GOAWAY_RETRY_DELAYS_MS = [550, 1100, 1800];
 const MINA_HTTP1_FALLBACK_WINDOW_MS = 30 * 60 * 1000;
 const MINA_CONVERSATION_TRACE_SAMPLE_MS = 5_000;
@@ -993,7 +999,7 @@ export class XiaomiAccountClient {
         const bodyText = options.body?.toString();
         const preferIpv4 = shouldPreferIpv4ForHttp1Host(target.hostname.toLowerCase());
         const timeoutMs = Number.isFinite(Number(options.timeoutMs))
-            ? Math.max(1_000, Math.round(Number(options.timeoutMs)))
+            ? Math.max(XIAOMI_MIN_FETCH_TIMEOUT_MS, Math.round(Number(options.timeoutMs)))
             : XIAOMI_FETCH_TIMEOUT_MS;
 
         if (bodyText && !headerRecord["content-length"]) {
@@ -1001,7 +1007,38 @@ export class XiaomiAccountClient {
         }
 
         return new Promise((resolve, reject) => {
-            const request = httpsRequest(
+            let settled = false;
+            let request: ReturnType<typeof httpsRequest> | undefined;
+            const finishResolve = (value: XiaomiResponseLike) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(deadlineTimer);
+                resolve(value);
+            };
+            const finishReject = (error: unknown) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(deadlineTimer);
+                reject(error);
+            };
+            const buildTimeoutError = () => {
+                const timeoutError = new Error(
+                    `request timeout after ${timeoutMs}ms`
+                ) as NodeJS.ErrnoException;
+                timeoutError.code = "ETIMEDOUT";
+                return timeoutError;
+            };
+            const deadlineTimer = setTimeout(() => {
+                const timeoutError = buildTimeoutError();
+                finishReject(timeoutError);
+                request?.destroy(timeoutError);
+            }, timeoutMs);
+
+            request = httpsRequest(
                 {
                     protocol: target.protocol,
                     hostname: target.hostname,
@@ -1014,12 +1051,21 @@ export class XiaomiAccountClient {
                 (response) => {
                     const chunks: Buffer[] = [];
                     response.on("data", (chunk) => {
+                        if (settled) {
+                            return;
+                        }
                         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
                     });
+                    response.on("error", (error) => {
+                        finishReject(error);
+                    });
                     response.on("end", () => {
+                        if (settled) {
+                            return;
+                        }
                         const textPayload = Buffer.concat(chunks).toString("utf8");
                         const status = Number(response.statusCode || 0);
-                        resolve({
+                        finishResolve({
                             status,
                             ok: status >= 200 && status < 300,
                             url: options.url,
@@ -1030,14 +1076,12 @@ export class XiaomiAccountClient {
             );
             request.setTimeout(timeoutMs);
             request.on("timeout", () => {
-                const timeoutError = new Error(
-                    `request timeout after ${timeoutMs}ms`
-                ) as NodeJS.ErrnoException;
-                timeoutError.code = "ETIMEDOUT";
+                const timeoutError = buildTimeoutError();
+                finishReject(timeoutError);
                 request.destroy(timeoutError);
             });
             request.on("error", (error) => {
-                reject(error);
+                finishReject(error);
             });
             if (bodyText) {
                 request.write(bodyText);
@@ -2854,7 +2898,7 @@ export class XiaomiAccountClient {
     }): Promise<T> {
         const allowRelogin = options.allowRelogin !== false;
         const timeoutMs = Number.isFinite(Number(options.timeoutMs))
-            ? Math.max(1_000, Math.round(Number(options.timeoutMs)))
+            ? Math.max(XIAOMI_MIN_FETCH_TIMEOUT_MS, Math.round(Number(options.timeoutMs)))
             : XIAOMI_FETCH_TIMEOUT_MS;
         const maxAttempts = Number.isFinite(Number(options.maxAttempts))
             ? Math.min(3, Math.max(1, Math.round(Number(options.maxAttempts))))
@@ -3083,10 +3127,7 @@ export class MiNAClient {
         data?: Record<string, any>,
         method?: "GET" | "POST",
         cookies?: Record<string, string>,
-        options?: {
-            timeoutMs?: number;
-            maxAttempts?: number;
-        }
+        options?: XiaomiRequestOptions
     ): Promise<T> {
         const requestId = `app_ios_${randomString(30)}`;
         const actualMethod = method || (data ? "POST" : "GET");
@@ -3110,24 +3151,30 @@ export class MiNAClient {
         return response.data || [];
     }
 
-    async ubusRequest(deviceId: string, method: string, pathName: string, message: Record<string, any>) {
+    async ubusRequest(
+        deviceId: string,
+        method: string,
+        pathName: string,
+        message: Record<string, any>,
+        options?: XiaomiRequestOptions
+    ) {
         return this.request("/remote/ubus", {
             deviceId,
             path: pathName,
             method,
             message: JSON.stringify(message)
-        }, "POST");
+        }, "POST", undefined, options);
     }
 
     async textToSpeech(deviceId: string, text: string) {
         return this.ubusRequest(deviceId, "text_to_speech", "mibrain", { text });
     }
 
-    async playerSetVolume(deviceId: string, volume: number) {
+    async playerSetVolume(deviceId: string, volume: number, options?: XiaomiRequestOptions) {
         return this.ubusRequest(deviceId, "player_set_volume", "mediaplayer", {
             volume,
             media: "app_ios"
-        });
+        }, options);
     }
 
     async playerSetLoop(deviceId: string, type = 1) {
@@ -3137,38 +3184,47 @@ export class MiNAClient {
         });
     }
 
-    async playerPause(deviceId: string, options?: { media?: string }) {
+    async playerPause(
+        deviceId: string,
+        options?: { media?: string } & XiaomiRequestOptions
+    ) {
         return this.ubusRequest(deviceId, "player_play_operation", "mediaplayer", {
             action: "pause",
             media: options?.media || "app_ios"
-        });
+        }, options);
     }
 
-    async playerPlay(deviceId: string, options?: { media?: string }) {
+    async playerPlay(
+        deviceId: string,
+        options?: { media?: string } & XiaomiRequestOptions
+    ) {
         return this.ubusRequest(deviceId, "player_play_operation", "mediaplayer", {
             action: "play",
             media: options?.media || "app_ios"
-        });
+        }, options);
     }
 
-    async playerStop(deviceId: string, options?: { media?: string }) {
+    async playerStop(
+        deviceId: string,
+        options?: { media?: string } & XiaomiRequestOptions
+    ) {
         return this.ubusRequest(deviceId, "player_play_operation", "mediaplayer", {
             action: "stop",
             media: options?.media || "app_ios"
-        });
+        }, options);
     }
 
     async playerPlayUrl(
         deviceId: string,
         url: string,
         type = 1,
-        options?: { media?: string }
+        options?: { media?: string } & XiaomiRequestOptions
     ) {
         return this.ubusRequest(deviceId, "player_play_url", "mediaplayer", {
             url,
             type,
             media: options?.media || "app_ios"
-        });
+        }, options);
     }
 
     async playerPlayMusic(deviceId: string, data: Record<string, any>) {
@@ -3187,7 +3243,7 @@ export class MiNAClient {
 
     async playerGetStatus(
         deviceId: string,
-        options?: { media?: string | null; timeoutMs?: number; maxAttempts?: number }
+        options?: { media?: string | null } & XiaomiRequestOptions
     ) {
         const message: Record<string, any> = {};
         const media = typeof options?.media === "string" ? options.media.trim() : "";
@@ -3215,7 +3271,7 @@ export class MiNAClient {
         hardware: string,
         deviceId: string,
         limit = 3,
-        options?: { timeoutMs?: number; maxAttempts?: number }
+        options?: XiaomiRequestOptions
     ): Promise<any> {
         return this.account.miRequest({
             sid: "micoapi",
@@ -3271,7 +3327,11 @@ export class MiIOClient {
         };
     }
 
-    async miioRequest<T = any>(uri: string, data: Record<string, any>): Promise<T> {
+    async miioRequest<T = any>(
+        uri: string,
+        data: Record<string, any>,
+        options?: XiaomiRequestOptions
+    ): Promise<T> {
         return this.account.miRequest<T>({
             sid: "xiaomiio",
             url: `${this.baseUrl}${uri}`,
@@ -3287,7 +3347,9 @@ export class MiIOClient {
             headers: {
                 "User-Agent": MIIO_USER_AGENT,
                 "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2"
-            }
+            },
+            timeoutMs: options?.timeoutMs,
+            maxAttempts: options?.maxAttempts,
         });
     }
 
@@ -3299,21 +3361,33 @@ export class MiIOClient {
         return response.result?.list || [];
     }
 
-    async miotGetProps(params: Array<{ did: string; siid: number; piid: number }>) {
+    async miotGetProps(
+        params: Array<{ did: string; siid: number; piid: number }>,
+        options?: XiaomiRequestOptions
+    ) {
         const response = await this.miioRequest<{ result?: any[] }>("/miotspec/prop/get", {
             params
-        });
+        }, options);
         return response.result || [];
     }
 
-    async miotSetProps(params: Array<{ did: string; siid: number; piid: number; value: any }>) {
+    async miotSetProps(
+        params: Array<{ did: string; siid: number; piid: number; value: any }>,
+        options?: XiaomiRequestOptions
+    ) {
         const response = await this.miioRequest<{ result?: any[] }>("/miotspec/prop/set", {
             params
-        });
+        }, options);
         return response.result || [];
     }
 
-    async miotAction(did: string, siid: number, aiid: number, args: any[] = []) {
+    async miotAction(
+        did: string,
+        siid: number,
+        aiid: number,
+        args: any[] = [],
+        options?: XiaomiRequestOptions
+    ) {
         const response = await this.miioRequest<{ result?: { code?: number } }>("/miotspec/action", {
             params: {
                 did,
@@ -3321,7 +3395,7 @@ export class MiIOClient {
                 aiid,
                 in: args
             }
-        });
+        }, options);
         return response.result || {};
     }
 }

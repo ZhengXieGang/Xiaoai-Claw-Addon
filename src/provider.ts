@@ -226,6 +226,7 @@ interface ConsoleSpeakerAudioLatencyProfile {
     pauseSettleEstimateMs?: number;
     stopSettleEstimateMs?: number;
     playbackDetectEstimateMs?: number;
+    manualOffsetMs?: number;
     updatedAt?: string;
 }
 
@@ -238,6 +239,7 @@ interface ConsoleCalibrationPrompt {
 interface ConsoleAudioCalibrationState {
     running: boolean;
     tailPaddingMs: number;
+    manualOffsetMs: number;
     currentProfile?: ConsoleSpeakerAudioLatencyProfile;
     lastRun?: PersistedAudioCalibrationSummary;
     prompt?: ConsoleCalibrationPrompt;
@@ -336,8 +338,21 @@ interface ActiveVoiceAgentRun {
     id: string;
     label: string;
     sessionKey?: string;
+    interceptSessionId?: string;
     startedAtMs: number;
     firstSpeakObserved: boolean;
+}
+
+interface ConversationInterceptSession {
+    id: string;
+    deviceId?: string;
+    startedAtMs: number;
+    forwardIssuedAtMs?: number;
+    primaryInterruptAcceptedAtMs?: number;
+    primaryInterruptAcceptedLabel?: string;
+    primaryInterruptReason?: string;
+    cancelledAtMs?: number;
+    cancelReason?: string;
 }
 
 interface RecentOpenclawSpeech {
@@ -496,6 +511,7 @@ interface SpeakerAudioLatencyProfile {
     pauseSettleEstimateMs?: number;
     stopSettleEstimateMs?: number;
     playbackDetectEstimateMs?: number;
+    manualOffsetMs?: number;
     updatedAtMs: number;
 }
 
@@ -535,6 +551,9 @@ type ConversationInterceptLatencyKey =
 interface ConversationFetchLatencyProfile {
     estimateMs: number;
     updatedAtMs: number;
+    consecutiveFailures?: number;
+    lastFailureAtMs?: number;
+    slowUntilMs?: number;
 }
 
 type ConversationFetchWinner = {
@@ -561,6 +580,10 @@ interface ConversationInterceptGuardPlan {
 interface ConversationInterceptSupplementalGuardState {
     attemptsUsed: number;
     lastAttemptAtMs: number;
+    sessionId?: string;
+    primaryInterruptStartedAtMs?: number;
+    primaryInterruptSettledAtMs?: number;
+    primaryInterruptAccepted?: boolean;
 }
 
 const DEFAULT_TRANSITION_PHRASES = ["让我想想", "嗯，稍等一下", "好的，我想想"];
@@ -653,6 +676,10 @@ const PAUSE_RETRY_DELAYS_MS = [0, 120];
 const SPEAKER_COMMAND_VERIFY_DELAYS_MS = [80, 160, 320, 600, 900];
 const SPEAKER_COMMAND_FAST_VERIFY_DELAYS_MS = [40, 80, 140];
 const SPEAKER_CONTROL_MEDIA_CANDIDATES = ["common", "app_ios"] as const;
+const SPEAKER_FAST_INTERRUPT_TIMEOUT_MS = 650;
+const SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS = 520;
+const SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS = 650;
+const SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS = 1;
 const SPEAKER_PLAY_URL_MEDIA_CANDIDATES = ["app_ios", "common"] as const;
 const SPEAKER_STATUS_MEDIA_FALLBACK_CANDIDATES = ["app_ios", "common"] as const;
 const SPEAKER_MUTE_READBACK_VERIFY_DELAYS_MS = [120, 360, 900];
@@ -673,6 +700,7 @@ const MIN_RECOMMENDED_POLL_INTERVAL_MS = 200;
 const IDLE_POLL_INTERVAL_MS = 900;
 const FAST_POLL_INTERVAL_MS = 200;
 const FAST_POLL_WINDOW_MS = 15_000;
+const POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS = 650;
 const POLL_ACTIVITY_GRACE_MS = 20_000;
 const STARTUP_POLL_GRACE_MS = 20_000;
 const POLL_TRANSIENT_BACKOFF_STEPS_MS = [180, 260, 420, 700, 1100, 1700];
@@ -710,17 +738,22 @@ const MIN_AUDIO_RELAY_TAIL_SILENCE_MS = 0;
 const MAX_AUDIO_RELAY_TAIL_SILENCE_MS = 10_000;
 const AUDIO_CALIBRATION_SAMPLE_DURATIONS_MS = [450, 800, 1200];
 const AUDIO_CALIBRATION_ROUND_SETTLE_MS = 500;
+const MIN_AUDIO_CALIBRATION_MANUAL_OFFSET_MS = -900;
+const MAX_AUDIO_CALIBRATION_MANUAL_OFFSET_MS = 900;
+const AUDIO_CALIBRATION_MANUAL_OFFSET_STEP_MS = 25;
 const AUDIO_PLAYBACK_SKIP_TTL_MS = 10 * 60 * 1000;
 const AUDIO_STANDARDIZE_TIMEOUT_MS = 45_000;
 const CONVERSATION_INTERCEPT_CALIBRATION_TIMEOUT_MS = 12_000;
 const CONVERSATION_INTERCEPT_CALIBRATION_POLL_MS = 90;
 const CONVERSATION_INTERCEPT_CALIBRATION_SETTLE_MS = 450;
+const CONVERSATION_INTERCEPT_CALIBRATION_STATUS_TIMEOUT_MS = 1200;
 const CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT = 10;
 const CONVERSATION_INTERCEPT_CALIBRATION_POST_VISIBLE_OBSERVE_MIN_MS = 220;
 const CONVERSATION_INTERCEPT_CALIBRATION_POST_VISIBLE_OBSERVE_MAX_MS = 480;
 const CONVERSATION_INTERCEPT_FALLBACK_GUARD_MAX_DELAY_MS = 1_800;
 const CONVERSATION_INTERCEPT_MAX_SUPPLEMENTAL_ATTEMPTS = 2;
 const CONVERSATION_INTERCEPT_SUPPLEMENTAL_MIN_SPACING_MS = 180;
+const CONVERSATION_INTERCEPT_SUPPLEMENTAL_SAFE_WINDOW_MS = 1_450;
 const CONVERSATION_INTERCEPT_RUNTIME_MAX_INTERVENTIONS = 1;
 const CONVERSATION_INTERCEPT_LATE_RECORD_BURST_DELAY_MS = 120;
 const CONVERSATION_INTERCEPT_LATE_RECORD_FORWARD_GATE_DELAYS_MS = [
@@ -735,23 +768,29 @@ const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_POLL_MS = 120;
 const CONVERSATION_INTERCEPT_RUNTIME_MONITOR_AGGRESSIVE_POLL_MS = 90;
 const CONVERSATION_INTERCEPT_TRANSITION_GRACE_MIN_MS = 320;
 const CONVERSATION_INTERCEPT_TRANSITION_GRACE_MAX_MS = 1200;
+const CONVERSATION_INTERCEPT_TRANSITION_MAX_DISPATCH_ELAPSED_MS = 2200;
+const CONVERSATION_INTERCEPT_TRANSITION_VERIFY_TIMEOUT_MS = 650;
+const CONVERSATION_INTERCEPT_TRANSITION_ASSUME_QUIET_AFTER_INTERRUPT_MS = 220;
 const CONVERSATION_FETCH_ESTIMATE_DEFAULT_MS = 320;
 const CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS = 70;
 const CONVERSATION_FETCH_HEDGE_MAX_DELAY_MS = 140;
-const CONVERSATION_FETCH_TIMEOUT_MS = 4_500;
-const CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS = 3_500;
+const CONVERSATION_FETCH_TIMEOUT_MS = 3_200;
+const CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS = 2_200;
 const CONVERSATION_FETCH_HISTORY_TIMEOUT_MS = 5_000;
 const CONVERSATION_FETCH_MAX_ATTEMPTS = 1;
 const MAX_CONVERSATION_FETCH_INFLIGHT = 2;
+const CONVERSATION_FETCH_RECENT_FAILURE_WINDOW_MS = 30_000;
+const CONVERSATION_FETCH_HEDGE_MAX_ESTIMATE_MS = 900;
 const CONVERSATION_STARTUP_STALE_RECORD_IGNORE_MS = 45_000;
+const CONVERSATION_STALE_ANSWERED_RECORD_IGNORE_MS = 120_000;
+const CONVERSATION_STALE_UNANSWERED_RECORD_IGNORE_MS = 15 * 60_000;
 const SPEAKER_INTERRUPT_BURST_VERIFY_DELAYS_MS = [0, 40, 80, 140, 220];
 const CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MIN_WAIT_MS = 260;
 const CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_MAX_WAIT_MS = 900;
+const CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_ACCEPTED_WAIT_MS = 80;
 const CONVERSATION_INTERCEPT_CALIBRATION_QUERIES = [
     "现在几点",
     "今天星期几",
-    "今天天气怎么样",
-    "现在是几月几号",
     "今天几号",
 ];
 const MIN_OPENCLAW_CONTEXT_TOKENS = 1;
@@ -762,6 +801,8 @@ const EXTERNAL_AUDIO_LOOP_GUARD_NEAR_END_POLL_MS = 45;
 const EXTERNAL_AUDIO_LOOP_GUARD_NEAR_END_MS = 1600;
 const EXTERNAL_AUDIO_LOOP_GUARD_RESTART_POSITION_MS = 900;
 const EXTERNAL_AUDIO_LOOP_GUARD_DEADLINE_LEAD_MS = 320;
+const EXTERNAL_AUDIO_LOOP_GUARD_MIN_DEADLINE_LEAD_MS = 120;
+const EXTERNAL_AUDIO_LOOP_GUARD_MAX_DEADLINE_LEAD_MS = 2200;
 const EXTERNAL_AUDIO_LOOP_GUARD_TAIL_PADDING_RESERVE_MS = 120;
 const EXTERNAL_AUDIO_LOOP_GUARD_DEADLINE_GRACE_MS = 300;
 const EXTERNAL_AUDIO_LOOP_GUARD_SNAPSHOT_FRESH_MS = 900;
@@ -2169,6 +2210,24 @@ function normalizeConversationInterceptManualOffsetMs(
     );
 }
 
+function normalizeAudioCalibrationManualOffsetMs(value: any, fallback = 0) {
+    const resolvedFallback = clamp(
+        Math.round(Number(fallback) || 0),
+        MIN_AUDIO_CALIBRATION_MANUAL_OFFSET_MS,
+        MAX_AUDIO_CALIBRATION_MANUAL_OFFSET_MS
+    );
+    const parsed = readNumber(value);
+    if (typeof parsed !== "number" || !Number.isFinite(parsed)) {
+        return resolvedFallback;
+    }
+    return clamp(
+        Math.round(parsed / AUDIO_CALIBRATION_MANUAL_OFFSET_STEP_MS) *
+            AUDIO_CALIBRATION_MANUAL_OFFSET_STEP_MS,
+        MIN_AUDIO_CALIBRATION_MANUAL_OFFSET_MS,
+        MAX_AUDIO_CALIBRATION_MANUAL_OFFSET_MS
+    );
+}
+
 function normalizeOpenclawContextTokens(
     value: any,
     fallback?: number
@@ -2824,6 +2883,7 @@ class XiaoaiCloudPlugin {
     private pendingVolumeState?: PendingVolumeState;
     private lastKnownVolumeSnapshot?: VolumeSnapshot;
     private waitingForResponse = false;
+    private activeConversationInterceptSession?: ConversationInterceptSession;
     private wakeWordPatternSource = DEFAULT_WAKE_WORD_PATTERN;
     private wakeWordRegex = new RegExp(DEFAULT_WAKE_WORD_PATTERN);
     private helperStatusCache?: {
@@ -3036,6 +3096,7 @@ class XiaoaiCloudPlugin {
     private notePollTransientBackoff(message: string) {
         const nowMs = Date.now();
         const rateLimited = this.isRateLimitedNetworkError(message);
+        const previousFloorMs = this.currentPollTransientBackoffFloorMs(nowMs);
         let floorMs = 0;
         let untilMs = 0;
 
@@ -3045,7 +3106,7 @@ class XiaoaiCloudPlugin {
                 POLL_TRANSIENT_BACKOFF_STEPS_MS.length - 1
             );
             floorMs = Math.max(
-                this.currentPollTransientBackoffFloorMs(nowMs),
+                previousFloorMs,
                 POLL_RATE_LIMIT_BACKOFF_MS
             );
             untilMs = Math.max(
@@ -3054,14 +3115,15 @@ class XiaoaiCloudPlugin {
             );
             this.pollTransientBackoffReason = "rate_limit";
         } else {
-            this.pollTransientBackoffStep = clamp(
+            const nextStep = clamp(
                 this.pollTransientBackoffStep + 1,
                 0,
                 POLL_TRANSIENT_BACKOFF_STEPS_MS.length - 1
             );
+            this.pollTransientBackoffStep = nextStep;
             floorMs = Math.max(
-                this.currentPollTransientBackoffFloorMs(nowMs),
-                POLL_TRANSIENT_BACKOFF_STEPS_MS[this.pollTransientBackoffStep] || 0
+                previousFloorMs,
+                POLL_TRANSIENT_BACKOFF_STEPS_MS[nextStep] || 0
             );
             untilMs = Math.max(
                 this.pollTransientBackoffUntil,
@@ -3244,6 +3306,13 @@ class XiaoaiCloudPlugin {
                 hasEstimate = true;
             }
         });
+        const manualOffsetMs = readNumber(value.manualOffsetMs);
+        if (typeof manualOffsetMs === "number" && Number.isFinite(manualOffsetMs)) {
+            next.manualOffsetMs = normalizeAudioCalibrationManualOffsetMs(
+                manualOffsetMs
+            );
+            hasEstimate = true;
+        }
         return hasEstimate ? next : undefined;
     }
 
@@ -3260,6 +3329,7 @@ class XiaoaiCloudPlugin {
             pauseSettleEstimateMs: normalized.pauseSettleEstimateMs,
             stopSettleEstimateMs: normalized.stopSettleEstimateMs,
             playbackDetectEstimateMs: normalized.playbackDetectEstimateMs,
+            manualOffsetMs: normalized.manualOffsetMs,
             updatedAtMs: normalized.updatedAtMs,
         };
     }
@@ -3277,6 +3347,7 @@ class XiaoaiCloudPlugin {
             pauseSettleEstimateMs: normalized.pauseSettleEstimateMs,
             stopSettleEstimateMs: normalized.stopSettleEstimateMs,
             playbackDetectEstimateMs: normalized.playbackDetectEstimateMs,
+            manualOffsetMs: normalized.manualOffsetMs,
             updatedAt:
                 normalized.updatedAtMs > 0
                     ? new Date(normalized.updatedAtMs).toISOString()
@@ -3344,6 +3415,7 @@ class XiaoaiCloudPlugin {
         const successCount = readNumber(value.successCount);
         const failureCount = readNumber(value.failureCount);
         const tailPaddingMs = readNumber(value.tailPaddingMs);
+        const manualOffsetMs = readNumber(value.manualOffsetMs);
         const summary: PersistedAudioCalibrationSummary = {
             deviceId: readString(value.deviceId) || undefined,
             deviceName: readString(value.deviceName) || undefined,
@@ -3369,6 +3441,10 @@ class XiaoaiCloudPlugin {
                 tailPaddingMs >= 0
                     ? Math.max(0, Math.round(tailPaddingMs))
                     : undefined,
+            manualOffsetMs:
+                typeof manualOffsetMs === "number" && Number.isFinite(manualOffsetMs)
+                    ? normalizeAudioCalibrationManualOffsetMs(manualOffsetMs)
+                    : latencyProfile?.manualOffsetMs,
             startedAt: readString(value.startedAt) || undefined,
             completedAt: readString(value.completedAt) || undefined,
             lastError: readString(value.lastError) || undefined,
@@ -3893,12 +3969,16 @@ class XiaoaiCloudPlugin {
 
     private buildConsoleAudioCalibrationState(): ConsoleAudioCalibrationState {
         const currentDevice = this.device;
+        const currentProfile = this.buildConsoleSpeakerAudioLatencyProfile(
+            this.readSpeakerAudioLatencyProfile(currentDevice?.minaDeviceId)
+        );
         return {
             running: this.audioCalibrationRunning,
             tailPaddingMs: this.getAudioRelayTailPaddingMs(),
-            currentProfile: this.buildConsoleSpeakerAudioLatencyProfile(
-                this.readSpeakerAudioLatencyProfile(currentDevice?.minaDeviceId)
+            manualOffsetMs: normalizeAudioCalibrationManualOffsetMs(
+                currentProfile?.manualOffsetMs
             ),
+            currentProfile,
             lastRun: this.lastAudioCalibration,
             prompt: this.buildConsoleAudioCalibrationPrompt(currentDevice),
         };
@@ -6275,6 +6355,47 @@ class XiaoaiCloudPlugin {
                 });
                 return true;
             }
+            if (
+                requestMethod === "POST" &&
+                action === "diagnostics/simulate-incoming-query"
+            ) {
+                const body = await readJsonBody(request);
+                const text = readString(body?.text ?? body?.query);
+                if (!text) {
+                    sendJson(response, 400, { error: "请输入要模拟的用户语音。" });
+                    return true;
+                }
+                const answersPresent = readBoolean(body?.answersPresent) === true;
+                const answerCount = clamp(
+                    Math.round(
+                        readNumber(body?.answerCount) ||
+                            (answersPresent ? 1 : 0)
+                    ),
+                    0,
+                    8
+                );
+                const recordAgeMs = clamp(
+                    Math.round(readNumber(body?.recordAgeMs) || 0),
+                    0,
+                    10 * 60_000
+                );
+                await this.appendDebugTrace("diagnostics_simulate_incoming_query", {
+                    text: normalizeEventText(text, 240),
+                    answersPresent,
+                    answerCount,
+                    recordAgeMs,
+                });
+                await this.handleIncomingQuery(text, {
+                    answersPresent,
+                    answerCount,
+                    recordAgeMs,
+                });
+                sendJson(response, 200, {
+                    ok: true,
+                    message: "已模拟一条用户语音并交给当前拦截链路处理。",
+                });
+                return true;
+            }
             if (requestMethod === "POST" && action === "speaker/speak") {
                 const body = await readJsonBody(request);
                 const text = readString(body?.text);
@@ -6282,7 +6403,7 @@ class XiaoaiCloudPlugin {
                     sendJson(response, 400, { error: "请输入要直接播报的文字。" });
                     return true;
                 }
-                this.waitingForResponse = false;
+                this.clearWaitingForResponse("console_speaker_speak");
                 const ok = await this.playText(text);
                 if (!ok) {
                     throw new Error("播报失败。");
@@ -6312,7 +6433,7 @@ class XiaoaiCloudPlugin {
                     });
                     return true;
                 }
-                this.waitingForResponse = false;
+                this.clearWaitingForResponse("console_speaker_play_audio");
                 let played: Awaited<ReturnType<XiaoaiCloudPlugin["playAudioUrl"]>> | null = null;
                 let playbackErrorMessage = "";
                 try {
@@ -6550,6 +6671,40 @@ class XiaoaiCloudPlugin {
                     message: result.changed
                         ? `对话拦截微调已更新为 ${result.manualOffsetMs}ms`
                         : `当前对话拦截微调保持 ${result.manualOffsetMs}ms`,
+                });
+                return true;
+            }
+            if (
+                requestMethod === "POST" &&
+                action === "device/audio-calibration-offset"
+            ) {
+                const body = await readJsonBody(request);
+                const manualOffsetMs = readNumber(
+                    body?.manualOffsetMs ?? body?.milliseconds ?? body?.ms
+                );
+                if (
+                    typeof manualOffsetMs !== "number" ||
+                    !Number.isFinite(manualOffsetMs)
+                ) {
+                    sendJson(response, 400, { error: "音频时序微调参数无效。" });
+                    return true;
+                }
+                const result = await this.updateAudioCalibrationManualOffsetMs(
+                    manualOffsetMs
+                );
+                await this.appendConsoleEvent(
+                    "console.audio_calibration_offset",
+                    "控制台微调音频时序",
+                    `${result.previousManualOffsetMs}ms -> ${result.manualOffsetMs}ms`,
+                    "success"
+                );
+                sendJson(response, 200, {
+                    ok: true,
+                    manualOffsetMs: result.manualOffsetMs,
+                    calibration: this.buildConsoleAudioCalibrationState(),
+                    message: result.changed
+                        ? `音频时序微调已更新为 ${result.manualOffsetMs}ms`
+                        : `当前音频时序微调保持 ${result.manualOffsetMs}ms`,
                 });
                 return true;
             }
@@ -7426,6 +7581,18 @@ class XiaoaiCloudPlugin {
         );
     }
 
+    private isActiveVoicePollingWindow(nowMs = Date.now()) {
+        return Boolean(
+            this.waitingForResponse ||
+                nowMs < this.fastPollUntil ||
+                (
+                    this.lastDialogWindowOpenedAt > 0 &&
+                    nowMs / 1000 - this.lastDialogWindowOpenedAt <=
+                        this.continuousDialogWindow
+                )
+        );
+    }
+
     private currentPollInterval(config?: PluginConfig) {
         const baseInterval = clamp(
             config?.pollIntervalMs || DEFAULT_POLL_INTERVAL_MS,
@@ -7446,8 +7613,13 @@ class XiaoaiCloudPlugin {
             }
         }
         const backoffFloorMs = this.currentPollTransientBackoffFloorMs();
+        const activeVoiceWindow = this.isActiveVoicePollingWindow();
+        const effectiveBackoffFloorMs =
+            activeVoiceWindow && this.pollTransientBackoffReason !== "rate_limit"
+                ? Math.min(backoffFloorMs, POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS)
+                : backoffFloorMs;
         return backoffFloorMs > 0
-            ? Math.max(desiredInterval, backoffFloorMs)
+            ? Math.max(desiredInterval, effectiveBackoffFloorMs)
             : desiredInterval;
     }
 
@@ -7493,8 +7665,84 @@ class XiaoaiCloudPlugin {
         );
     }
 
-    private clearInterceptWindowState() {
+    private createConversationInterceptSession(deviceId?: string) {
+        const session: ConversationInterceptSession = {
+            id: randomBytes(8).toString("hex"),
+            deviceId: readString(deviceId),
+            startedAtMs: Date.now(),
+        };
+        this.activeConversationInterceptSession = session;
+        this.waitingForResponse = true;
+        return session;
+    }
+
+    private isConversationInterceptSessionActive(
+        session?: ConversationInterceptSession | string
+    ) {
+        const sessionId =
+            typeof session === "string" ? session : readString(session?.id);
+        return Boolean(
+            sessionId &&
+                this.waitingForResponse &&
+                this.activeConversationInterceptSession?.id === sessionId &&
+                !this.activeConversationInterceptSession.cancelledAtMs
+        );
+    }
+
+    private markConversationInterceptForwardIssued(
+        session?: ConversationInterceptSession
+    ) {
+        if (!session || this.activeConversationInterceptSession?.id !== session.id) {
+            return;
+        }
+        this.activeConversationInterceptSession.forwardIssuedAtMs = Date.now();
+    }
+
+    private markConversationInterceptPrimaryInterruptAccepted(
+        session: ConversationInterceptSession | undefined,
+        reason: string,
+        acceptedLabel?: string
+    ) {
+        if (!session || this.activeConversationInterceptSession?.id !== session.id) {
+            return;
+        }
+        this.activeConversationInterceptSession.primaryInterruptAcceptedAtMs =
+            Date.now();
+        this.activeConversationInterceptSession.primaryInterruptAcceptedLabel =
+            readString(acceptedLabel);
+        this.activeConversationInterceptSession.primaryInterruptReason =
+            readString(reason);
+    }
+
+    private clearWaitingForResponse(reason = "cleared") {
         this.waitingForResponse = false;
+        if (
+            this.activeConversationInterceptSession &&
+            !this.activeConversationInterceptSession.cancelledAtMs
+        ) {
+            this.activeConversationInterceptSession.cancelledAtMs = Date.now();
+            this.activeConversationInterceptSession.cancelReason = reason;
+        }
+    }
+
+    private clearConversationInterceptSession(
+        session?: ConversationInterceptSession | string,
+        reason = "cleared"
+    ) {
+        const sessionId =
+            typeof session === "string" ? session : readString(session?.id);
+        if (
+            !sessionId ||
+            this.activeConversationInterceptSession?.id === sessionId
+        ) {
+            this.clearWaitingForResponse(reason);
+            return true;
+        }
+        return false;
+    }
+
+    private clearInterceptWindowState(reason = "intercept_window_cleared") {
+        this.clearWaitingForResponse(reason);
         this.lastDialogWindowOpenedAt = 0;
     }
 
@@ -8079,6 +8327,62 @@ class XiaoaiCloudPlugin {
             updatedAtMs: Date.now(),
         };
         this.conversationInterceptLatencyProfiles.set(deviceId, nextProfile);
+        if (
+            this.lastConversationInterceptCalibration &&
+            readString(this.lastConversationInterceptCalibration.deviceId) === deviceId
+        ) {
+            this.lastConversationInterceptCalibration = {
+                ...this.lastConversationInterceptCalibration,
+                latencyProfile:
+                    this.serializeConversationInterceptLatencyProfileForPersistence(
+                        nextProfile
+                    ),
+            };
+        }
+        await this.persistResolvedProfile(config, this.device, true);
+        return {
+            deviceId,
+            manualOffsetMs,
+            previousManualOffsetMs,
+            changed: manualOffsetMs !== previousManualOffsetMs,
+        };
+    }
+
+    private async updateAudioCalibrationManualOffsetMs(msInput: number) {
+        const config = await this.loadConfig(false);
+        const deviceId = readString(this.device?.minaDeviceId);
+        if (!deviceId) {
+            throw new Error("当前还没有选定可写入画像的设备。");
+        }
+        const currentProfile = this.readSpeakerAudioLatencyProfile(deviceId) || {
+            updatedAtMs: 0,
+        };
+        const previousManualOffsetMs = normalizeAudioCalibrationManualOffsetMs(
+            currentProfile.manualOffsetMs
+        );
+        const manualOffsetMs = normalizeAudioCalibrationManualOffsetMs(
+            msInput,
+            previousManualOffsetMs
+        );
+        const nextProfile: SpeakerAudioLatencyProfile = {
+            ...currentProfile,
+            manualOffsetMs,
+            updatedAtMs: Date.now(),
+        };
+        this.speakerAudioLatencyProfiles.set(deviceId, nextProfile);
+        if (
+            this.lastAudioCalibration &&
+            readString(this.lastAudioCalibration.deviceId) === deviceId
+        ) {
+            this.lastAudioCalibration = {
+                ...this.lastAudioCalibration,
+                manualOffsetMs,
+                latencyProfile:
+                    this.serializeSpeakerAudioLatencyProfileForPersistence(
+                        nextProfile
+                    ),
+            };
+        }
         await this.persistResolvedProfile(config, this.device, true);
         return {
             deviceId,
@@ -8401,7 +8705,7 @@ class XiaoaiCloudPlugin {
         this.lastConversationTimestamp = 0;
         this.lastConversationRequestId = "";
         this.lastConversationQuery = "";
-        this.waitingForResponse = false;
+        this.clearWaitingForResponse("login_without_device");
         this.lastDialogWindowOpenedAt = 0;
         this.lastError = message;
         await this.persistResolvedProfile(config, undefined, true);
@@ -8819,10 +9123,40 @@ class XiaoaiCloudPlugin {
                     )
                 : boundedObservedMs;
         this.conversationFetchLatencyProfiles.set(normalizedDeviceId, {
+            ...current,
             estimateMs: nextEstimate,
             updatedAtMs: Date.now(),
+            consecutiveFailures: 0,
+            slowUntilMs:
+                nextEstimate > CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS * 0.75
+                    ? Date.now() + CONVERSATION_FETCH_RECENT_FAILURE_WINDOW_MS
+                    : current?.slowUntilMs,
         });
         return nextEstimate;
+    }
+
+    private noteConversationFetchFailure(deviceId?: string) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        const nowMs = Date.now();
+        const current = this.conversationFetchLatencyProfiles.get(normalizedDeviceId);
+        const recentFailure =
+            current?.lastFailureAtMs &&
+            nowMs - current.lastFailureAtMs <= CONVERSATION_FETCH_RECENT_FAILURE_WINDOW_MS;
+        const consecutiveFailures = recentFailure
+            ? (readNumber(current?.consecutiveFailures) || 0) + 1
+            : 1;
+        this.conversationFetchLatencyProfiles.set(normalizedDeviceId, {
+            estimateMs:
+                readNumber(current?.estimateMs) || CONVERSATION_FETCH_ESTIMATE_DEFAULT_MS,
+            updatedAtMs: current?.updatedAtMs || nowMs,
+            consecutiveFailures,
+            lastFailureAtMs: nowMs,
+            slowUntilMs: nowMs + CONVERSATION_FETCH_RECENT_FAILURE_WINDOW_MS,
+        });
+        return consecutiveFailures;
     }
 
     private readConversationFetchLatencyEstimate(deviceId?: string) {
@@ -8835,13 +9169,56 @@ class XiaoaiCloudPlugin {
         );
     }
 
+    private readConversationFetchProfile(deviceId?: string) {
+        const normalizedDeviceId = readString(deviceId);
+        if (!normalizedDeviceId) {
+            return undefined;
+        }
+        return this.conversationFetchLatencyProfiles.get(normalizedDeviceId);
+    }
+
     private shouldUseHedgedConversationFetch(deviceId?: string) {
+        if (!readString(deviceId)) {
+            return false;
+        }
+        const profile = this.readConversationFetchProfile(deviceId);
+        const nowMs = Date.now();
+        const consecutiveFailures = readNumber(profile?.consecutiveFailures) || 0;
+        const recentlySlow = readNumber(profile?.slowUntilMs) || 0;
+        if (
+            consecutiveFailures > 0 ||
+            recentlySlow > nowMs ||
+            (readNumber(profile?.estimateMs) || 0) > CONVERSATION_FETCH_HEDGE_MAX_ESTIMATE_MS
+        ) {
+            return false;
+        }
         return Boolean(
-            readString(deviceId) &&
-                (this.conversationInterceptCalibrationRunning ||
-                    this.waitingForResponse ||
-                    Date.now() < this.fastPollUntil)
+            this.conversationInterceptCalibrationRunning ||
+                this.waitingForResponse ||
+                Date.now() < this.fastPollUntil
         );
+    }
+
+    private resolveConversationFetchTimeoutMs(
+        deviceId?: string,
+        fallbackActive = false
+    ) {
+        const profile = this.readConversationFetchProfile(deviceId);
+        const nowMs = Date.now();
+        const consecutiveFailures = readNumber(profile?.consecutiveFailures) || 0;
+        const slowUntilMs = readNumber(profile?.slowUntilMs) || 0;
+        const estimateMs = readNumber(profile?.estimateMs) || 0;
+        const activeTimeout = Math.max(
+            CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS,
+            estimateMs > 0 ? Math.round(estimateMs * 1.85) : 0,
+            consecutiveFailures > 0 ? CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS + 450 : 0,
+            consecutiveFailures >= 2 ? CONVERSATION_FETCH_TIMEOUT_MS : 0,
+            slowUntilMs > nowMs ? CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS + 350 : 0
+        );
+        const baseTimeout = fallbackActive
+            ? CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS
+            : activeTimeout;
+        return clamp(Math.round(baseTimeout), 1_000, CONVERSATION_FETCH_TIMEOUT_MS);
     }
 
     private computeConversationFetchHedgeDelayMs(deviceId?: string) {
@@ -8870,12 +9247,16 @@ class XiaoaiCloudPlugin {
         }
     ): Promise<any | null> {
         const startedAtMs = Date.now();
+        const fallbackActive = this.shouldUseHedgedConversationFetch(
+            device.minaDeviceId
+        );
         const timeoutMs = clamp(
             Math.round(
                 readNumber(options?.timeoutMs) ||
-                    (this.shouldUseHedgedConversationFetch(device.minaDeviceId)
-                        ? CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS
-                        : CONVERSATION_FETCH_TIMEOUT_MS)
+                    this.resolveConversationFetchTimeoutMs(
+                        device.minaDeviceId,
+                        fallbackActive
+                    )
             ),
             1_000,
             CONVERSATION_FETCH_TIMEOUT_MS
@@ -8907,6 +9288,18 @@ class XiaoaiCloudPlugin {
                 Date.now() - startedAtMs
             );
             return this.selectLatestConversationCandidate(records);
+        } catch (error) {
+            const consecutiveFailures = this.noteConversationFetchFailure(
+                device.minaDeviceId
+            );
+            void this.appendDebugTrace("conversation_fetch_failed", {
+                deviceId: device.minaDeviceId,
+                elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                timeoutMs,
+                consecutiveFailures,
+                message: this.errorMessage(error),
+            });
+            throw error;
         } finally {
             this.conversationFetchInflightCount = Math.max(
                 0,
@@ -9102,6 +9495,7 @@ class XiaoaiCloudPlugin {
             }
 
             const cycleStartedAt = Date.now();
+            let failureBackoffDelayMs = 0;
             try {
                 await this.pollConversationOnce();
             } catch (error) {
@@ -9111,6 +9505,13 @@ class XiaoaiCloudPlugin {
                     this.isRateLimitedNetworkError(message)
                 ) {
                     const backoff = this.notePollTransientBackoff(message);
+                    failureBackoffDelayMs =
+                        backoff.rateLimited || !this.isActiveVoicePollingWindow()
+                            ? backoff.floorMs
+                            : Math.min(
+                                backoff.floorMs,
+                                POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS
+                            );
                     console.warn(
                         `[XiaoAI Cloud] 会话轮询暂时失败，将自动重试${
                             backoff.floorMs > 0
@@ -9144,7 +9545,13 @@ class XiaoaiCloudPlugin {
                     if (config) {
                         const desiredInterval = this.currentPollInterval(config);
                         const elapsedMs = Date.now() - cycleStartedAt;
-                        this.schedulePollingLoop(Math.max(0, desiredInterval - elapsedMs));
+                        this.schedulePollingLoop(
+                            Math.max(
+                                failureBackoffDelayMs,
+                                desiredInterval - elapsedMs,
+                                0
+                            )
+                        );
                     }
                 }
             }
@@ -9195,6 +9602,24 @@ class XiaoaiCloudPlugin {
         this.lastConversationTimestamp = latestTimestamp;
         this.lastConversationRequestId = latestRequestId;
         this.lastConversationQuery = latestQuery;
+
+        if (
+            this.shouldIgnoreStaleConversationRecord(
+                recordAgeMs,
+                normalizedConversation.answers.length > 0
+            )
+        ) {
+            await this.appendDebugTrace("conversation_record_ignored", {
+                reason: normalizedConversation.answers.length > 0
+                    ? "stale_answered_record"
+                    : "stale_unanswered_record",
+                requestId: latestRequestId || undefined,
+                query: latestQuery,
+                recordAgeMs,
+                answerCount: normalizedConversation.answers.length,
+            });
+            return;
+        }
 
         if (
             this.shouldIgnoreStartupStaleConversationRecord(
@@ -9719,8 +10144,15 @@ class XiaoaiCloudPlugin {
         if (!snapshot) {
             return false;
         }
+        const status = readNumber(snapshot.status);
+        if (status === 1) {
+            return true;
+        }
+        if (status === 0 || status === 2) {
+            return false;
+        }
         const position = Math.max(0, readNumber(snapshot.position) || 0);
-        return readNumber(snapshot.status) === 1 || position > 0;
+        return position > 0;
     }
 
     private isSpeakerPlaybackZeroProgress(snapshot: SpeakerPlaybackSnapshot | null) {
@@ -10395,14 +10827,23 @@ class XiaoaiCloudPlugin {
         mina: MiNAClient,
         deviceId: string,
         predicate: (snapshot: SpeakerPlaybackSnapshot | null) => boolean,
-        delaysMs = SPEAKER_COMMAND_VERIFY_DELAYS_MS
+        delaysMs = SPEAKER_COMMAND_VERIFY_DELAYS_MS,
+        options?: {
+            timeoutMs?: number;
+            maxAttempts?: number;
+            skipMediaFallback?: boolean;
+        }
     ) {
         let lastSnapshot: SpeakerPlaybackSnapshot | null = null;
         for (const delayMs of delaysMs) {
             if (delayMs > 0) {
                 await sleep(delayMs);
             }
-            lastSnapshot = await this.readSpeakerPlaybackSnapshotWithTiming(mina, deviceId);
+            lastSnapshot = await this.readSpeakerPlaybackSnapshotWithTiming(
+                mina,
+                deviceId,
+                options
+            );
             if (predicate(lastSnapshot)) {
                 return {
                     ok: true,
@@ -11975,7 +12416,12 @@ class XiaoaiCloudPlugin {
             }
             const snapshot = await this.readSpeakerPlaybackSnapshotWithTiming(
                 mina,
-                deviceId
+                deviceId,
+                {
+                    timeoutMs: CONVERSATION_INTERCEPT_CALIBRATION_STATUS_TIMEOUT_MS,
+                    maxAttempts: 1,
+                    skipMediaFallback: true,
+                }
             ).catch(() => null);
             const reason =
                 this.detectConversationInterceptCalibrationPlaybackReason(
@@ -12142,7 +12588,13 @@ class XiaoaiCloudPlugin {
                     const baselinePlaybackSnapshot =
                         (await this.readSpeakerPlaybackSnapshotWithTiming(
                             mina,
-                            device.minaDeviceId
+                            device.minaDeviceId,
+                            {
+                                timeoutMs:
+                                    CONVERSATION_INTERCEPT_CALIBRATION_STATUS_TIMEOUT_MS,
+                                maxAttempts: 1,
+                                skipMediaFallback: true,
+                            }
                         ).catch(() => null)) || null;
                     const baselineTimestamp = Number(baseline?.time || 0);
                     const baselineRequestId = readString(baseline?.requestId) || "";
@@ -12465,7 +12917,13 @@ class XiaoaiCloudPlugin {
                         const currentSnapshot =
                             await this.readSpeakerPlaybackSnapshotWithTiming(
                                 mina,
-                                device.minaDeviceId
+                                device.minaDeviceId,
+                                {
+                                    timeoutMs: AUDIO_PLAYBACK_FAST_STATUS_TIMEOUT_MS,
+                                    maxAttempts:
+                                        AUDIO_PLAYBACK_FAST_STATUS_MAX_ATTEMPTS,
+                                    skipMediaFallback: true,
+                                }
                             );
                         if (
                             this.isSpeakerPlaybackActivelyPlaying(currentSnapshot) ||
@@ -12498,6 +12956,10 @@ class XiaoaiCloudPlugin {
                 this.applySpeakerAudioCalibrationSamples(device.minaDeviceId);
             }
 
+            const latencyProfile =
+                this.serializeSpeakerAudioLatencyProfileForPersistence(
+                    this.readSpeakerAudioLatencyProfile(device.minaDeviceId)
+                );
             const summary: PersistedAudioCalibrationSummary = {
                 deviceId: device.minaDeviceId,
                 deviceName: device.name,
@@ -12505,12 +12967,13 @@ class XiaoaiCloudPlugin {
                 successCount,
                 failureCount,
                 tailPaddingMs,
+                manualOffsetMs: normalizeAudioCalibrationManualOffsetMs(
+                    latencyProfile?.manualOffsetMs
+                ),
                 startedAt,
                 completedAt: new Date().toISOString(),
                 lastError,
-                latencyProfile: this.serializeSpeakerAudioLatencyProfileForPersistence(
-                    this.readSpeakerAudioLatencyProfile(device.minaDeviceId)
-                ),
+                latencyProfile,
             };
             this.lastAudioCalibration = summary;
             await this.persistResolvedProfile(config, this.device || device, false);
@@ -13379,8 +13842,25 @@ class XiaoaiCloudPlugin {
 
     private claimConversationSupplementalIntervention(
         state?: ConversationInterceptSupplementalGuardState,
+        session?: ConversationInterceptSession,
         nowMs = Date.now()
     ) {
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            return {
+                ok: false,
+                reason: "stale_intercept_session",
+            };
+        }
+        if (
+            state?.sessionId &&
+            session?.id &&
+            state.sessionId !== session.id
+        ) {
+            return {
+                ok: false,
+                reason: "guard_session_mismatch",
+            };
+        }
         if (!state) {
             return {
                 ok: true,
@@ -13413,11 +13893,28 @@ class XiaoaiCloudPlugin {
         interceptStartedAtMs?: number,
         actionContextPromise?: Promise<ActionContext>,
         plan?: ConversationInterceptGuardPlan,
-        guardState?: ConversationInterceptSupplementalGuardState
+        guardState?: ConversationInterceptSupplementalGuardState,
+        session?: ConversationInterceptSession
     ) {
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_fallback_pause_guard", {
+                deviceId: session.deviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session",
+            });
+            return;
+        }
         const { device, mina, miio } = actionContextPromise
             ? await actionContextPromise
             : await this.ensureActionContext();
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_fallback_pause_guard", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session_after_context",
+            });
+            return;
+        }
         const delaysMs =
             Array.isArray(plan?.guardDelaysMs) && plan.guardDelaysMs.length > 0
                 ? plan.guardDelaysMs
@@ -13436,14 +13933,56 @@ class XiaoaiCloudPlugin {
             if (waitMs > 0) {
                 await sleep(waitMs);
             }
-            if (!this.waitingForResponse) {
+            if (!this.isConversationInterceptSessionActive(session)) {
                 attempts.push({
                     delayMs: targetDelayMs,
-                    skipped: "waiting_for_response_cleared",
+                    skipped: "intercept_session_cleared",
                 });
                 break;
             }
-            const claim = this.claimConversationSupplementalIntervention(guardState);
+            if (guardState?.primaryInterruptAccepted) {
+                attempts.push({
+                    delayMs: targetDelayMs,
+                    skipped: "primary_interrupt_accepted",
+                });
+                break;
+            }
+            if (
+                guardState?.primaryInterruptStartedAtMs &&
+                !guardState.primaryInterruptSettledAtMs
+            ) {
+                const primaryDeadlineAtMs =
+                    guardState.primaryInterruptStartedAtMs +
+                    SPEAKER_FAST_INTERRUPT_TIMEOUT_MS +
+                    80;
+                const primaryWaitMs = primaryDeadlineAtMs - Date.now();
+                if (primaryWaitMs > 0) {
+                    await sleep(primaryWaitMs);
+                }
+                if (guardState.primaryInterruptAccepted) {
+                    attempts.push({
+                        delayMs: targetDelayMs,
+                        skipped: "primary_interrupt_accepted",
+                    });
+                    break;
+                }
+            }
+            const elapsedBeforeDispatchMs = Math.max(0, Date.now() - startedAtMs);
+            if (
+                elapsedBeforeDispatchMs >
+                CONVERSATION_INTERCEPT_SUPPLEMENTAL_SAFE_WINDOW_MS
+            ) {
+                attempts.push({
+                    delayMs: targetDelayMs,
+                    elapsedMs: elapsedBeforeDispatchMs,
+                    skipped: "stale_supplemental_window",
+                });
+                break;
+            }
+            const claim = this.claimConversationSupplementalIntervention(
+                guardState,
+                session
+            );
             if (!claim.ok) {
                 attempts.push({
                     delayMs: targetDelayMs,
@@ -13459,8 +13998,19 @@ class XiaoaiCloudPlugin {
             let errorMessage = "";
             let action = "pause";
             try {
+                if (!this.isConversationInterceptSessionActive(session)) {
+                    attempts.push({
+                        delayMs: targetDelayMs,
+                        skipped: "intercept_session_cleared_before_command",
+                    });
+                    break;
+                }
                 await this.sendPauseCommand(device, mina, miio, {
                     singleAttempt: true,
+                    timeoutMs: SPEAKER_FAST_INTERRUPT_TIMEOUT_MS,
+                    minaTimeoutMs: SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS,
+                    miioTimeoutMs: SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS,
+                    maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
                 });
                 ok = true;
             } catch (error) {
@@ -13488,14 +14038,31 @@ class XiaoaiCloudPlugin {
         interceptStartedAtMs: number,
         actionContextPromise?: Promise<ActionContext>,
         plan?: ConversationInterceptGuardPlan,
-        guardState?: ConversationInterceptSupplementalGuardState
+        guardState?: ConversationInterceptSupplementalGuardState,
+        session?: ConversationInterceptSession
     ) {
         if (!plan?.aggressive || (readNumber(plan.primarySilenceDelayMs) || 0) > 0) {
+            return;
+        }
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                deviceId: session.deviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session",
+            });
             return;
         }
         const { device, mina, miio } = actionContextPromise
             ? await actionContextPromise
             : await this.ensureActionContext();
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session_after_context",
+            });
+            return;
+        }
         const targetDelayMs = clamp(
             Math.round(readNumber(plan.lateRecordFollowUpDelayMs) || 0),
             0,
@@ -13505,16 +14072,30 @@ class XiaoaiCloudPlugin {
         if (waitMs > 0) {
             await sleep(waitMs);
         }
-        if (!this.waitingForResponse) {
+        if (!this.isConversationInterceptSessionActive(session)) {
             await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
                 deviceId: device.minaDeviceId,
                 startedAtMs: interceptStartedAtMs,
                 delayMs: targetDelayMs,
-                skipped: "waiting_for_response_cleared",
+                skipped: "intercept_session_cleared",
             });
             return;
         }
-        const claim = this.claimConversationSupplementalIntervention(guardState);
+        const elapsedBeforeDispatchMs = Math.max(0, Date.now() - interceptStartedAtMs);
+        if (elapsedBeforeDispatchMs > CONVERSATION_INTERCEPT_SUPPLEMENTAL_SAFE_WINDOW_MS) {
+            await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                delayMs: targetDelayMs,
+                elapsedMs: elapsedBeforeDispatchMs,
+                skipped: "stale_supplemental_window",
+            });
+            return;
+        }
+        const claim = this.claimConversationSupplementalIntervention(
+            guardState,
+            session
+        );
         if (!claim.ok) {
             await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
                 deviceId: device.minaDeviceId,
@@ -13529,6 +14110,15 @@ class XiaoaiCloudPlugin {
         let attemptedCount = 0;
         let errorMessage = "";
         try {
+            if (!this.isConversationInterceptSessionActive(session)) {
+                await this.appendDebugTrace("conversation_intercept_late_record_followup_burst", {
+                    deviceId: device.minaDeviceId,
+                    startedAtMs: interceptStartedAtMs,
+                    delayMs: targetDelayMs,
+                    skipped: "intercept_session_cleared_before_command",
+                });
+                return;
+            }
             const burst = await this.dispatchSpeakerInterruptBurst(device, mina, miio);
             accepted = burst.accepted;
             acceptedCount = burst.acceptedCount;
@@ -13551,11 +14141,28 @@ class XiaoaiCloudPlugin {
         interceptStartedAtMs: number,
         plan: ConversationInterceptGuardPlan,
         actionContextPromise?: Promise<ActionContext>,
-        guardState?: ConversationInterceptSupplementalGuardState
+        guardState?: ConversationInterceptSupplementalGuardState,
+        session?: ConversationInterceptSession
     ) {
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_runtime_monitor", {
+                deviceId: session.deviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session",
+            });
+            return;
+        }
         const { device, mina, miio } = actionContextPromise
             ? await actionContextPromise
             : await this.ensureActionContext();
+        if (session && !this.isConversationInterceptSessionActive(session)) {
+            await this.appendDebugTrace("conversation_intercept_runtime_monitor", {
+                deviceId: device.minaDeviceId,
+                startedAtMs: interceptStartedAtMs,
+                skipped: "stale_intercept_session_after_context",
+            });
+            return;
+        }
         const deadlineAtMs =
             interceptStartedAtMs + plan.runtimeMonitorDurationMs;
         const samples: Record<string, any>[] = [];
@@ -13570,20 +14177,20 @@ class XiaoaiCloudPlugin {
         let lastInterventionAtMs = 0;
 
         while (Date.now() < deadlineAtMs) {
-            if (!this.waitingForResponse) {
+            if (!this.isConversationInterceptSessionActive(session)) {
                 samples.push({
                     elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
-                    skipped: "waiting_for_response_cleared",
+                    skipped: "intercept_session_cleared",
                 });
                 break;
             }
             if (samples.length > 0) {
                 await sleep(plan.runtimeMonitorPollMs);
             }
-            if (!this.waitingForResponse) {
+            if (!this.isConversationInterceptSessionActive(session)) {
                 samples.push({
                     elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
-                    skipped: "waiting_for_response_cleared",
+                    skipped: "intercept_session_cleared",
                 });
                 break;
             }
@@ -13622,7 +14229,7 @@ class XiaoaiCloudPlugin {
                 true,
                 elapsedMs
             );
-            if (!this.waitingForResponse) {
+            if (!this.isConversationInterceptSessionActive(session)) {
                 break;
             }
             if (
@@ -13631,7 +14238,10 @@ class XiaoaiCloudPlugin {
             ) {
                 continue;
             }
-            const claim = this.claimConversationSupplementalIntervention(guardState);
+            const claim = this.claimConversationSupplementalIntervention(
+                guardState,
+                session
+            );
             if (!claim.ok) {
                 if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
                     samples.push({
@@ -13649,13 +14259,30 @@ class XiaoaiCloudPlugin {
             let pauseAccepted = false;
             let errorMessage = "";
             try {
+                if (!this.isConversationInterceptSessionActive(session)) {
+                    if (samples.length < CONVERSATION_INTERCEPT_CALIBRATION_DEBUG_SAMPLE_LIMIT) {
+                        samples.push({
+                            elapsedMs: Math.max(0, Date.now() - interceptStartedAtMs),
+                            interventionSkipped:
+                                "intercept_session_cleared_before_command",
+                        });
+                    }
+                    break;
+                }
                 fastStopped = await this.stopSpeaker({
                     fast: true,
                     preserveLoopGuard: false,
                 });
-                if (!fastStopped && this.waitingForResponse) {
+                if (
+                    !fastStopped &&
+                    this.isConversationInterceptSessionActive(session)
+                ) {
                     await this.sendPauseCommand(device, mina, miio, {
                         singleAttempt: true,
+                        timeoutMs: SPEAKER_FAST_INTERRUPT_TIMEOUT_MS,
+                        minaTimeoutMs: SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS,
+                        miioTimeoutMs: SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS,
+                        maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
                     });
                     pauseAccepted = true;
                 }
@@ -13702,7 +14329,8 @@ class XiaoaiCloudPlugin {
     private async maybeSendConversationTransitionPrompt(
         interceptStartedAtMs: number,
         plan: ConversationInterceptGuardPlan,
-        actionContextPromise?: Promise<ActionContext>
+        actionContextPromise?: Promise<ActionContext>,
+        session?: ConversationInterceptSession
     ) {
         if (plan.suppressTransitionPrompt) {
             await this.appendDebugTrace("conversation_transition_prompt_skipped", {
@@ -13713,29 +14341,127 @@ class XiaoaiCloudPlugin {
             return;
         }
 
+        const waitForAcceptedInterruptDeadlineAtMs =
+            Date.now() +
+            Math.min(
+                260,
+                Math.max(
+                    0,
+                    interceptStartedAtMs + plan.transitionGraceMs - Date.now()
+                )
+            );
+        while (
+            this.isConversationInterceptSessionActive(session) &&
+            !session?.primaryInterruptAcceptedAtMs &&
+            Date.now() < waitForAcceptedInterruptDeadlineAtMs
+        ) {
+            await sleep(40);
+        }
+        if (!this.isConversationInterceptSessionActive(session)) {
+            return;
+        }
+
+        const acceptedInterruptAtMs =
+            readNumber(session?.primaryInterruptAcceptedAtMs) || 0;
+        if (acceptedInterruptAtMs > 0) {
+            const safeDispatchAtMs =
+                acceptedInterruptAtMs +
+                CONVERSATION_INTERCEPT_TRANSITION_ASSUME_QUIET_AFTER_INTERRUPT_MS;
+            const acceptedWaitMs = safeDispatchAtMs - Date.now();
+            if (acceptedWaitMs > 0) {
+                await sleep(acceptedWaitMs);
+            }
+            if (!this.isConversationInterceptSessionActive(session)) {
+                return;
+            }
+            const elapsedBeforeDispatchMs = Math.max(
+                0,
+                Date.now() - interceptStartedAtMs
+            );
+            if (
+                elapsedBeforeDispatchMs >
+                CONVERSATION_INTERCEPT_TRANSITION_MAX_DISPATCH_ELAPSED_MS
+            ) {
+                await this.appendDebugTrace("conversation_transition_prompt_skipped", {
+                    reason: "stale_transition_prompt_after_interrupt",
+                    aggressive: plan.aggressive,
+                    transitionGraceMs: plan.transitionGraceMs,
+                    elapsedMs: elapsedBeforeDispatchMs,
+                    acceptedInterruptAgeMs: Date.now() - acceptedInterruptAtMs,
+                    acceptedLabel: session?.primaryInterruptAcceptedLabel,
+                    interruptReason: session?.primaryInterruptReason,
+                });
+                return;
+            }
+            await this.appendDebugTrace("conversation_transition_prompt_assumed_quiet", {
+                aggressive: plan.aggressive,
+                transitionGraceMs: plan.transitionGraceMs,
+                elapsedMs: elapsedBeforeDispatchMs,
+                acceptedInterruptAgeMs: Date.now() - acceptedInterruptAtMs,
+                acceptedLabel: session?.primaryInterruptAcceptedLabel,
+                interruptReason: session?.primaryInterruptReason,
+                strategy: "accepted_interrupt_anchor",
+            });
+            this.clearConversationInterceptSession(
+                session,
+                "transition_prompt_started"
+            );
+            await this.sendTransitionPrompt();
+            return;
+        }
+
         const waitMs = interceptStartedAtMs + plan.transitionGraceMs - Date.now();
         if (waitMs > 0) {
             await sleep(waitMs);
         }
-        if (!this.waitingForResponse) {
+        if (!this.isConversationInterceptSessionActive(session)) {
             return;
         }
 
         const { device, mina } = actionContextPromise
             ? await actionContextPromise
             : await this.ensureActionContext();
+        if (!this.isConversationInterceptSessionActive(session)) {
+            return;
+        }
         const settled = await this.verifySpeakerCommandState(
             mina,
             device.minaDeviceId,
             (snapshot) => this.isSpeakerPlaybackPausedOrStopped(snapshot),
-            plan.aggressive
-                ? [0, ...SPEAKER_COMMAND_FAST_VERIFY_DELAYS_MS, 220]
-                : [0, ...SPEAKER_COMMAND_FAST_VERIFY_DELAYS_MS]
+            [0],
+            {
+                timeoutMs: CONVERSATION_INTERCEPT_TRANSITION_VERIFY_TIMEOUT_MS,
+                maxAttempts: 1,
+                skipMediaFallback: true,
+            }
         );
-        if (!this.waitingForResponse) {
+        if (!this.isConversationInterceptSessionActive(session)) {
             return;
         }
-        if (!settled.ok) {
+        const elapsedBeforeDispatchMs = Math.max(
+            0,
+            Date.now() - interceptStartedAtMs
+        );
+        if (
+            elapsedBeforeDispatchMs >
+            CONVERSATION_INTERCEPT_TRANSITION_MAX_DISPATCH_ELAPSED_MS
+        ) {
+            await this.appendDebugTrace("conversation_transition_prompt_skipped", {
+                reason: "stale_transition_prompt",
+                aggressive: plan.aggressive,
+                transitionGraceMs: plan.transitionGraceMs,
+                elapsedMs: elapsedBeforeDispatchMs,
+            });
+            return;
+        }
+        const acceptedInterruptAgeMs =
+            acceptedInterruptAtMs > 0 ? Date.now() - acceptedInterruptAtMs : 0;
+        const canAssumeQuietAfterAcceptedInterrupt =
+            !settled.ok &&
+            acceptedInterruptAgeMs >=
+                CONVERSATION_INTERCEPT_TRANSITION_ASSUME_QUIET_AFTER_INTERRUPT_MS &&
+            !this.isSpeakerPlaybackActivelyPlaying(settled.snapshot);
+        if (!settled.ok && !canAssumeQuietAfterAcceptedInterrupt) {
             await this.appendDebugTrace("conversation_transition_prompt_skipped", {
                 reason: "speaker_not_quiet",
                 aggressive: plan.aggressive,
@@ -13744,7 +14470,21 @@ class XiaoaiCloudPlugin {
             });
             return;
         }
+        if (canAssumeQuietAfterAcceptedInterrupt) {
+            await this.appendDebugTrace("conversation_transition_prompt_assumed_quiet", {
+                aggressive: plan.aggressive,
+                transitionGraceMs: plan.transitionGraceMs,
+                acceptedInterruptAgeMs,
+                acceptedLabel: session?.primaryInterruptAcceptedLabel,
+                interruptReason: session?.primaryInterruptReason,
+                snapshot: this.summarizeSpeakerPlaybackSnapshot(settled.snapshot),
+            });
+        }
 
+        this.clearConversationInterceptSession(
+            session,
+            "transition_prompt_started"
+        );
         await this.sendTransitionPrompt();
     }
 
@@ -13861,6 +14601,19 @@ class XiaoaiCloudPlugin {
         return Date.now() - this.pollingStartedAt <= STARTUP_POLL_GRACE_MS;
     }
 
+    private shouldIgnoreStaleConversationRecord(
+        recordAgeMs: number,
+        answersPresent: boolean
+    ) {
+        if (recordAgeMs <= 0) {
+            return false;
+        }
+        const maxAgeMs = answersPresent
+            ? CONVERSATION_STALE_ANSWERED_RECORD_IGNORE_MS
+            : CONVERSATION_STALE_UNANSWERED_RECORD_IGNORE_MS;
+        return recordAgeMs > maxAgeMs;
+    }
+
     private async confirmLateRecordForwardAllowed(
         actionContextPromise?: Promise<ActionContext>,
         plan?: ConversationInterceptGuardPlan
@@ -13921,6 +14674,10 @@ class XiaoaiCloudPlugin {
             try {
                 await this.sendPauseCommand(device, mina, miio, {
                     singleAttempt: true,
+                    timeoutMs: SPEAKER_FAST_INTERRUPT_TIMEOUT_MS,
+                    minaTimeoutMs: SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS,
+                    miioTimeoutMs: SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS,
+                    maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
                 });
                 ok = true;
             } catch (error) {
@@ -13988,6 +14745,9 @@ class XiaoaiCloudPlugin {
         const pauseSettleEstimateMs = readNumber(profile?.pauseSettleEstimateMs) || 0;
         const stopSettleEstimateMs = readNumber(profile?.stopSettleEstimateMs) || 0;
         const playbackDetectEstimateMs = readNumber(profile?.playbackDetectEstimateMs) || 0;
+        const manualOffsetMs = normalizeAudioCalibrationManualOffsetMs(
+            profile?.manualOffsetMs
+        );
         const commandSettleEstimateMs = Math.max(
             pauseSettleEstimateMs,
             stopSettleEstimateMs
@@ -13997,7 +14757,11 @@ class XiaoaiCloudPlugin {
             commandSettleEstimateMs + statusProbeEstimateMs + 120,
             Math.round(playbackDetectEstimateMs * 0.6) + statusProbeEstimateMs + 120
         );
-        return clamp(leadMs, EXTERNAL_AUDIO_LOOP_GUARD_DEADLINE_LEAD_MS, 1800);
+        return clamp(
+            leadMs - manualOffsetMs,
+            EXTERNAL_AUDIO_LOOP_GUARD_MIN_DEADLINE_LEAD_MS,
+            EXTERNAL_AUDIO_LOOP_GUARD_MAX_DEADLINE_LEAD_MS
+        );
     }
 
     private scoreSpeakerPlaybackSnapshot(snapshot: SpeakerPlaybackSnapshot | null) {
@@ -14106,14 +14870,16 @@ class XiaoaiCloudPlugin {
         const dynamicBaseLeadMs = this.computeDynamicExternalAudioLoopGuardBaseLeadMs(deviceId);
         const tailPaddingMs = readNumber(entry?.tailPaddingMs);
         if (typeof tailPaddingMs === "number" && tailPaddingMs > 0) {
+            const maxTailLeadMs = Math.max(
+                0,
+                tailPaddingMs - EXTERNAL_AUDIO_LOOP_GUARD_TAIL_PADDING_RESERVE_MS
+            );
             return {
                 tailPaddingMs,
-                deadlineLeadMs: Math.max(
+                deadlineLeadMs: clamp(
                     dynamicBaseLeadMs,
-                    Math.max(
-                        0,
-                        tailPaddingMs - EXTERNAL_AUDIO_LOOP_GUARD_TAIL_PADDING_RESERVE_MS
-                    )
+                    Math.min(EXTERNAL_AUDIO_LOOP_GUARD_MIN_DEADLINE_LEAD_MS, maxTailLeadMs),
+                    maxTailLeadMs
                 ),
             };
         }
@@ -17472,7 +18238,7 @@ class XiaoaiCloudPlugin {
             if (this.remoteWakeArmsDialogWindow()) {
                 this.lastOpenclawSpeakTime = Date.now() / 1000;
             }
-            this.waitingForResponse = false;
+            this.clearWaitingForResponse("speaker_wake_up");
             return true;
         }
         await this.appendDebugTrace("speaker_wake_up_failed_code", {
@@ -17488,15 +18254,37 @@ class XiaoaiCloudPlugin {
         device: DeviceContext,
         mina: MiNAClient,
         miio: MiIOClient,
-        options?: { singleAttempt?: boolean }
+        options?: {
+            singleAttempt?: boolean;
+            timeoutMs?: number;
+            minaTimeoutMs?: number;
+            miioTimeoutMs?: number;
+            maxAttempts?: number;
+        }
     ) {
         const pauseAction = device.speakerFeatures.pause;
         const runPauseAttempt = () => {
             const attempts: Promise<true>[] = [];
+            const maxAttempts =
+                Number.isFinite(Number(options?.maxAttempts))
+                    ? Math.max(1, Math.round(Number(options?.maxAttempts)))
+                    : undefined;
+            const minaTimeoutMs =
+                readNumber(options?.minaTimeoutMs) ||
+                readNumber(options?.timeoutMs) ||
+                undefined;
+            const miioTimeoutMs =
+                readNumber(options?.miioTimeoutMs) ||
+                readNumber(options?.timeoutMs) ||
+                undefined;
 
             for (const media of SPEAKER_CONTROL_MEDIA_CANDIDATES) {
                 attempts.push(
-                    mina.playerPause(device.minaDeviceId, { media }).then((result) => {
+                    mina.playerPause(device.minaDeviceId, {
+                        media,
+                        timeoutMs: minaTimeoutMs,
+                        maxAttempts,
+                    }).then((result) => {
                         if (result?.code === 0) {
                             return true as const;
                         }
@@ -17508,7 +18296,16 @@ class XiaoaiCloudPlugin {
             if (pauseAction) {
                 attempts.push(
                     miio
-                        .miotAction(device.miDid, pauseAction.siid, pauseAction.aiid, [])
+                        .miotAction(
+                            device.miDid,
+                            pauseAction.siid,
+                            pauseAction.aiid,
+                            [],
+                            {
+                                timeoutMs: miioTimeoutMs,
+                                maxAttempts,
+                            }
+                        )
                         .then((result) => {
                             if (result.code === 0) {
                                 return true as const;
@@ -17787,10 +18584,35 @@ class XiaoaiCloudPlugin {
         device: DeviceContext,
         mina: MiNAClient,
         miio: MiIOClient,
-        reason: string
+        reason: string,
+        options?: {
+            stopFallback?: boolean;
+            timeoutMs?: number;
+            minaTimeoutMs?: number;
+            miioTimeoutMs?: number;
+        }
     ) {
         const startedAtMs = Date.now();
         const commands: Array<{ label: string; promise: Promise<true> }> = [];
+        const stopFallback = options?.stopFallback === true;
+        const minaTimeoutMs = clamp(
+            Math.round(
+                readNumber(options?.minaTimeoutMs) ||
+                    readNumber(options?.timeoutMs) ||
+                    SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS
+            ),
+            300,
+            2_000
+        );
+        const miioTimeoutMs = clamp(
+            Math.round(
+                readNumber(options?.miioTimeoutMs) ||
+                    readNumber(options?.timeoutMs) ||
+                    SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS
+            ),
+            300,
+            2_000
+        );
         const addCommand = (label: string, promise: Promise<any>) => {
             commands.push({
                 label,
@@ -17807,12 +18629,22 @@ class XiaoaiCloudPlugin {
         for (const media of SPEAKER_CONTROL_MEDIA_CANDIDATES) {
             addCommand(
                 `mina.pause:${media}`,
-                mina.playerPause(device.minaDeviceId, { media })
+                mina.playerPause(device.minaDeviceId, {
+                    media,
+                    timeoutMs: minaTimeoutMs,
+                    maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
+                })
             );
-            addCommand(
-                `mina.stop:${media}`,
-                mina.playerStop(device.minaDeviceId, { media })
-            );
+            if (stopFallback) {
+                addCommand(
+                    `mina.stop:${media}`,
+                    mina.playerStop(device.minaDeviceId, {
+                        media,
+                        timeoutMs: minaTimeoutMs,
+                        maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
+                    })
+                );
+            }
         }
 
         if (device.speakerFeatures.pause) {
@@ -17822,18 +18654,26 @@ class XiaoaiCloudPlugin {
                     device.miDid,
                     device.speakerFeatures.pause.siid,
                     device.speakerFeatures.pause.aiid,
-                    []
+                    [],
+                    {
+                        timeoutMs: miioTimeoutMs,
+                        maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
+                    }
                 )
             );
         }
-        if (device.speakerFeatures.stop) {
+        if (stopFallback && device.speakerFeatures.stop) {
             addCommand(
                 "miio.stop",
                 miio.miotAction(
                     device.miDid,
                     device.speakerFeatures.stop.siid,
                     device.speakerFeatures.stop.aiid,
-                    []
+                    [],
+                    {
+                        timeoutMs: miioTimeoutMs,
+                        maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
+                    }
                 )
             );
         }
@@ -17876,6 +18716,9 @@ class XiaoaiCloudPlugin {
                 acceptedLabel,
                 attemptedCount: commands.length,
                 elapsedMs,
+                stopFallback,
+                minaTimeoutMs,
+                miioTimeoutMs,
             });
             return {
                 accepted: true,
@@ -17889,6 +18732,9 @@ class XiaoaiCloudPlugin {
                 reason,
                 attemptedCount: commands.length,
                 elapsedMs: Math.max(0, Date.now() - startedAtMs),
+                stopFallback,
+                minaTimeoutMs,
+                miioTimeoutMs,
                 errorMessage: this.errorMessage(error),
             });
             return {
@@ -17923,6 +18769,10 @@ class XiaoaiCloudPlugin {
                 try {
                     await this.sendPauseCommand(device, mina, miio, {
                         singleAttempt: true,
+                        timeoutMs: SPEAKER_FAST_INTERRUPT_TIMEOUT_MS,
+                        minaTimeoutMs: SPEAKER_FAST_INTERRUPT_MINA_TIMEOUT_MS,
+                        miioTimeoutMs: SPEAKER_FAST_INTERRUPT_MIIO_TIMEOUT_MS,
+                        maxAttempts: SPEAKER_FAST_INTERRUPT_MAX_ATTEMPTS,
                     });
                     pauseAccepted = true;
                 } catch (error) {
@@ -18536,6 +19386,18 @@ class XiaoaiCloudPlugin {
         this.pendingAgentPromptCount = this.activeVoiceAgentRuns.length;
     }
 
+    private cancelInterceptForActiveVoiceRun(
+        activeRun?: ActiveVoiceAgentRun,
+        reason = "voice_reply_started"
+    ) {
+        const sessionId = readString(activeRun?.interceptSessionId);
+        if (sessionId) {
+            this.clearConversationInterceptSession(sessionId, reason);
+            return;
+        }
+        this.clearWaitingForResponse(reason);
+    }
+
     private markActiveVoiceAgentSpoken(
         text: string,
         sessionKey = this.openclawVoiceSessionKey
@@ -18550,6 +19412,7 @@ class XiaoaiCloudPlugin {
         }
 
         activeRun.firstSpeakObserved = true;
+        this.cancelInterceptForActiveVoiceRun(activeRun, "voice_first_speak");
         const elapsedMs = Date.now() - activeRun.startedAtMs;
         console.log(
             `-> [性能] 首次播报工具触发 | ${elapsedMs}ms | 会话: ${activeRun.sessionKey || "unknown"}`
@@ -18627,7 +19490,10 @@ class XiaoaiCloudPlugin {
                 firstContextTitle,
                 activeRun.sessionKey
             );
-            this.waitingForResponse = false;
+            this.cancelInterceptForActiveVoiceRun(
+                activeRun,
+                "voice_audio_payload_started"
+            );
             let played: Awaited<ReturnType<XiaoaiCloudPlugin["playAudioUrl"]>> | null = null;
             let playbackError = "";
             try {
@@ -18683,7 +19549,7 @@ class XiaoaiCloudPlugin {
                 return;
             }
             this.markActiveVoiceAgentSpoken(joined, activeRun.sessionKey);
-            this.waitingForResponse = false;
+            this.cancelInterceptForActiveVoiceRun(activeRun, "voice_text_payload_started");
             await this.playText(joined);
             this.lastOpenclawSpeech = {
                 text: joined,
@@ -18999,14 +19865,20 @@ class XiaoaiCloudPlugin {
                 );
             }
             if (!activeRun.firstSpeakObserved && activeRun.sessionKey === this.openclawVoiceSessionKey) {
-                this.waitingForResponse = false;
+                this.cancelInterceptForActiveVoiceRun(
+                    activeRun,
+                    "voice_agent_run_finished_without_speak"
+                );
             }
         } catch (error) {
             console.warn(
                 `-> [${activeRun.label}] Run 收尾失败: ${this.errorMessage(error)}`
             );
             if (!activeRun.firstSpeakObserved && activeRun.sessionKey === this.openclawVoiceSessionKey) {
-                this.waitingForResponse = false;
+                this.cancelInterceptForActiveVoiceRun(
+                    activeRun,
+                    "voice_agent_run_wait_failed"
+                );
             }
         } finally {
             this.clearActiveVoiceAgentRun(activeRun.id);
@@ -19175,7 +20047,7 @@ class XiaoaiCloudPlugin {
     private async deliverAgentPrompt(
         text: string,
         label = "OpenClaw",
-        options?: { sessionKey?: string }
+        options?: { sessionKey?: string; interceptSessionId?: string }
     ) {
         const config = await this.loadConfig(false);
         const startedAtMs = Date.now();
@@ -19198,6 +20070,7 @@ class XiaoaiCloudPlugin {
             id: params.idempotencyKey,
             label,
             sessionKey,
+            interceptSessionId: readString(options?.interceptSessionId),
             startedAtMs,
             firstSpeakObserved: false,
         };
@@ -19259,11 +20132,17 @@ class XiaoaiCloudPlugin {
             }
             await this.handleOpenclawFinalPayloads(activeRun, payloads);
             if (!activeRun.firstSpeakObserved && activeRun.sessionKey === this.openclawVoiceSessionKey) {
-                this.waitingForResponse = false;
+                this.cancelInterceptForActiveVoiceRun(
+                    activeRun,
+                    "voice_agent_finished_without_speak"
+                );
             }
         } catch (error) {
             if (!activeRun.firstSpeakObserved && activeRun.sessionKey === this.openclawVoiceSessionKey) {
-                this.waitingForResponse = false;
+                this.cancelInterceptForActiveVoiceRun(
+                    activeRun,
+                    "voice_agent_failed_before_speak"
+                );
             }
             throw error;
         } finally {
@@ -19271,7 +20150,13 @@ class XiaoaiCloudPlugin {
         }
     }
 
-    private forwardToOpenclaw(text: string, options?: { renewVoiceSession?: boolean }) {
+    private forwardToOpenclaw(
+        text: string,
+        options?: {
+            renewVoiceSession?: boolean;
+            interceptSession?: ConversationInterceptSession;
+        }
+    ) {
         const sessionKey = this.resolveOpenclawVoiceSessionKey(Boolean(options?.renewVoiceSession));
         const sessionNotice = this.buildVoiceSessionNotice(options);
         const contextPrompt = this.buildVoiceContextPrompt(sessionKey);
@@ -19279,10 +20164,19 @@ class XiaoaiCloudPlugin {
 
         console.log(`-> [传给大脑] 原始文本: ${text} | 会话: ${sessionKey}`);
         this.recordVoiceContextTurn("user", text, sessionKey);
+        this.markConversationInterceptForwardIssued(options?.interceptSession);
         void this.deliverAgentPrompt(prompt, "传给大脑", {
             sessionKey,
+            interceptSessionId: options?.interceptSession?.id,
         }).catch((error) => {
-            this.waitingForResponse = false;
+            if (options?.interceptSession) {
+                this.clearConversationInterceptSession(
+                    options.interceptSession,
+                    "voice_agent_delivery_failed"
+                );
+            } else {
+                this.clearWaitingForResponse("voice_agent_delivery_failed");
+            }
             console.error(`[OpenClaw异常] CLI 执行失败: ${this.errorMessage(error)}`);
         });
     }
@@ -19294,10 +20188,10 @@ class XiaoaiCloudPlugin {
             interceptHint?: ConversationInterceptHint;
         }
     ) {
-        const interceptStartedAtMs = Date.now();
-        this.waitingForResponse = true;
-        this.armFastPolling();
         const deviceId = this.device?.minaDeviceId;
+        const interceptSession = this.createConversationInterceptSession(deviceId);
+        const interceptStartedAtMs = interceptSession.startedAtMs;
+        this.armFastPolling();
         const interceptHint = options?.interceptHint;
         if (deviceId) {
             this.noteConversationInterceptLateRecord(
@@ -19337,6 +20231,7 @@ class XiaoaiCloudPlugin {
             guardPlan
         );
         const supplementalGuardState: ConversationInterceptSupplementalGuardState = {
+            sessionId: interceptSession.id,
             attemptsUsed: 0,
             lastAttemptAtMs: 0,
         };
@@ -19346,85 +20241,97 @@ class XiaoaiCloudPlugin {
             interceptHint?.answersPresent &&
                 lateRecordForwarding.deferUntilSilenced === true
         );
-        if (shouldFastForwardLateRecord) {
-            supplementalGuardState.lastAttemptAtMs = Date.now();
-        }
-
+        const sendPrimaryConversationInterrupt = async (reason: string) => {
+            supplementalGuardState.primaryInterruptStartedAtMs = Date.now();
+            const { device, mina, miio } = actionContextPromise
+                ? await actionContextPromise
+                : await this.ensureActionContext();
+            if (!this.isConversationInterceptSessionActive(interceptSession)) {
+                supplementalGuardState.primaryInterruptSettledAtMs = Date.now();
+                supplementalGuardState.primaryInterruptAccepted = false;
+                return false;
+            }
+            const interrupt = await this.sendFastSpeakerInterruptCommand(
+                device,
+                mina,
+                miio,
+                reason,
+                {
+                    stopFallback: false,
+                    timeoutMs: SPEAKER_FAST_INTERRUPT_TIMEOUT_MS,
+                }
+            );
+            supplementalGuardState.primaryInterruptSettledAtMs = Date.now();
+            supplementalGuardState.primaryInterruptAccepted = interrupt.accepted;
+            if (interrupt.accepted) {
+                supplementalGuardState.lastAttemptAtMs = Date.now();
+                this.markConversationInterceptPrimaryInterruptAccepted(
+                    interceptSession,
+                    reason,
+                    interrupt.acceptedLabel
+                );
+            } else if (interceptHint?.answersPresent) {
+                supplementalGuardState.lastAttemptAtMs = 0;
+            }
+            return (
+                interrupt.accepted &&
+                this.isConversationInterceptSessionActive(interceptSession)
+            );
+        };
         const silenceTask = (async () => {
             const waitMs =
                 interceptStartedAtMs + guardPlan.primarySilenceDelayMs - Date.now();
             if (waitMs > 0) {
                 await sleep(waitMs);
             }
-            if (!this.waitingForResponse) {
+            if (!this.isConversationInterceptSessionActive(interceptSession)) {
                 return false;
             }
             if (interceptHint?.answersPresent) {
-                const { device, mina, miio } = actionContextPromise
-                    ? await actionContextPromise
-                    : await this.ensureActionContext();
-                const interrupt = await this.sendFastSpeakerInterruptCommand(
-                    device,
-                    mina,
-                    miio,
+                return sendPrimaryConversationInterrupt(
                     "conversation-late-record-primary"
                 );
-                if (interrupt.accepted) {
-                    supplementalGuardState.lastAttemptAtMs = Date.now();
-                }
-                return interrupt.accepted;
             }
-            return this.silenceSpeaker({
-                aggressive: guardPlan.silenceMode === "fast-stop",
-                reason: lateRecordForwarding.skip
-                    ? lateRecordForwarding.reason
-                    : interceptHint?.answersPresent
-                        ? "检测到会话记录已带答案，立即强拦截并准备转发 OpenClaw"
-                    : guardPlan.primarySilenceDelayMs > 0
-                        ? `按预计原生起播窗口延后 ${guardPlan.primarySilenceDelayMs}ms 拦截`
-                        : guardPlan.aggressive
-                            ? "当前设备进入动态激进拦截"
-                            : undefined,
-            }).catch((error) => {
+            if (!this.isConversationInterceptSessionActive(interceptSession)) {
+                return false;
+            }
+            const reason = lateRecordForwarding.skip
+                ? lateRecordForwarding.reason || "conversation-primary-interrupt"
+                : guardPlan.primarySilenceDelayMs > 0
+                    ? `按预计原生起播窗口延后 ${guardPlan.primarySilenceDelayMs}ms 拦截`
+                    : guardPlan.aggressive
+                        ? "当前设备进入动态激进拦截"
+                        : "conversation-primary-interrupt";
+            return sendPrimaryConversationInterrupt(reason).catch((error) => {
                 console.error(`[XiaoAI Cloud] 暂停打断失败: ${this.errorMessage(error)}`);
                 return false;
             });
         })();
         const fallbackPauseGuardTask =
-            shouldRunFallbackPauseGuard && this.waitingForResponse
+            shouldRunFallbackPauseGuard &&
+            this.isConversationInterceptSessionActive(interceptSession)
                 ? this.runConversationInterceptFallbackPauseGuard(
                     interceptStartedAtMs,
                     actionContextPromise,
                     guardPlan,
-                    supplementalGuardState
+                    supplementalGuardState,
+                    interceptSession
                 ).catch((error) => {
                     console.warn(
                         `[XiaoAI Cloud] fallback 拦截补偿失败: ${this.errorMessage(error)}`
                     );
                 })
                 : Promise.resolve();
-        const lateRecordFollowUpTask =
-            shouldRunFallbackPauseGuard &&
-            this.waitingForResponse &&
-            interceptHint?.answersPresent
-                ? this.runConversationInterceptLateRecordFollowUpBurst(
-                    interceptStartedAtMs,
-                    actionContextPromise,
-                    guardPlan,
-                    supplementalGuardState
-                ).catch((error) => {
-                    console.warn(
-                        `[XiaoAI Cloud] 晚记录快速补拦截失败: ${this.errorMessage(error)}`
-                    );
-                })
-                : Promise.resolve();
+        const lateRecordFollowUpTask = Promise.resolve();
         const runtimeMonitorTask =
-            shouldRunFallbackPauseGuard && this.waitingForResponse
+            shouldRunFallbackPauseGuard &&
+            this.isConversationInterceptSessionActive(interceptSession)
                 ? this.runConversationInterceptRuntimeMonitor(
                     interceptStartedAtMs,
                     guardPlan,
                     actionContextPromise,
-                    supplementalGuardState
+                    supplementalGuardState,
+                    interceptSession
                 ).catch((error) => {
                     console.warn(
                         `[XiaoAI Cloud] 运行时拦截监测失败: ${this.errorMessage(error)}`
@@ -19461,10 +20368,16 @@ class XiaoaiCloudPlugin {
         }).catch(() => undefined);
         let forwardIssued = false;
         const issueForwardOnce = (trigger: string) => {
-            if (forwardIssued || !this.waitingForResponse) {
+            if (
+                forwardIssued ||
+                !this.isConversationInterceptSessionActive(interceptSession)
+            ) {
                 return false;
             }
-            this.forwardToOpenclaw(text, options);
+            this.forwardToOpenclaw(text, {
+                ...options,
+                interceptSession,
+            });
             forwardIssued = true;
             void this.appendDebugTrace("conversation_intercept_forward_issued", {
                 deviceId,
@@ -19480,14 +20393,30 @@ class XiaoaiCloudPlugin {
         };
         const lateRecordForwardGateRunner = shouldGateLateRecordForward
             ? lateRecordForwardGateTask.then((lateRecordForwardAllowed) => {
-                if (lateRecordForwardAllowed) {
-                    issueForwardOnce("late_record_gate_open");
+                if (
+                    lateRecordForwardAllowed &&
+                    issueForwardOnce("late_record_gate_open")
+                ) {
+                    scheduleTransitionPrompt();
                 }
                 return lateRecordForwardAllowed;
             })
             : Promise.resolve(false);
+        let transitionPromptTask: Promise<void> = Promise.resolve();
+        const scheduleTransitionPrompt = () => {
+            transitionPromptTask = this.maybeSendConversationTransitionPrompt(
+                interceptStartedAtMs,
+                guardPlan,
+                actionContextPromise,
+                interceptSession
+            ).catch((error) => {
+                console.error(`[XiaoAI Cloud] 过渡播报失败: ${this.errorMessage(error)}`);
+            });
+        };
         if (!interceptHint?.answersPresent) {
-            issueForwardOnce("immediate");
+            if (issueForwardOnce("immediate")) {
+                scheduleTransitionPrompt();
+            }
         } else if (shouldFastForwardLateRecord) {
             const fastForwardWaitMs = this.computeLateRecordFastForwardWaitMs(deviceId);
             const fastInterruptResult = await Promise.race([
@@ -19500,31 +20429,44 @@ class XiaoaiCloudPlugin {
                     accepted: false,
                 })),
             ]);
+            if (fastInterruptResult.accepted) {
+                await sleep(CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_ACCEPTED_WAIT_MS);
+            }
             void this.appendDebugTrace("conversation_intercept_fast_forward_gate", {
                 deviceId,
                 fastForwardWaitMs,
+                acceptedWaitMs: fastInterruptResult.accepted
+                    ? CONVERSATION_INTERCEPT_LATE_RECORD_FAST_FORWARD_ACCEPTED_WAIT_MS
+                    : undefined,
                 completed: fastInterruptResult.completed,
                 accepted: fastInterruptResult.accepted,
                 recordAgeMs: readNumber(interceptHint?.recordAgeMs) || undefined,
             }).catch(() => undefined);
-            issueForwardOnce(
+            if (issueForwardOnce(
                 fastInterruptResult.completed
                     ? "late_record_fast_interrupt_forward"
                     : "late_record_fast_interrupt_timeout_forward"
-            );
+            )) {
+                scheduleTransitionPrompt();
+            }
         }
         if (!forwardIssued) {
             await silenceTask;
-            issueForwardOnce(
+            if (issueForwardOnce(
                 interceptHint?.answersPresent
                     ? lateRecordForwarding.deferUntilSilenced
                         ? "speaker_silenced_immediate_forward"
                         : "late_record_gate_closed_immediate_forward"
                     : "post_silence_fallback"
-            );
+            )) {
+                scheduleTransitionPrompt();
+            }
         }
         if (!forwardIssued) {
-            this.waitingForResponse = false;
+            this.clearConversationInterceptSession(
+                interceptSession,
+                "conversation_intercept_forward_not_issued"
+            );
             return;
         }
         await Promise.all([
@@ -19532,17 +20474,8 @@ class XiaoaiCloudPlugin {
             lateRecordFollowUpTask,
             fallbackPauseGuardTask,
             runtimeMonitorTask,
+            transitionPromptTask,
         ]);
-        if (!this.waitingForResponse) {
-            return;
-        }
-        await this.maybeSendConversationTransitionPrompt(
-            interceptStartedAtMs,
-            guardPlan,
-            actionContextPromise
-        ).catch((error) => {
-            console.error(`[XiaoAI Cloud] 过渡播报失败: ${this.errorMessage(error)}`);
-        });
     }
 
     private registerPluginTools() {
@@ -19578,7 +20511,7 @@ class XiaoaiCloudPlugin {
                         this.normalizeAudioReplyTitle(redirectedTitle) ||
                         this.describeAudioReply(redirectedAudio.input, redirectedTitle);
                     this.markActiveVoiceAgentSpoken(titleForContext);
-                    this.waitingForResponse = false;
+                    this.clearWaitingForResponse("tool_speak_redirect_audio");
                     console.log(
                         `<- [播报指令/云端] 检测到音频输入，自动改为播放: ${redirectedAudio.input}`
                     );
@@ -19623,7 +20556,7 @@ class XiaoaiCloudPlugin {
                 } else {
                     console.log(`<- [播报指令/云端] ${text}`);
                     this.markActiveVoiceAgentSpoken(text);
-                    this.waitingForResponse = false;
+                    this.clearWaitingForResponse("tool_speak_text");
                 }
 
                 await this.finalizeSpokenToolReply(text, {
@@ -19667,7 +20600,7 @@ class XiaoaiCloudPlugin {
                     };
                 }
                 console.log(`<- [音频播放/云端] ${url}`);
-                this.waitingForResponse = false;
+                this.clearWaitingForResponse("tool_play_audio");
                 const played = await this.playAudioUrl(url, {
                     title: readString(params.title),
                     interrupt: false,
@@ -19717,7 +20650,7 @@ class XiaoaiCloudPlugin {
                 }
                 console.log(`<- [TTS桥接/云端] ${text}`);
                 this.markActiveVoiceAgentSpoken(text);
-                this.waitingForResponse = false;
+                this.clearWaitingForResponse("tool_tts_bridge");
                 try {
                     const playbackUrl = await this.synthesizeOpenclawTtsToRelayUrl(text, {
                         title: params.title || text,
@@ -19931,7 +20864,7 @@ class XiaoaiCloudPlugin {
             }),
             execute: async (_id: string, params: { command: string }) => {
                 console.log(`<- [转发小爱/云端] 执行指令: ${params.command}`);
-                this.waitingForResponse = false;
+                this.clearWaitingForResponse("tool_execute_directive");
                 const ok = await this.executeDirective(params.command, false);
                 this.recordConsoleEvent(
                     "tool.execute",

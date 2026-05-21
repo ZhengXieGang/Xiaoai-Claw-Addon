@@ -256,7 +256,9 @@ interface ConsoleConversationInterceptLatencyProfile {
 interface ConsoleConversationInterceptCalibrationState {
     running: boolean;
     pollIntervalMs: number;
+    effectivePollIntervalMs?: number;
     recommendedPollIntervalMs?: number;
+    pollIntervalLimitedByCalibration?: boolean;
     manualOffsetMs: number;
     currentProfile?: ConsoleConversationInterceptLatencyProfile;
     lastRun?: PersistedConversationInterceptCalibrationSummary;
@@ -700,7 +702,8 @@ const MIN_RECOMMENDED_POLL_INTERVAL_MS = 200;
 const IDLE_POLL_INTERVAL_MS = 900;
 const FAST_POLL_INTERVAL_MS = 200;
 const FAST_POLL_WINDOW_MS = 15_000;
-const POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS = 650;
+const REALTIME_POLL_INTERVAL_CAP_MS = DEFAULT_POLL_INTERVAL_MS;
+const POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS = 320;
 const POLL_ACTIVITY_GRACE_MS = 20_000;
 const STARTUP_POLL_GRACE_MS = 20_000;
 const POLL_TRANSIENT_BACKOFF_STEPS_MS = [180, 260, 420, 700, 1100, 1700];
@@ -776,6 +779,8 @@ const CONVERSATION_FETCH_HEDGE_MIN_DELAY_MS = 70;
 const CONVERSATION_FETCH_HEDGE_MAX_DELAY_MS = 140;
 const CONVERSATION_FETCH_TIMEOUT_MS = 3_200;
 const CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS = 2_200;
+const CONVERSATION_FETCH_REALTIME_TIMEOUT_MS = 2_400;
+const CONVERSATION_FETCH_REALTIME_MAX_TIMEOUT_MS = 2_600;
 const CONVERSATION_FETCH_HISTORY_TIMEOUT_MS = 5_000;
 const CONVERSATION_FETCH_MAX_ATTEMPTS = 1;
 const MAX_CONVERSATION_FETCH_INFLIGHT = 2;
@@ -2898,6 +2903,7 @@ class XiaoaiCloudPlugin {
     private pollingStartedAt = 0;
     private nextPollAt = 0;
     private pollLoopRunner?: () => void;
+    private pollLoopRunning = false;
     private latestConversationFetchKey?: string;
     private latestConversationFetchPromise?: Promise<any | null>;
     private conversationFetchInflightCount = 0;
@@ -3989,17 +3995,25 @@ class XiaoaiCloudPlugin {
         const currentProfile = this.buildConsoleConversationInterceptLatencyProfile(
             this.readConversationInterceptLatencyProfile(currentDevice?.minaDeviceId)
         );
-        const recommendedPollIntervalMs = this.recommendConversationPollIntervalMs(
-            currentDevice?.minaDeviceId,
-            this.config?.pollIntervalMs
+        const configuredPollIntervalMs = normalizePollIntervalMs(
+            this.config?.pollIntervalMs,
+            DEFAULT_POLL_INTERVAL_MS
         );
+        const recommendedPollIntervalMs =
+            this.recommendedConversationPollIntervalForCurrentDevice(
+                configuredPollIntervalMs
+            );
+        const effectivePollIntervalMs =
+            this.currentMode === "silent"
+                ? configuredPollIntervalMs
+                : recommendedPollIntervalMs;
         return {
             running: this.conversationInterceptCalibrationRunning,
-            pollIntervalMs: normalizePollIntervalMs(
-                this.config?.pollIntervalMs,
-                DEFAULT_POLL_INTERVAL_MS
-            ),
+            pollIntervalMs: configuredPollIntervalMs,
+            effectivePollIntervalMs,
             recommendedPollIntervalMs,
+            pollIntervalLimitedByCalibration:
+                effectivePollIntervalMs < configuredPollIntervalMs,
             manualOffsetMs: normalizeConversationInterceptManualOffsetMs(
                 currentProfile?.manualOffsetMs
             ),
@@ -7570,6 +7584,7 @@ class XiaoaiCloudPlugin {
         this.pollingStartedAt = 0;
         this.nextPollAt = 0;
         this.pollLoopRunner = undefined;
+        this.pollLoopRunning = false;
     }
 
     private recentPollingActivityAtMs() {
@@ -7593,27 +7608,68 @@ class XiaoaiCloudPlugin {
         );
     }
 
+    private isRealtimeConversationInterceptionMode(nowMs = Date.now()) {
+        return Boolean(
+            this.currentMode === "proxy" ||
+                this.currentMode === "wake" ||
+                this.isActiveVoicePollingWindow(nowMs)
+        );
+    }
+
+    private recommendedConversationPollIntervalForCurrentDevice(
+        currentPollIntervalMs?: number
+    ) {
+        const deviceId = readString(this.device?.minaDeviceId);
+        const currentPoll = normalizePollIntervalMs(
+            currentPollIntervalMs,
+            DEFAULT_POLL_INTERVAL_MS
+        );
+        if (!deviceId) {
+            return Math.min(currentPoll, REALTIME_POLL_INTERVAL_CAP_MS);
+        }
+        const summary = this.lastConversationInterceptCalibration;
+        const summaryRecommendedPollMs =
+            summary && readString(summary.deviceId) === deviceId
+                ? readNumber(summary.recommendedPollIntervalMs)
+                : undefined;
+        const recommendedPollMs =
+            typeof summaryRecommendedPollMs === "number" &&
+            Number.isFinite(summaryRecommendedPollMs)
+                ? normalizePollIntervalMs(summaryRecommendedPollMs, currentPoll)
+                : this.recommendConversationPollIntervalMs(deviceId, currentPoll);
+        return clamp(
+            Math.min(currentPoll, recommendedPollMs, REALTIME_POLL_INTERVAL_CAP_MS),
+            MIN_POLL_INTERVAL_MS,
+            currentPoll
+        );
+    }
+
     private currentPollInterval(config?: PluginConfig) {
         const baseInterval = clamp(
             config?.pollIntervalMs || DEFAULT_POLL_INTERVAL_MS,
             MIN_POLL_INTERVAL_MS,
             MAX_POLL_INTERVAL_MS
         );
+        const nowMs = Date.now();
+        const realtimeMode = this.isRealtimeConversationInterceptionMode(nowMs);
+        const realtimeInterval = realtimeMode
+            ? this.recommendedConversationPollIntervalForCurrentDevice(baseInterval)
+            : baseInterval;
         let desiredInterval = baseInterval;
-        if (Date.now() < this.fastPollUntil) {
-            desiredInterval = Math.min(baseInterval, FAST_POLL_INTERVAL_MS);
+        if (nowMs < this.fastPollUntil) {
+            desiredInterval = Math.min(realtimeInterval, FAST_POLL_INTERVAL_MS);
         } else {
             const activeUntil =
                 this.recentPollingActivityAtMs() +
                 Math.max(POLL_ACTIVITY_GRACE_MS, STARTUP_POLL_GRACE_MS);
-            if (Date.now() <= activeUntil || this.currentMode !== "silent") {
-                desiredInterval = baseInterval;
+            if (nowMs <= activeUntil || this.currentMode !== "silent") {
+                desiredInterval = realtimeInterval;
             } else {
                 desiredInterval = Math.max(baseInterval, IDLE_POLL_INTERVAL_MS);
             }
         }
         const backoffFloorMs = this.currentPollTransientBackoffFloorMs();
-        const activeVoiceWindow = this.isActiveVoicePollingWindow();
+        const activeVoiceWindow = this.isRealtimeConversationInterceptionMode();
         const effectiveBackoffFloorMs =
             activeVoiceWindow && this.pollTransientBackoffReason !== "rate_limit"
                 ? Math.min(backoffFloorMs, POLL_ACTIVE_TRANSIENT_BACKOFF_MAX_MS)
@@ -7642,6 +7698,9 @@ class XiaoaiCloudPlugin {
     private armFastPolling(windowMs = FAST_POLL_WINDOW_MS) {
         this.fastPollUntil = Math.max(this.fastPollUntil, Date.now() + windowMs);
         if (!this.polling || !this.pollLoopRunner) {
+            return;
+        }
+        if (this.pollLoopRunning) {
             return;
         }
         const desiredDelay = this.currentPollInterval(this.config);
@@ -9208,6 +9267,19 @@ class XiaoaiCloudPlugin {
         const consecutiveFailures = readNumber(profile?.consecutiveFailures) || 0;
         const slowUntilMs = readNumber(profile?.slowUntilMs) || 0;
         const estimateMs = readNumber(profile?.estimateMs) || 0;
+        if (this.isRealtimeConversationInterceptionMode(nowMs)) {
+            const realtimeTimeout = Math.max(
+                CONVERSATION_FETCH_REALTIME_TIMEOUT_MS,
+                estimateMs > 0 ? Math.round(estimateMs * 1.35) : 0,
+                consecutiveFailures > 0 ? CONVERSATION_FETCH_REALTIME_TIMEOUT_MS + 150 : 0,
+                slowUntilMs > nowMs ? CONVERSATION_FETCH_REALTIME_TIMEOUT_MS + 250 : 0
+            );
+            return clamp(
+                Math.round(realtimeTimeout),
+                750,
+                CONVERSATION_FETCH_REALTIME_MAX_TIMEOUT_MS
+            );
+        }
         const activeTimeout = Math.max(
             CONVERSATION_FETCH_ACTIVE_TIMEOUT_MS,
             estimateMs > 0 ? Math.round(estimateMs * 1.85) : 0,
@@ -9506,7 +9578,8 @@ class XiaoaiCloudPlugin {
                 ) {
                     const backoff = this.notePollTransientBackoff(message);
                     failureBackoffDelayMs =
-                        backoff.rateLimited || !this.isActiveVoicePollingWindow()
+                        backoff.rateLimited ||
+                        !this.isRealtimeConversationInterceptionMode()
                             ? backoff.floorMs
                             : Math.min(
                                 backoff.floorMs,
@@ -9558,10 +9631,18 @@ class XiaoaiCloudPlugin {
         };
 
         this.pollLoopRunner = () => {
-            void loop().catch((error) => {
-                this.lastError = this.errorMessage(error);
-                console.error(`[XiaoAI Cloud] 启动轮询失败: ${this.lastError}`);
-            });
+            if (this.pollLoopRunning) {
+                return;
+            }
+            this.pollLoopRunning = true;
+            void loop()
+                .catch((error) => {
+                    this.lastError = this.errorMessage(error);
+                    console.error(`[XiaoAI Cloud] 启动轮询失败: ${this.lastError}`);
+                })
+                .finally(() => {
+                    this.pollLoopRunning = false;
+                });
         };
 
         this.pollLoopRunner();

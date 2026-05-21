@@ -380,6 +380,7 @@ function initConsolePage() {
     selectedCalibrationMode: "audio",
     currentPollIntervalMs: DEFAULT_CONVERSATION_POLL_INTERVAL_MS,
     confirmedPollIntervalMs: DEFAULT_CONVERSATION_POLL_INTERVAL_MS,
+    effectivePollIntervalMs: DEFAULT_CONVERSATION_POLL_INTERVAL_MS,
     pollIntervalEditing: false,
     pollIntervalDirty: false,
     pollIntervalSaving: false,
@@ -3918,6 +3919,11 @@ function initConsolePage() {
       nextCalibration.recommendedPollIntervalMs,
       pollIntervalMs
     );
+    const effectivePollIntervalMs = getFiniteNumber(
+      nextCalibration.effectivePollIntervalMs,
+      pollIntervalMs
+    );
+    state.effectivePollIntervalMs = effectivePollIntervalMs;
     state.conversationInterceptCalibrationRunning = Boolean(nextCalibration.running);
     if (!state.pollIntervalEditing || !state.pollIntervalDirty) {
       updatePollIntervalDisplay(pollIntervalMs, {
@@ -3969,6 +3975,8 @@ function initConsolePage() {
     if (els.pollIntervalNote) {
       els.pollIntervalNote.textContent = state.pollIntervalSaving
         ? "正在保存..."
+        : effectivePollIntervalMs < pollIntervalMs
+          ? `配置 ${pollIntervalMs}ms，校准后实际按 ${effectivePollIntervalMs}ms 拦截`
         : recommendedPollIntervalMs < pollIntervalMs
           ? `建议收紧到 ${recommendedPollIntervalMs}ms`
           : "拦截主轮询节奏，回车或失焦保存";
@@ -4009,6 +4017,9 @@ function initConsolePage() {
           detailParts.push(`策略：${strategyLabel}`);
         }
         detailParts.push(`轮询间隔 ${lastPollIntervalMs}ms`);
+        if (effectivePollIntervalMs < pollIntervalMs) {
+          detailParts.push(`当前实际生效 ${effectivePollIntervalMs}ms`);
+        }
         if (
           getFiniteNumber(lastRun.recommendedPollIntervalMs, lastPollIntervalMs) <
           lastPollIntervalMs
@@ -6179,14 +6190,26 @@ function initConsolePage() {
         payload && payload.pollIntervalMs,
         pollIntervalMs
       );
+      const nextCalibration =
+        payload && payload.calibration && typeof payload.calibration === "object"
+          ? payload.calibration
+          : {};
+      const nextEffectivePollIntervalMs = getFiniteNumber(
+        nextCalibration.effectivePollIntervalMs,
+        nextPollIntervalMs
+      );
       state.pollIntervalDirty = false;
       updatePollIntervalDisplay(nextPollIntervalMs, { forceText: true });
+      state.effectivePollIntervalMs = nextEffectivePollIntervalMs;
       if (state.bootstrap) {
         state.bootstrap.conversationInterceptCalibration = Object.assign(
           {},
           state.bootstrap.conversationInterceptCalibration,
-          payload && payload.calibration,
-          { pollIntervalMs: nextPollIntervalMs }
+          nextCalibration,
+          {
+            pollIntervalMs: nextPollIntervalMs,
+            effectivePollIntervalMs: nextEffectivePollIntervalMs,
+          }
         );
       }
       const warning =

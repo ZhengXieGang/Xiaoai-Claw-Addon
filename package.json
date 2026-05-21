@@ -25,6 +25,7 @@
   "files": [
     "dist",
     "assets/ui/favicon.svg",
+    "assets/ui/xiaoai-auth-portal.js",
     "assets/ui/xiaoai-console.css",
     "assets/ui/xiaoai-console.js",
     "assets/fonts/manrope/files/*.woff2",

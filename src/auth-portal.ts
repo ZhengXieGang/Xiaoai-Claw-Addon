@@ -184,7 +184,14 @@ function normalizePortalBaseUrl(value: string | undefined) {
     }
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<any> {
+function readRequestContentType(request: IncomingMessage) {
+    return String(request.headers["content-type"] || "")
+        .split(";")[0]
+        .trim()
+        .toLowerCase();
+}
+
+async function readRequestBodyText(request: IncomingMessage) {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     for await (const chunk of request) {
@@ -195,9 +202,25 @@ async function readJsonBody(request: IncomingMessage): Promise<any> {
         }
         chunks.push(nextChunk);
     }
-    const text = Buffer.concat(chunks).toString("utf8");
+    return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseFormBody(text: string) {
+    const params = new URLSearchParams(text);
+    const body: Record<string, string> = {};
+    for (const [key, value] of params.entries()) {
+        body[key] = value;
+    }
+    return body;
+}
+
+async function readJsonBody(request: IncomingMessage): Promise<any> {
+    const text = await readRequestBodyText(request);
     if (!text) {
         return {};
+    }
+    if (readRequestContentType(request) === "application/x-www-form-urlencoded") {
+        return parseFormBody(text);
     }
     try {
         return JSON.parse(text);
@@ -413,10 +436,25 @@ function renderLoginPage(
             : session.status === "success"
               ? "ok"
               : "";
+    const passwordLoginUrl = `${requestBaseUrl}/login/password`;
+    const verifyTicketUrl = `${requestBaseUrl}/verify/ticket`;
+    const portalConfig = {
+        embedded,
+        statusUrl: `${requestBaseUrl}/status`,
+        passwordLoginUrl,
+        verifyTicketUrl,
+        openVerifyPageApiUrl: `${requestBaseUrl}/verify/page`,
+        verification: session.verification || null,
+        sessionCompleted: session.status === "success",
+    };
+    const portalConfigJson = JSON.stringify(portalConfig);
     return `<!doctype html>
 <html lang="zh-CN">
 ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
-<body data-page="${embedded ? "portal-embedded" : "portal"}">
+<body
+  data-page="${embedded ? "portal-embedded" : "portal"}"
+  data-auth-config="${htmlEscape(portalConfigJson)}"
+>
   <div class="page-shell">
     <main class="console-shell portal-shell${embedded ? " portal-shell-embedded" : ""}">
       <section class="surface portal-simple-shell${embedded ? " portal-simple-shell-embedded" : ""}">
@@ -431,7 +469,13 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
           title="${htmlEscape(initialStatus)}"
         >${htmlEscape(initialStatus)}</div>
 
-        <form id="authForm" class="portal-simple-form" autocomplete="off">
+        <form
+          id="authForm"
+          class="portal-simple-form"
+          autocomplete="off"
+          method="post"
+          action="${htmlEscape(session.verification ? verifyTicketUrl : passwordLoginUrl)}"
+        >
           <div class="portal-simple-grid">
             <label class="field-shell">
               <span class="field-label">小米账号</span>
@@ -487,453 +531,16 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
             <button class="primary-btn" type="button" id="submitLoginBtn">登录</button>
           </div>
         </form>
+        <noscript>
+          <p class="helper-text">
+            当前浏览器禁用了 JavaScript。仍可提交账号密码，页面会在服务端完成处理后返回 JSON 状态；推荐启用 JavaScript 获得完整登录流程。
+          </p>
+        </noscript>
       </section>
     </main>
   </div>
   <script type="module" src="${htmlEscape(assetBasePath)}/ui/xiaoai-console.js${assetVersion}"></script>
-  <script>
-    const embeddedMode = ${embedded ? "true" : "false"};
-    const statusUrl = ${JSON.stringify(`${requestBaseUrl}/status`)};
-    const passwordLoginUrl = ${JSON.stringify(`${requestBaseUrl}/login/password`)};
-    const verifyTicketUrl = ${JSON.stringify(`${requestBaseUrl}/verify/ticket`)};
-    const openVerifyPageApiUrl = ${JSON.stringify(`${requestBaseUrl}/verify/page`)};
-    const statusBox = document.getElementById("statusBox");
-    const authForm = document.getElementById("authForm");
-    const openVerifyBtn = document.getElementById("openVerifyBtn");
-    const submitLoginBtn = document.getElementById("submitLoginBtn");
-    const ticketFieldShell = document.getElementById("ticketFieldShell");
-    const accountInput = authForm.elements.namedItem("account");
-    const serverCountryInput = authForm.elements.namedItem("serverCountry");
-    const passwordInput = authForm.elements.namedItem("password");
-    const ticketInput = authForm.elements.namedItem("ticket");
-
-    let verification = ${JSON.stringify(session.verification || null)};
-    let verificationKey = "";
-    let loginInFlight = false;
-    let openVerifyPageInFlight = false;
-    let verifyInFlight = false;
-    let sessionCompleted = ${session.status === "success" ? "true" : "false"};
-
-    function escapeHtml(value) {
-      return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    function verificationMethodLabel(methods) {
-      const labels = (Array.isArray(methods) ? methods : [])
-        .map((item) =>
-          item === "phone"
-            ? "短信验证码"
-            : item === "email"
-              ? "邮箱验证码"
-              : String(item || "").trim()
-        )
-        .filter(Boolean);
-      return labels[0] || "";
-    }
-
-    function currentVerificationKey(value) {
-      if (!value) {
-        return "";
-      }
-      const methods = Array.isArray(value.methods) ? value.methods.join(",") : "";
-      return String(value.verifyUrl || "") + "|" + methods;
-    }
-
-    function looksLikeVerificationFlow(raw) {
-      return /(验证码|安全验证|二次验证|验证页面|验证链接|identity_session|identity session|verification|verify|短信验证|邮箱验证)/i.test(raw);
-    }
-
-    function looksLikePasswordFailure(raw) {
-      return /(账号或密码错误|密码错误|密码不正确|密码有误|invalid password|incorrect password|wrong password)/i.test(raw);
-    }
-
-    function looksLikeAccountFailure(raw) {
-      return /(账号错误|账号不存在|账号无效|账号不正确|invalid account|unknown account|user not found)/i.test(raw);
-    }
-
-    function summarizeStatus(kind, text) {
-      const raw = String(text || "").replace(/\\s+/g, " ").trim();
-      if (!raw) {
-        return kind === "ok" ? "登录成功" : "等待登录";
-      }
-      if (/验证码/.test(raw) && /(错|误|无效|失败|过期)/.test(raw)) {
-        return "验证码错误";
-      }
-      if (looksLikeVerificationFlow(raw)) {
-        if (/(identity_session|identity session|会话)/i.test(raw) && /(没有|缺少|失效|过期|重新)/.test(raw)) {
-          return "请重新打开验证页面";
-        }
-        if (/(短信|邮箱|邮件|验证码).{0,8}已发送/.test(raw) || /已发送.{0,8}(短信|邮箱|邮件|验证码)/.test(raw)) {
-          const method = verificationMethodLabel(verification && verification.methods);
-          return method ? method + "已发送" : "验证码已发送";
-        }
-        if (/(打开|前往|跳转).{0,8}(验证页面|验证链接)/.test(raw) || /官方.{0,8}(验证页面|验证链接)/.test(raw)) {
-          return "请打开验证页面";
-        }
-        if (verification) {
-          const method = verificationMethodLabel(verification.methods);
-          return method ? "请输入" + method : "请输入验证码";
-        }
-      }
-      if (looksLikePasswordFailure(raw)) {
-        return "密码错误";
-      }
-      if (looksLikeAccountFailure(raw)) {
-        return "账号错误";
-      }
-      if (/登录成功|账号已登录/.test(raw)) {
-        return "登录成功";
-      }
-      if (/处理中|正在|稍候/.test(raw)) {
-        return "正在处理…";
-      }
-      if (verification) {
-        const method = verificationMethodLabel(verification.methods);
-        return method ? "请输入" + method : "请输入验证码";
-      }
-      if (kind === "err") {
-        return raw.slice(0, 32);
-      }
-      return raw.slice(0, 32) || "等待登录";
-    }
-
-    function setStatus(kind, text) {
-      statusBox.className = "status status-banner" + (kind ? " " + kind : "");
-      const raw = String(text || "").trim();
-      const concise = summarizeStatus(kind, raw);
-      statusBox.textContent = concise;
-      statusBox.title = raw || concise;
-      queueEmbeddedLayoutReport();
-      if (embeddedMode && window.parent && window.parent !== window) {
-        try {
-          window.parent.postMessage({
-            source: "xiaoai-cloud-portal",
-            type: "status",
-            payload: { kind, text: concise }
-          }, window.location.origin);
-        } catch (_) {}
-      }
-    }
-
-    function measureEmbeddedHeight() {
-      const doc = document.documentElement;
-      const body = document.body;
-      return Math.max(
-        doc ? doc.scrollHeight : 0,
-        doc ? doc.offsetHeight : 0,
-        body ? body.scrollHeight : 0,
-        body ? body.offsetHeight : 0
-      );
-    }
-
-    function reportEmbeddedLayout() {
-      if (!embeddedMode || !window.parent || window.parent === window) {
-        return;
-      }
-      try {
-        window.parent.postMessage({
-          source: "xiaoai-cloud-portal",
-          type: "layout",
-          payload: {
-            height: measureEmbeddedHeight()
-          }
-        }, window.location.origin);
-      } catch (_) {}
-    }
-
-    function queueEmbeddedLayoutReport() {
-      if (!embeddedMode) {
-        return;
-      }
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(reportEmbeddedLayout);
-      });
-    }
-
-    function updateActionButtons() {
-      const busy = loginInFlight || openVerifyPageInFlight || verifyInFlight;
-      submitLoginBtn.disabled = busy || sessionCompleted;
-      submitLoginBtn.textContent = sessionCompleted ? "已完成" : "登录";
-      if (openVerifyBtn) {
-        const canOpenVerify = Boolean(verification && verification.verifyUrl && !sessionCompleted);
-        openVerifyBtn.hidden = !canOpenVerify;
-        openVerifyBtn.disabled = busy || !canOpenVerify;
-        openVerifyBtn.textContent = "打开验证页面";
-      }
-      queueEmbeddedLayoutReport();
-    }
-
-    function renderVerification(nextVerification) {
-      verification = nextVerification || null;
-      const nextKey = currentVerificationKey(verification);
-      if (!verification) {
-        verificationKey = "";
-        ticketInput.value = "";
-        if (ticketFieldShell) {
-          ticketFieldShell.hidden = true;
-        }
-      } else if (nextKey !== verificationKey) {
-        verificationKey = nextKey;
-        if (ticketFieldShell) {
-          ticketFieldShell.hidden = false;
-        }
-      } else if (ticketFieldShell) {
-        ticketFieldShell.hidden = false;
-      }
-      queueEmbeddedLayoutReport();
-      updateActionButtons();
-    }
-
-    async function fetchStatus() {
-      const res = await fetch(statusUrl);
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "状态查询失败");
-      }
-      renderVerification(data.verification || null);
-      sessionCompleted = data.status === "success";
-      if (data.status === "success") {
-        setStatus("ok", data.message || "登录成功");
-      } else if (data.status === "error") {
-        setStatus("err", data.error || "登录失败");
-      } else if (data.status === "processing") {
-        setStatus("", data.message || "正在处理登录…");
-      } else {
-        setStatus("", data.message || "等待登录");
-      }
-      if (embeddedMode && window.parent && window.parent !== window) {
-        try {
-          window.parent.postMessage({
-            source: "xiaoai-cloud-portal",
-            type: "session",
-            payload: {
-              status: data.status,
-              message: data.message || data.error || ""
-            }
-          }, window.location.origin);
-        } catch (_) {}
-      }
-      updateActionButtons();
-      return data;
-    }
-
-    async function postJson(url, payload, options) {
-      const timeoutMs = Math.max(
-        1000,
-        Math.round(
-          Number(
-            options && Number.isFinite(Number(options.timeoutMs))
-              ? options.timeoutMs
-              : 15000
-          ) || 15000
-        )
-      );
-      const hasAbortController = typeof AbortController === "function";
-      const controller = hasAbortController ? new AbortController() : null;
-      const timer =
-        controller && typeof setTimeout === "function"
-          ? setTimeout(() => {
-              try {
-                controller.abort();
-              } catch (_) {}
-            }, timeoutMs)
-          : null;
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-          signal: controller ? controller.signal : undefined
-        });
-        const rawText = await res.text();
-        let data = {};
-        if (rawText) {
-          try {
-            data = JSON.parse(rawText);
-          } catch {
-            throw new Error("服务端返回了非 JSON 响应（HTTP " + res.status + "）。");
-          }
-        }
-        if (!res.ok) {
-          throw new Error((data && data.error) || ("请求失败（HTTP " + res.status + "）"));
-        }
-        return data;
-      } catch (error) {
-        if (error && typeof error === "object" && error.name === "AbortError") {
-          throw new Error("请求超时（>" + timeoutMs + "ms）");
-        }
-        throw error;
-      } finally {
-        if (timer) {
-          clearTimeout(timer);
-        }
-      }
-    }
-
-    async function loginByPassword() {
-      if (loginInFlight || openVerifyPageInFlight || verifyInFlight || sessionCompleted) {
-        return;
-      }
-      const account = String(accountInput.value || "").trim();
-      const password = String(passwordInput.value || "");
-      if (!account) {
-        setStatus("err", "请先填写小米账号。");
-        return;
-      }
-      if (!password.trim()) {
-        setStatus("err", "请先填写小米账号密码。");
-        return;
-      }
-      renderVerification(null);
-      loginInFlight = true;
-      updateActionButtons();
-      setStatus("", "正在登录，请稍候…");
-      try {
-        await postJson(passwordLoginUrl, {
-          account,
-          password,
-          serverCountry: String(serverCountryInput.value || "cn")
-        });
-        await fetchStatus();
-      } catch (error) {
-        setStatus("err", error.message || String(error));
-      } finally {
-        loginInFlight = false;
-        updateActionButtons();
-      }
-    }
-
-    async function verifyByTicket(ticketOverride) {
-      if (verifyInFlight || loginInFlight || openVerifyPageInFlight || sessionCompleted) {
-        return;
-      }
-      const ticket = typeof ticketOverride === "string"
-        ? ticketOverride.trim()
-        : String(ticketInput.value || "").trim();
-      const externalContinueAttempt = !ticket && Boolean(verification && verification.verifyUrl);
-      if (!ticket && !externalContinueAttempt) {
-        setStatus("err", "请先填入短信或邮箱收到的验证码。");
-        return;
-      }
-      verifyInFlight = true;
-      updateActionButtons();
-      setStatus(
-        "",
-        externalContinueAttempt
-          ? "正在检查官方验证结果并继续登录，请稍候…"
-          : "正在校验验证码并继续登录，请稍候…"
-      );
-      try {
-        await postJson(verifyTicketUrl, { ticket });
-        await fetchStatus();
-      } catch (error) {
-        setStatus("err", error.message || String(error));
-      } finally {
-        verifyInFlight = false;
-        updateActionButtons();
-      }
-    }
-
-    async function openVerifyPage() {
-      if (!verification || !verification.verifyUrl || openVerifyPageInFlight || loginInFlight || verifyInFlight || sessionCompleted) {
-        return;
-      }
-      const openedWindow = window.open("about:blank", "_blank", "noopener");
-      if (!openedWindow) {
-        setStatus("err", "浏览器拦截了验证页面，请允许弹窗后重试。");
-        return;
-      }
-      openVerifyPageInFlight = true;
-      updateActionButtons();
-      setStatus("", "正在打开官方验证页面，请稍候…");
-      try {
-        const initialVerifyUrl = String(
-          (verification && verification.verifyUrl) || ""
-        ).trim();
-        if (/^https?:\/\//i.test(initialVerifyUrl)) {
-          // Keep popup navigation within the original click gesture whenever possible.
-          openedWindow.location.href = initialVerifyUrl;
-        }
-        const data = await postJson(openVerifyPageApiUrl, {});
-        const openUrl = String(data && (data.openUrl || (data.verification && data.verification.verifyUrl) || "") || "").trim();
-        if (!openUrl) {
-          throw new Error("当前没有可用的官方验证页面。");
-        }
-        openedWindow.location.href = openUrl;
-        setStatus("", "请在官方页面获取验证码，回到这里填写后再点登录。");
-      } catch (error) {
-        const fallbackVerifyUrl = String(
-          (verification && verification.verifyUrl) || ""
-        ).trim();
-        if (/^https?:\/\//i.test(fallbackVerifyUrl)) {
-          try {
-            openedWindow.location.href = fallbackVerifyUrl;
-            setStatus(
-              "",
-              "验证页面接口异常，已回退为直接打开小米验证页。完成后请回到此页填写验证码。"
-            );
-            return;
-          } catch (_) {}
-        }
-        try {
-          openedWindow.close();
-        } catch (_) {}
-        setStatus("err", error.message || String(error));
-      } finally {
-        openVerifyPageInFlight = false;
-        updateActionButtons();
-      }
-    }
-
-    async function handlePrimaryAction() {
-      if (verification) {
-        if (!String(ticketInput.value || "").trim()) {
-          if (verification.verifyUrl) {
-            await verifyByTicket("");
-            return;
-          }
-          setStatus("err", "请先填入验证码，再点登录。");
-          return;
-        }
-        await verifyByTicket();
-        return;
-      }
-      await loginByPassword();
-    }
-
-    authForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      await handlePrimaryAction();
-    });
-
-    if (openVerifyBtn) {
-      openVerifyBtn.addEventListener("click", openVerifyPage);
-    }
-
-    submitLoginBtn.addEventListener("click", async (event) => {
-      event.preventDefault();
-      await handlePrimaryAction();
-    });
-
-    renderVerification(verification);
-    updateActionButtons();
-    queueEmbeddedLayoutReport();
-    if (embeddedMode && typeof ResizeObserver === "function") {
-      const embeddedResizeObserver = new ResizeObserver(() => {
-        queueEmbeddedLayoutReport();
-      });
-      embeddedResizeObserver.observe(document.body);
-    }
-    window.addEventListener("resize", queueEmbeddedLayoutReport);
-    fetchStatus().catch(() => {});
-    setInterval(() => {
-      fetchStatus().catch(() => {});
-    }, 3000);
-  </script>
+  <script src="${htmlEscape(assetBasePath)}/ui/xiaoai-auth-portal.js${assetVersion}" defer></script>
 </body>
 </html>`;
 }

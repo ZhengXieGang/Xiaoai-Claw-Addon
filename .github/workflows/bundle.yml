@@ -223,6 +223,7 @@ jobs:
           test -f "$root/dist/src/provider.js"
           test -f "$root/assets/ui/xiaoai-console.css"
           test -f "$root/assets/ui/xiaoai-console.js"
+          test -f "$root/assets/ui/xiaoai-auth-portal.js"
           test -f "$root/assets/ui/favicon.svg"
           test -f "$root/assets/fonts/manrope/wght.css"
           test -f "$root/assets/fonts/noto-sans-sc/wght.css"

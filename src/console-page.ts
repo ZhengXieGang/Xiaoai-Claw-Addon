@@ -32,6 +32,7 @@ function resolveUiAssetFile(relativePath: string) {
 const UI_ASSET_FINGERPRINT_FILES = [
     resolveUiAssetFile("ui/xiaoai-console.css"),
     resolveUiAssetFile("ui/xiaoai-console.js"),
+    resolveUiAssetFile("ui/xiaoai-auth-portal.js"),
     resolveUiAssetFile("ui/favicon.svg"),
     resolveUiAssetFile("fonts/manrope/wght.css"),
     resolveUiAssetFile("fonts/noto-sans-sc/wght.css"),

@@ -1,77 +1,44 @@
-# openclaw-plugin-xiaoai-cloud 项目分析与实现说明
+# openclaw-plugin-xiaoai-cloud 项目分析与适配说明
 
-这份文档不是给普通安装用户看的，而是给真正想弄清楚项目原理、实现边界、性能策略和维护方式的人看的。
+这份文档不是给普通安装用户看的，而是给后续维护者、二次开发者和负责跨宿主适配的 agent 看的。
 
-如果你只是想安装然后直接用，回到 [README.md](./README.md) 就够了。
+它的核心目的已经从“解释这个 OpenClaw 插件怎么实现”调整为：
 
-`README.md` 故意只保留四件事：
+- 帮后续 agent 快速理解项目的真实运行边界。
+- 帮后续 agent 判断哪些逻辑是小米核心能力，哪些逻辑只是 OpenClaw 宿主适配。
+- 帮后续 agent 在适配 PicoClaw、ZeroClaw、Hermes 或未知 agent 框架时，先拆对边界，再写代码。
+- 帮维护者避免继续把登录、轮询、音频、控制台、OpenClaw agent 调用都堆进 `src/provider.ts`。
 
-- 是什么
-- 能干什么
-- 怎么安装
-- 怎么用
-
-除此之外的内容，例如：
-
-- 架构
-- 状态与配置
-- 控制台前后端
-- 性能和安全
-- 发布和安装细节
-- 踩坑复盘与排障
-
-都统一放在这份分析文档里。
-
-如果你关心后续如何把本项目适配到 `ZeroClaw` / `PicoClaw`，请看单独的规划文档：
+如果你关心后续如何把本项目适配到 `PicoClaw`、`ZeroClaw`、`Hermes` 或其他 agent 框架，请优先看：
 
 - [CROSS_CLAW_ADAPTATION_PLAN.md](./CROSS_CLAW_ADAPTATION_PLAN.md)
 
-## 0. 文档边界与 README 拆分原则
+如果你需要精确到函数级的运行时架构图，请看：
 
-这部分专门解释一个原则：
+- [maintain.md](./maintain.md)
 
-`README.md` 只负责回答普通用户最关心的四个问题：
+## 给后续 agent 的阅读顺序
 
-1. 这是什么
-2. 它能做什么
-3. 怎么安装
-4. 装完以后怎么开始用
+后续 agent 不应该从“想给某个新宿主加一个 if 分支”开始，而应该按下面顺序读：
 
-凡是超出这四个问题、且不会影响普通用户完成首次安装和首次使用的内容，都不应该继续堆在 `README.md` 里。
+1. 先读本文档第 2、3、24、25、27 节，建立当前 OpenClaw 插件的运行模型。
+2. 再读 [maintain.md](./maintain.md)，确认入口、登录、轮询、音频、控制台、OpenClaw agent 调用分别落在哪些函数上。
+3. 再读 [CROSS_CLAW_ADAPTATION_PLAN.md](./CROSS_CLAW_ADAPTATION_PLAN.md)，按 HostAdapter / sidecar / MCP 的方式判断新宿主。
+4. 最后再动 `src/provider.ts`。如果改动让 `provider.ts` 继续膨胀，而不是把能力拆到 core/app/host/state，就应该先停下来重评方案。
 
-这类内容包括但不限于：
+对后续适配来说，最重要的判断不是“某个宿主能不能注册工具”，而是：
 
-- 插件和 OpenClaw runtime 之间如何交互
-- 小米云、MiNA、MiIO、MIOT 分别承担什么职责
-- 为什么要做专属 `xiaoai` agent
-- 为什么安装脚本会自动修复 allowlist、agent 配置、owner 和宿主依赖
-- 为什么音频 URL 需要先在本地标准化再转交给小爱
-- 为什么插件安装时可能需要走 `--dangerously-force-unsafe-install`
-- 为什么 `openclawTo` 允许自动推断但不应该盲猜
-- 控制台状态、日志、上下文、事件流分别落在哪些文件里
-- 发布包为什么只带必要文件，而不把源码目录里的所有内容都给最终用户
+- 这个宿主是否能承载长期后台监听。
+- 这个宿主是否能把外部输入注入指定 agent/session。
+- 这个宿主是否能稳定回传结果和用户通知。
+- 这个宿主是否能安全存放小米 token、控制台 token 和校准状态。
+- 这个宿主是否适合内嵌音频 relay，还是必须走 sidecar。
 
-如果把这些内容写进 `README.md`，会有几个直接问题：
+## 0. 维护要点速览
 
-- 普通用户第一次打开仓库时信息量过大，很难迅速理解“我到底该怎么装、怎么用”
-- 安装步骤会被原理、限制、复盘、兼容性说明冲淡，降低上手效率
-- 维护者后续每次调架构、补兼容、修安装器，都得同步修改 README，导致 README 膨胀
-- 技术细节和用户说明混在一起后，两个文档都会失焦
+### 0.1 安装脚本职责
 
-所以本仓库把文档明确拆成两层：
-
-- `README.md`
-  面向普通用户，只保留最短路径信息。
-- `PROJECT_ANALYSIS.md`
-  面向维护者、二次开发者和真正想看实现细节的人，集中承接所有技术性内容。
-
-下面这些原本最容易误塞进 `README.md`、但实际上更适合写在技术文档里的内容，这里统一展开说明。
-
-### 0.1 安装脚本实际做了什么
-
-普通用户在 README 里只需要知道运行 `install.sh` 或 `install.cmd` 即可，但从实现角度看，安装脚本实际上做了比“复制插件文件”更多的事情。
-
-它会依次处理：
+`install.sh` / `install.cmd` 会依次处理：
 
 1. 检查 Node.js 版本是否满足 OpenClaw 官方要求。
 2. 判断当前目录是源码树还是 release 压缩包解压目录。
@@ -89,18 +56,9 @@
 - `install.sh` 和 `uninstall.sh` 都应该在仓库和 release 包里保留可执行位
 - 如果某些解压工具把执行位丢了，用户仍然可以直接运行 `bash ./install.sh` 或 `bash ./uninstall.sh`
 
-这不是功能逻辑问题，但它会直接影响用户是否会误判成“安装脚本坏了”。
+### 0.2 通知路由策略
 
-这些步骤不适合写进 README 的原因很简单：
-
-- 它们会让普通用户误以为自己需要理解这些内部细节后才能安装
-- 但实际上，用户只需要执行安装脚本，脚本本身就应该把这些复杂度吸收掉
-
-### 0.2 为什么 `openclawChannel / openclawTo` 的细节不该写在 README
-
-对普通用户来说，只要插件能把登录入口、语音转发和通知发送给 OpenClaw 就够了。
-
-但从实现上看，通知路由是一个比较容易踩坑的配置点：
+通知路由是一个容易踩坑的配置点：
 
 - 如果手工漏填，插件过去会在语音转发或登录通知时直接报错
 - 如果盲目写死，又会在不同用户的渠道结构下出问题
@@ -113,13 +71,9 @@
 3. 如果存在多个候选目标，就宁可不猜，也不把消息发错。
 4. 如果用户在控制台里明确关闭了插件通知，就把这个“关闭状态”持久化，而不是下次启动时又偷偷自动恢复。
 
-这是典型的“实现细节必须写清楚，但不该堆在 README 里”的内容。
+### 0.3 音频 URL 标准化逻辑
 
-### 0.3 为什么音频 URL 标准化逻辑不该写在 README
-
-README 里只需要告诉用户“支持让小爱播放音频 URL”。
-
-但真正的实现远比一句话复杂：
+小爱云端音频播放的真实表现受设备、音频源和格式共同影响：
 
 - 不同型号的小爱对第三方音频 URL 的接受程度不同
 - 同一个 URL 在浏览器能播，不代表小爱云端能真正开始播
@@ -132,16 +86,7 @@ README 里只需要告诉用户“支持让小爱播放音频 URL”。
 - 通过插件自身的 relay 地址重新暴露出去
 - 再让小爱请求这个更可控、更标准化的音频源
 
-这能提升兼容性和成功率，但它显然属于实现机制，不是 README 应该展开解释的内容。
-
-### 0.4 为什么 TTS 桥接工具应该写在技术文档
-
-普通用户只需要知道：
-
-- OpenClaw 可以让小爱播报文字
-- 也可以走音频播放链路
-
-但对于维护者来说，是否需要单独的 TTS 桥接、为什么不用第三方临时 TTS、为什么改用 OpenClaw 官方 `runtime.tts`，这些都必须说清楚。
+### 0.4 TTS 桥接工具
 
 当前实现的设计目标是：
 
@@ -151,22 +96,11 @@ README 里只需要告诉用户“支持让小爱播放音频 URL”。
 
 这能让后续适配其他 claw 系项目时更容易复用音频层，而不是把所有逻辑都绑死在 `xiaoai_speak` 上。
 
-### 0.5 为什么 release、源码树、技术文档要分开
+### 0.5 Release 产物边界
 
-对普通用户而言，release 压缩包里越少越好，只要能安装就行。
-
-所以从分发视角看：
-
-- 用户真正需要的是预构建产物、安装脚本和插件清单
-- 不需要为了“看文档”把大段技术说明或分析文档跟着打进 release
-
-而从仓库视角看：
-
-- `README.md` 仍然必须保留，因为 GitHub 首页需要它
-- `PROJECT_ANALYSIS.md` 仍然必须保留，因为维护者需要它
-- 但这两者不应该成为 release 包的负担
-
-这也是为什么文档策略必须写进技术文档，而不是在 README 里越写越长。
+- Release 产物只应包含运行所需的预构建产物、安装脚本、插件清单和必要资源。
+- 技术分析、适配规划、维护图表属于仓库维护资料，不应扩大最终安装包体积。
+- ClawHub 包和手动安装包应复用同一套运行时入口，避免出现两套安装行为。
 
 ## 1. 项目定位
 
@@ -228,6 +162,16 @@ README 里只需要告诉用户“支持让小爱播放音频 URL”。
   -> 同一套设备控制 / 配置 / 状态 / 事件能力
 ```
 
+对后续适配来说，这张图还不够。真正需要记住的是当前实现有三类边界：
+
+- 小米侧边界：`src/xiaomi-client.ts`、登录 token、MiNA/MiIO/MIOT、对话轮询、设备动作。
+- 协调层边界：`src/provider.ts` 里的拦截、会话、音频 relay、控制台状态、校准、防循环。
+- OpenClaw 宿主边界：工具注册、服务注册、HTTP 路由、agent 调用、通知回推、配置写回。
+
+跨宿主适配时，目标不是把整条链复制到新框架，而是把第三类边界替换成新的 `HostAdapter`，并把前两类能力迁出 `provider.ts`。
+
+函数级调用图维护在 [maintain.md](./maintain.md)。改动入口、登录、轮询、音频或 OpenClaw agent 调用前，必须先对照那里确认函数链路。
+
 ## 3. 仓库结构
 
 核心文件如下：
@@ -254,7 +198,7 @@ scripts/configure-openclaw-install.mjs
 - `index.ts`
   插件入口，只负责把 provider 注册进 OpenClaw。
 - `src/provider.ts`
-  整个项目的核心。几乎所有运行时行为都在这里。
+  当前运行时中枢。它同时承担宿主适配、通用协调、小米动作编排、音频 relay、控制台 API 等职责。后续跨宿主适配的第一项工程任务，就是把它拆成 `core / app / host / state`。
 - `src/xiaomi-client.ts`
   小米账号、MiNA、MiIO、MIOT 这一侧的客户端实现。
 - `src/auth-portal.ts`
@@ -270,9 +214,9 @@ scripts/configure-openclaw-install.mjs
 - `src/openclaw-paths.ts`
   OpenClaw state dir / config path / plugin storage dir 的定位逻辑。
 - `src/openclaw-gateway-runtime.ts`
-  动态加载 OpenClaw 官方 Gateway SDK。
+  动态加载 OpenClaw 官方 Gateway SDK。这属于 OpenClaw adapter 能力，不应被 PicoClaw、ZeroClaw、Hermes 复用。
 - `src/openclaw-agent-wrapper.ts`
-  对 OpenClaw CLI 输出做包装，尽量拿到稳定摘要。
+  对 OpenClaw CLI 输出做包装，尽量拿到稳定摘要。这同样属于 OpenClaw adapter 能力。
 - `install.sh` / `install.cmd`
   用户安装入口。
 - `scripts/configure-openclaw-install.mjs`
@@ -300,6 +244,12 @@ scripts/configure-openclaw-install.mjs
   启动时注册工具、尝试注册 HTTP 路由、执行初始化、初始化成功后开始轮询。
 - `stopService()`
   停轮询、停 Gateway client、清理 runtime state、清理 login portal、清空会话和上下文缓存。
+
+后续 adapter 化时，这三个函数的目标形态应该是：
+
+- `registerTools()` 只委托 `HostAdapter.registerTools()`。
+- `startService()` 只装配 core/app/state/host，不直接做宿主细节。
+- `stopService()` 只按统一生命周期停 orchestrator、sidecar、adapter。
 
 这意味着它不是“无状态脚本”，而是一个长期驻留的 OpenClaw 服务。
 
@@ -1293,7 +1243,7 @@ deadline 到点后，当前实现不会再等一整轮普通轮询，而是直�
 
 - 时间：`2026-04-02`
 - 入口：控制台 API `POST /api/xiaoai-cloud/api/speaker/play-audio`
-- 测试文件：`http://47.254.206.25/api/xiaoai-cloud/audio-relay/testshort20260402a.mp3`
+- 测试文件：插件音频 relay 暴露的短 MP3 样本
 - 文件时长：约 `2.304s`
 - 音量状态：`volume=0` 且 `muted=true`，因此测试不会实际出声
 
@@ -1767,8 +1717,6 @@ Linux 安装脚本会在非 dev install 下对安装后的插件目录做 owner 
 - 写入必要配置
 - 自动推断当前已启用通知渠道与唯一目标；无法唯一识别时保守回退
 
-这就是为什么 README 可以做到“普通用户不用手动改一堆 JSON”。
-
 ### 31.7 手工同步代码不等于完成安装
 
 这次项目维护里又踩到一个很典型的部署坑：
@@ -1831,7 +1779,7 @@ Linux 安装脚本会在非 dev install 下对安装后的插件目录做 owner 
 
 1. 安装/卸载脚本不能只假设 `openclaw` 一定在 PATH
    - 必要时要允许显式指定 `--openclaw-bin`
-   - README 提示词也要把“修复 CLI 入口”写进排障项
+   - 提示词安装链路也要把“修复 CLI 入口”写进排障项
 2. systemd service 不应该长期硬绑某个历史版本的 `dist/index.js` 绝对路径
    - 更稳妥的是直接走 `openclaw gateway ...`
    - 让服务入口跟随当前 CLI 解析结果，而不是跟随某次历史安装目录
@@ -1906,9 +1854,7 @@ release bundle 里会包含：
 - 纯 `openclaw plugins install` 负责的是“把插件装进 OpenClaw”
 - 仓库安装脚本负责的是“把插件装好并把外围配置收拾完整”
 
-所以 README 里仍然推荐普通用户优先走仓库或 release 自带的安装脚本。
-
-### 32.2 2026-04-12 云端 OpenClaw 更新与 README 提示词复测
+### 32.2 2026-04-12 云端 OpenClaw 更新与提示词安装复测
 
 `2026-04-12` 这次不是只验证插件本身，而是把“宿主更新 + 插件卸载 + 通过 OpenClaw 安装”整条链路重新走了一遍。
 
@@ -1919,7 +1865,7 @@ release bundle 里会包含：
    - `ExecStart=/usr/bin/openclaw gateway --port 18798`
 3. 卸载插件时，选择“删除 `xiaoai` agent，但保留历史记录”
    - 历史会正确备份到 `plugin-backups/`
-4. 再用 README 里的“通过 OpenClaw 安装”提示词触发安装
+4. 再用“通过 OpenClaw 安装”提示词触发安装
    - 插件成功重新装回
    - `xiaoai` agent 成功重建
    - `main` 仍然保持默认 agent
@@ -1939,7 +1885,7 @@ release bundle 里会包含：
 
 不是同一个完成点。
 
-这也是为什么 README 里的提示词后来又补了一条约束：
+提示词安装链路需要保留这条约束：
 
 - 把登录入口或控制台链接发给用户后，先停下来
 - 不要让当前任务一直挂着等登录
@@ -1953,7 +1899,7 @@ release bundle 里会包含：
 
 这次复测后可以把结论收敛成：
 
-- README 提示词安装链路本身是通的
+- 提示词安装链路本身是通的
 - 真正需要收敛的是“首次登录前后，任务该不该继续挂住”的行为设计
 
 ## 33. 典型问题复盘
@@ -2769,9 +2715,7 @@ deadline 提前量现在按下面的思路动态计算：
 - 控制台与运维体验
 - 安全和持久化边界
 
-如果只从 README 看，它像一个“能装就能用的插件”。
-
-如果从实现看，它实际上已经是一套完整的小爱语音接入层。
+从实现看，它已经是一套完整的小爱语音接入层，不只是安装包装或控制台皮肤。
 
 ## 37. 2026-04-19 音频链路通用修复（本地文件 + 误判 pending + 失败返回过慢）
 

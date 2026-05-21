@@ -3,18 +3,28 @@
 
   function parsePortalConfig() {
     var raw = document.getElementById("xiaoai-auth-config");
-    var text = raw ? raw.textContent || "" : "";
-    if (!text && document.body) {
+    var text = raw && raw.textContent ? raw.textContent : "";
+    if (!String(text || "").trim() && document.body) {
       text = document.body.getAttribute("data-auth-config") || "";
     }
-    if (!raw) {
-      raw = null;
+    if (!String(text || "").trim()) {
+      return null;
     }
     try {
-      return JSON.parse(text || "{}");
+      return JSON.parse(text);
     } catch (_) {
       return null;
     }
+  }
+
+  function markBootError(text) {
+    var box = document.getElementById("statusBox");
+    if (!box) {
+      return;
+    }
+    box.className = "status status-banner err";
+    box.textContent = text;
+    box.title = text;
   }
 
   var config = parsePortalConfig();
@@ -24,7 +34,13 @@
   var submitLoginBtn = document.getElementById("submitLoginBtn");
   var ticketFieldShell = document.getElementById("ticketFieldShell");
 
-  if (!config || !statusBox || !authForm || !submitLoginBtn) {
+  if (!statusBox || !authForm || !submitLoginBtn) {
+    markBootError("登录页结构不完整，请刷新后重试。");
+    return;
+  }
+
+  if (!config) {
+    markBootError("登录页脚本配置读取失败，已切换到兼容提交模式。");
     return;
   }
 
@@ -44,6 +60,11 @@
   var verifyInFlight = false;
   var sessionCompleted = Boolean(config.sessionCompleted);
   var statusTimer = null;
+
+  if (!statusUrl || !passwordLoginUrl || !verifyTicketUrl) {
+    markBootError("登录页接口配置不完整，已切换到兼容提交模式。");
+    return;
+  }
 
   function verificationMethodLabel(methods) {
     var labels = (Array.isArray(methods) ? methods : [])
@@ -471,7 +492,9 @@
   authForm.addEventListener("submit", function (event) {
     event.preventDefault();
     event.stopImmediatePropagation();
-    handlePrimaryAction();
+    Promise.resolve(handlePrimaryAction()).catch(function (error) {
+      setStatus("err", (error && error.message) || String(error));
+    });
   }, true);
 
   if (openVerifyBtn) {
@@ -481,12 +504,6 @@
       openVerifyPage();
     }, true);
   }
-
-  submitLoginBtn.addEventListener("click", function (event) {
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    handlePrimaryAction();
-  }, true);
 
   renderVerification(verification);
   updateActionButtons();

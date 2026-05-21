@@ -191,6 +191,14 @@ function readRequestContentType(request: IncomingMessage) {
         .toLowerCase();
 }
 
+function isHtmlFormRequest(request: IncomingMessage) {
+    if (readRequestContentType(request) !== "application/x-www-form-urlencoded") {
+        return false;
+    }
+    const accept = String(request.headers.accept || "");
+    return !accept || accept.includes("text/html") || accept.includes("*/*");
+}
+
 async function readRequestBodyText(request: IncomingMessage) {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
@@ -255,6 +263,13 @@ function sendHtml(response: ServerResponse, html: string, statusCode = 200) {
     response.end(html);
 }
 
+function sendRedirect(response: ServerResponse, location: string) {
+    response.statusCode = 303;
+    applySecurityHeaders(response);
+    response.setHeader("Location", location);
+    response.end();
+}
+
 function notFound(response: ServerResponse) {
     response.statusCode = 404;
     applySecurityHeaders(response);
@@ -313,6 +328,25 @@ function portalRequestBaseUrl(primaryUrl: string) {
     requestUrl.search = "";
     requestUrl.hash = "";
     return requestUrl.pathname.replace(/\/+$/, "");
+}
+
+function escapeJsonForHtmlScript(value: string) {
+    return value
+        .replace(/&/g, "\\u0026")
+        .replace(/</g, "\\u003c")
+        .replace(/>/g, "\\u003e")
+        .replace(/\u2028/g, "\\u2028")
+        .replace(/\u2029/g, "\\u2029");
+}
+
+function loginPageRedirectLocation(requestUrl: URL) {
+    const redirectUrl = new URL(requestUrl.toString());
+    redirectUrl.pathname = redirectUrl.pathname.replace(
+        /\/(?:discover\/password|login\/password|verify\/ticket|verify\/page)\/?$/i,
+        ""
+    );
+    redirectUrl.hash = "";
+    return `${redirectUrl.pathname}${redirectUrl.search}`;
 }
 
 function sessionMetaPills(seed: Omit<LoginSessionSeed, "tokenStorePath">) {
@@ -438,6 +472,7 @@ function renderLoginPage(
               : "";
     const passwordLoginUrl = `${requestBaseUrl}/login/password`;
     const verifyTicketUrl = `${requestBaseUrl}/verify/ticket`;
+    const embeddedActionQuery = embedded ? "?embedded=1" : "";
     const portalConfig = {
         embedded,
         statusUrl: `${requestBaseUrl}/status`,
@@ -448,6 +483,7 @@ function renderLoginPage(
         sessionCompleted: session.status === "success",
     };
     const portalConfigJson = JSON.stringify(portalConfig);
+    const portalConfigScript = escapeJsonForHtmlScript(portalConfigJson);
     return `<!doctype html>
 <html lang="zh-CN">
 ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
@@ -474,7 +510,9 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
           class="portal-simple-form"
           autocomplete="off"
           method="post"
-          action="${htmlEscape(session.verification ? verifyTicketUrl : passwordLoginUrl)}"
+          action="${htmlEscape(
+              `${session.verification ? verifyTicketUrl : passwordLoginUrl}${embeddedActionQuery}`
+          )}"
         >
           <div class="portal-simple-grid">
             <label class="field-shell">
@@ -528,18 +566,18 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
 
           <div class="portal-simple-actions">
             <button class="soft-btn" type="button" id="openVerifyBtn" hidden>打开验证页面</button>
-            <button class="primary-btn" type="button" id="submitLoginBtn">登录</button>
+            <button class="primary-btn" type="submit" id="submitLoginBtn">登录</button>
           </div>
         </form>
         <noscript>
           <p class="helper-text">
-            当前浏览器禁用了 JavaScript。仍可提交账号密码，页面会在服务端完成处理后返回 JSON 状态；推荐启用 JavaScript 获得完整登录流程。
+            当前浏览器禁用了 JavaScript。仍可提交账号密码，页面会刷新并显示处理结果；推荐启用 JavaScript 获得完整登录流程。
           </p>
         </noscript>
       </section>
     </main>
   </div>
-  <script type="module" src="${htmlEscape(assetBasePath)}/ui/xiaoai-console.js${assetVersion}"></script>
+  <script id="xiaoai-auth-config" type="application/json">${portalConfigScript}</script>
   <script src="${htmlEscape(assetBasePath)}/ui/xiaoai-auth-portal.js${assetVersion}" defer></script>
 </body>
 </html>`;
@@ -639,10 +677,15 @@ export class LoginPortal {
     private tryRespondWithExistingActionState(
         response: ServerResponse,
         session: InternalSession,
-        action: string
+        action: string,
+        redirectLocation?: string
     ) {
         if (session.status === "processing" && session.activeAction === action) {
-            sendJson(response, 202, this.toPublicSnapshot(session));
+            if (redirectLocation) {
+                sendRedirect(response, redirectLocation);
+            } else {
+                sendJson(response, 202, this.toPublicSnapshot(session));
+            }
             return true;
         }
 
@@ -650,7 +693,11 @@ export class LoginPortal {
             session.status === "success" &&
             (action === "login/password" || action === "verify/ticket")
         ) {
-            sendJson(response, 200, this.toPublicSnapshot(session));
+            if (redirectLocation) {
+                sendRedirect(response, redirectLocation);
+            } else {
+                sendJson(response, 200, this.toPublicSnapshot(session));
+            }
             return true;
         }
 
@@ -1119,7 +1166,17 @@ export class LoginPortal {
         }
 
         if (request.method === "POST" && action === "verify/ticket") {
-            if (this.tryRespondWithExistingActionState(response, session, action)) {
+            const htmlFormRedirectLocation = isHtmlFormRequest(request)
+                ? loginPageRedirectLocation(requestUrl)
+                : "";
+            if (
+                this.tryRespondWithExistingActionState(
+                    response,
+                    session,
+                    action,
+                    htmlFormRedirectLocation
+                )
+            ) {
                 return;
             }
             const body = await readJsonBody(request);
@@ -1156,7 +1213,11 @@ export class LoginPortal {
                         : undefined,
                     verificationRequired: Boolean(session.verification),
                 });
-                sendJson(response, 200, this.toPublicSnapshot(session));
+                if (htmlFormRedirectLocation) {
+                    sendRedirect(response, htmlFormRedirectLocation);
+                } else {
+                    sendJson(response, 200, this.toPublicSnapshot(session));
+                }
             } catch (error) {
                 session.status = "error";
                 session.activeAction = undefined;
@@ -1166,7 +1227,11 @@ export class LoginPortal {
                     ...this.requestMeta(request, matchedPath, session.id, action),
                     error: session.error,
                 });
-                sendJson(response, 400, { error: session.error });
+                if (htmlFormRedirectLocation) {
+                    sendRedirect(response, htmlFormRedirectLocation);
+                } else {
+                    sendJson(response, 400, { error: session.error });
+                }
             }
             return;
         }
@@ -1222,7 +1287,17 @@ export class LoginPortal {
         }
 
         if (request.method === "POST" && action === "login/password") {
-            if (this.tryRespondWithExistingActionState(response, session, action)) {
+            const htmlFormRedirectLocation = isHtmlFormRequest(request)
+                ? loginPageRedirectLocation(requestUrl)
+                : "";
+            if (
+                this.tryRespondWithExistingActionState(
+                    response,
+                    session,
+                    action,
+                    htmlFormRedirectLocation
+                )
+            ) {
                 return;
             }
             const body = await readJsonBody(request);
@@ -1265,7 +1340,11 @@ export class LoginPortal {
                     message: session.message,
                     verificationRequired: Boolean(session.verification),
                 });
-                sendJson(response, 200, this.toPublicSnapshot(session));
+                if (htmlFormRedirectLocation) {
+                    sendRedirect(response, htmlFormRedirectLocation);
+                } else {
+                    sendJson(response, 200, this.toPublicSnapshot(session));
+                }
             } catch (error) {
                 session.status = "error";
                 session.activeAction = undefined;
@@ -1275,7 +1354,11 @@ export class LoginPortal {
                     ...this.requestMeta(request, matchedPath, session.id, action),
                     error: session.error,
                 });
-                sendJson(response, 400, { error: session.error });
+                if (htmlFormRedirectLocation) {
+                    sendRedirect(response, htmlFormRedirectLocation);
+                } else {
+                    sendJson(response, 400, { error: session.error });
+                }
             }
             return;
         }

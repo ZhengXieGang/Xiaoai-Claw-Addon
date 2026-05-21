@@ -565,7 +565,7 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
           </label>
 
           <div class="portal-simple-actions">
-            <button class="soft-btn" type="button" id="openVerifyBtn" hidden>打开验证页面</button>
+            <button class="soft-btn" type="button" id="openVerifyBtn" hidden>发送验证码</button>
             <button class="primary-btn" type="submit" id="submitLoginBtn">登录</button>
           </div>
         </form>
@@ -1244,7 +1244,7 @@ export class LoginPortal {
             this.touchSession(session);
             session.status = "processing";
             session.activeAction = action;
-            session.message = "正在准备官方验证页面…";
+            session.message = "正在发送验证码…";
             session.error = undefined;
             await this.trace("portal_action_start", {
                 ...this.requestMeta(request, matchedPath, session.id, action),

@@ -2282,7 +2282,7 @@ export class XiaomiAccountClient {
                     state,
                     message: [
                         `小米账号登录需要先完成一次${methods.includes("phone") ? "短信" : methods.includes("email") ? "邮箱" : ""}安全验证。`,
-                        "请先点登录页上的“打开验证页面”按钮，在官方页面获取验证码。",
+                        "请先点登录页上的“发送验证码”按钮获取验证码。",
                         "回到当前登录页填写验证码后，再点“登录”继续。",
                     ]
                         .filter(Boolean)
@@ -2335,7 +2335,7 @@ export class XiaomiAccountClient {
                 `[XiaoAI Cloud] Xiaomi verification for ${sid} is missing identity_session.`
             );
             throw new Error(
-                "当前二次验证会话没有拿到 identity_session，请重新打开验证链接发送一次验证码后再提交。"
+                "当前二次验证会话没有拿到 identity_session，请重新发送验证码后再提交。"
             );
         }
 

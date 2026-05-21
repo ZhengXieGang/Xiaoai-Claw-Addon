@@ -56,7 +56,7 @@
   var verification = config.verification || null;
   var verificationKey = "";
   var loginInFlight = false;
-  var openVerifyPageInFlight = false;
+  var verificationCodeInFlight = false;
   var verifyInFlight = false;
   var sessionCompleted = Boolean(config.sessionCompleted);
   var statusTimer = null;
@@ -109,14 +109,17 @@
     }
     if (looksLikeVerificationFlow(raw)) {
       if (/(identity_session|identity session|会话)/i.test(raw) && /(没有|缺少|失效|过期|重新)/.test(raw)) {
-        return "请重新打开验证页面";
+        return "请重新发送验证码";
       }
       if (/(短信|邮箱|邮件|验证码).{0,8}已发送/.test(raw) || /已发送.{0,8}(短信|邮箱|邮件|验证码)/.test(raw)) {
         var sentMethod = verificationMethodLabel(verification && verification.methods);
         return sentMethod ? sentMethod + "已发送" : "验证码已发送";
       }
+      if (/(发送|获取|请求).{0,8}(短信|邮箱|邮件|验证码)/.test(raw) || /(短信|邮箱|邮件|验证码).{0,8}(发送|获取|请求)/.test(raw)) {
+        return "请发送验证码";
+      }
       if (/(打开|前往|跳转).{0,8}(验证页面|验证链接)/.test(raw) || /官方.{0,8}(验证页面|验证链接)/.test(raw)) {
-        return "请打开验证页面";
+        return "请发送验证码";
       }
       if (verification) {
         var verifyMethod = verificationMethodLabel(verification.methods);
@@ -211,16 +214,24 @@
   }
 
   function updateActionButtons() {
-    var busy = loginInFlight || openVerifyPageInFlight || verifyInFlight;
+    var busy = loginInFlight || verificationCodeInFlight || verifyInFlight;
+    var ticketValue = String((ticketInput && ticketInput.value) || "").trim();
+    var shouldOpenVerification = Boolean(
+      verification && verification.verifyUrl && !ticketValue
+    );
     submitLoginBtn.disabled = busy || sessionCompleted;
-    submitLoginBtn.textContent = sessionCompleted ? "已完成" : "登录";
+    submitLoginBtn.textContent = sessionCompleted
+      ? "已完成"
+      : shouldOpenVerification
+      ? "发送验证码"
+      : "登录";
     if (openVerifyBtn) {
       var canOpenVerify = Boolean(
         verification && verification.verifyUrl && !sessionCompleted
       );
       openVerifyBtn.hidden = !canOpenVerify;
       openVerifyBtn.disabled = busy || !canOpenVerify;
-      openVerifyBtn.textContent = "打开验证页面";
+      openVerifyBtn.textContent = "发送验证码";
     }
     updateFormTarget();
     queueEmbeddedLayoutReport();
@@ -348,7 +359,7 @@
   }
 
   function loginByPassword() {
-    if (loginInFlight || openVerifyPageInFlight || verifyInFlight || sessionCompleted) {
+    if (loginInFlight || verificationCodeInFlight || verifyInFlight || sessionCompleted) {
       return Promise.resolve();
     }
     var account = String((accountInput && accountInput.value) || "").trim();
@@ -383,7 +394,7 @@
   }
 
   function verifyByTicket(ticketOverride) {
-    if (verifyInFlight || loginInFlight || openVerifyPageInFlight || sessionCompleted) {
+    if (verifyInFlight || loginInFlight || verificationCodeInFlight || sessionCompleted) {
       return Promise.resolve();
     }
     var ticket =
@@ -416,61 +427,30 @@
       });
   }
 
-  function openVerifyPage() {
+  function requestVerificationCode() {
     if (
       !verification ||
       !verification.verifyUrl ||
-      openVerifyPageInFlight ||
+      verificationCodeInFlight ||
       loginInFlight ||
       verifyInFlight ||
       sessionCompleted
     ) {
       return Promise.resolve();
     }
-    var openedWindow = window.open("about:blank", "_blank", "noopener");
-    if (!openedWindow) {
-      setStatus("err", "浏览器拦截了验证页面，请允许弹窗后重试。");
-      return Promise.resolve();
-    }
-    openVerifyPageInFlight = true;
+    verificationCodeInFlight = true;
     updateActionButtons();
-    setStatus("", "正在打开官方验证页面，请稍候…");
-    var initialVerifyUrl = String((verification && verification.verifyUrl) || "").trim();
-    if (/^https?:\/\//i.test(initialVerifyUrl)) {
-      try {
-        openedWindow.location.href = initialVerifyUrl;
-      } catch (_) {}
-    }
+    setStatus("", "正在发送验证码，请稍候…");
     return postJson(openVerifyPageApiUrl, {})
       .then(function (data) {
-        var openUrl = String(
-          (data && (data.openUrl || (data.verification && data.verification.verifyUrl))) || ""
-        ).trim();
-        if (!openUrl) {
-          throw new Error("当前没有可用的官方验证页面。");
-        }
-        openedWindow.location.href = openUrl;
-        setStatus("", "请在官方页面获取验证码，回到这里填写后再点登录。");
+        renderVerification((data && data.verification) || verification || null);
+        setStatus("", (data && data.message) || "验证码已发送，请填写后再点登录。");
       })
       .catch(function (error) {
-        var fallbackVerifyUrl = String((verification && verification.verifyUrl) || "").trim();
-        if (/^https?:\/\//i.test(fallbackVerifyUrl)) {
-          try {
-            openedWindow.location.href = fallbackVerifyUrl;
-            setStatus(
-              "",
-              "验证页面接口异常，已回退为直接打开小米验证页。完成后请回到此页填写验证码。"
-            );
-            return;
-          } catch (_) {}
-        }
-        try {
-          openedWindow.close();
-        } catch (_) {}
         setStatus("err", (error && error.message) || String(error));
       })
       .finally(function () {
-        openVerifyPageInFlight = false;
+        verificationCodeInFlight = false;
         updateActionButtons();
       });
   }
@@ -479,7 +459,7 @@
     if (verification) {
       if (!String((ticketInput && ticketInput.value) || "").trim()) {
         if (verification.verifyUrl) {
-          return verifyByTicket("");
+          return requestVerificationCode();
         }
         setStatus("err", "请先填入验证码，再点登录。");
         return Promise.resolve();
@@ -501,8 +481,12 @@
     openVerifyBtn.addEventListener("click", function (event) {
       event.preventDefault();
       event.stopImmediatePropagation();
-      openVerifyPage();
+      requestVerificationCode();
     }, true);
+  }
+
+  if (ticketInput) {
+    ticketInput.addEventListener("input", updateActionButtons);
   }
 
   renderVerification(verification);

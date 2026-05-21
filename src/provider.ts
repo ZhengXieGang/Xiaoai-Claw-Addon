@@ -7598,7 +7598,7 @@ class XiaoaiCloudPlugin {
             message: [
                 error.message,
                 methodLabels,
-                "先点页面上的“打开验证页面”按钮，在官方页面获取验证码。",
+                "先点页面上的“发送验证码”按钮获取验证码。",
                 "回到当前页面填写验证码后，再点“登录”继续。",
             ]
                 .filter(Boolean)
@@ -8560,8 +8560,8 @@ class XiaoaiCloudPlugin {
                 return {
                     ...verificationPayload,
                     message: [
-                        "官方验证页面的结果还没有同步到当前登录会话。",
-                        "如果页面刚显示 ok，请等待 2-3 秒后再点一次“登录”。",
+                        "验证码结果还没有同步到当前登录会话。",
+                        "如果刚提交验证码，请等待 2-3 秒后再点一次“登录”。",
                         "如你还保留短信验证码，也可以直接填回当前页后再提交。",
                     ].join("\n"),
                 };
@@ -8586,10 +8586,10 @@ class XiaoaiCloudPlugin {
                 message:
                     devices.length === 1
                         ? attemptedExternalContinue
-                            ? "已从官方验证页面继续登录，已发现 1 台可用小爱。"
+                            ? "验证码校验通过，已发现 1 台可用小爱。"
                             : "验证码校验通过，已发现 1 台可用小爱。"
                         : attemptedExternalContinue
-                            ? `已从官方验证页面继续登录，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`
+                            ? `验证码校验通过，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`
                             : `验证码校验通过，已发现 ${devices.length} 台可用小爱，请点选目标音箱。`,
                 devices,
             };
@@ -8606,7 +8606,7 @@ class XiaoaiCloudPlugin {
 
         return {
             message: attemptedExternalContinue
-                ? `已从官方验证页面继续登录，已接入设备 ${device.name} (${device.hardware}/${device.model})。`
+                ? `验证码校验通过，已接入设备 ${device.name} (${device.hardware}/${device.model})。`
                 : `验证完成，已接入设备 ${device.name} (${device.hardware}/${device.model})。`,
         };
     }
@@ -8631,7 +8631,7 @@ class XiaoaiCloudPlugin {
         });
         accountClient.setVerificationState(pending.state);
 
-        const result = await accountClient.prepareVerificationPage(preferredMethod);
+        const result = await accountClient.requestVerificationCode(preferredMethod);
         const nextState = accountClient.getVerificationState() || pending.state;
         this.pendingVerifications.set(sessionId, {
             ...pending,
@@ -8640,7 +8640,7 @@ class XiaoaiCloudPlugin {
 
         return {
             message: result.message,
-            openUrl: result.openUrl,
+            openUrl: nextState.verifyUrl,
             verification: {
                 verifyUrl: nextState.verifyUrl,
                 methods: nextState.verifyMethods,

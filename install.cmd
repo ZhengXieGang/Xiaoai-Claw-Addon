@@ -383,14 +383,10 @@ if exist "%SOURCE_DIR%\src" if exist "%SOURCE_DIR%\index.ts" if exist "%SOURCE_D
 exit /b 0
 
 :ensure_node_supported
-for /f %%v in ('node -p "process.versions.node.split('.')[0]"') do set "NODE_MAJOR=%%v"
-if not defined NODE_MAJOR (
-  echo Failed to detect Node.js version.
-  exit /b 1
-)
-if %NODE_MAJOR% LSS 22 (
+node -e "const [major,minor,patch]=process.versions.node.split('.').map(Number); const supported=(major===22&&(minor>22||(minor===22&&patch>=3)))||(major===24&&minor>=15)||(major===25&&minor>=9)||major>25; process.exit(supported?0:1)" >nul 2>nul
+if errorlevel 1 (
   for /f %%v in ('node -p "process.versions.node"') do set "NODE_VERSION=%%v"
-  echo Node.js %NODE_VERSION% is too old. OpenClaw 官方文档要求插件环境使用 Node.js 22 或更高版本。
+  echo Node.js %NODE_VERSION% is not supported. OpenClaw 官方支持 Node.js 22.22.3+、24.15+ 或 25.9+（不含 23.x 和早于 24.15 的 24.x）。
   exit /b 1
 )
 exit /b 0

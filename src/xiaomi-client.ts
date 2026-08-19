@@ -1,6 +1,15 @@
 import { createHash, createHmac, randomBytes } from "crypto";
 import { execFile } from "child_process";
-import { appendFile, mkdir, readFile, stat, writeFile } from "fs/promises";
+import {
+    appendFile,
+    chmod,
+    mkdir,
+    readFile,
+    rename,
+    stat,
+    unlink,
+    writeFile,
+} from "fs/promises";
 import { request as httpsRequest } from "https";
 import path from "path";
 import { defaultPluginStorageDir } from "./openclaw-paths.js";
@@ -9,6 +18,20 @@ export type XiaomiSid = "micoapi" | "xiaomiio";
 export type XiaomiVerificationMethod = "phone" | "email";
 
 type XiaomiTokenEntry = [string, string];
+
+function sameTokenEntry(
+    left: XiaomiTokenEntry | undefined,
+    right: XiaomiTokenEntry | undefined
+) {
+    return Boolean(
+        left &&
+            right &&
+            left.length >= 2 &&
+            right.length >= 2 &&
+            left[0] === right[0] &&
+            left[1] === right[1]
+    );
+}
 
 export interface XiaomiTokenStore {
     deviceId: string;
@@ -169,8 +192,8 @@ const ACCOUNT_BASE_URL = "https://account.xiaomi.com/pass";
 const ACCOUNT_ORIGIN = new URL(ACCOUNT_BASE_URL).origin;
 const MINA_BASE_URL = "https://api2.mina.mi.com";
 const MINA_CONVERSATION_URL = "https://userprofile.mina.mi.com/device_profile/v2/conversation";
-const MIOT_SPEC_INSTANCES_URL = "http://miot-spec.org/miot-spec-v2/instances?status=all";
-const MIOT_SPEC_INSTANCE_URL = "http://miot-spec.org/miot-spec-v2/instance?type=";
+const MIOT_SPEC_INSTANCES_URL = "https://miot-spec.org/miot-spec-v2/instances?status=all";
+const MIOT_SPEC_INSTANCE_URL = "https://miot-spec.org/miot-spec-v2/instance?type=";
 
 const ACCOUNT_SDK_VERSION = "3.8.6";
 const MIIO_USER_AGENT =
@@ -212,7 +235,7 @@ try:
             "Connection": "keep-alive",
         },
         allow_redirects=False,
-        verify=False,
+        verify=True,
         timeout=20,
     )
     print(json.dumps({
@@ -257,6 +280,7 @@ const PYTHON_MICOAPI_LOGIN_SCRIPT = `
 import base64
 import hashlib
 import json
+import os
 import sys
 import urllib.parse
 import warnings
@@ -265,8 +289,8 @@ warnings.filterwarnings("ignore")
 
 device_id = sys.argv[1]
 user_id = sys.argv[2]
-pass_token = sys.argv[3]
-ua = sys.argv[4]
+pass_token = os.environ.get("XIAOAI_CLOUD_PASS_TOKEN", "")
+ua = sys.argv[3]
 
 try:
     import requests
@@ -292,7 +316,7 @@ try:
             "userId": user_id,
             "passToken": pass_token,
         },
-        verify=False,
+        verify=True,
         timeout=20,
     )
     auth = json.loads(strip_json_prefix(response.text))
@@ -319,7 +343,7 @@ try:
             "Connection": "keep-alive",
         },
         allow_redirects=False,
-        verify=False,
+        verify=True,
         timeout=20,
     )
     print(json.dumps({
@@ -577,26 +601,39 @@ function buildTimeoutSignal(timeoutMs = XIAOMI_FETCH_TIMEOUT_MS) {
     return undefined;
 }
 
-function execFileText(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+function execFileText(
+    command: string,
+    args: string[],
+    options?: { env?: NodeJS.ProcessEnv }
+): Promise<{ stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
-        execFile(command, args, { encoding: "utf8", maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-            if (error) {
-                const details = errorDetails(error);
-                reject(
-                    new Error(
-                        [
-                            `command=${command}`,
-                            details.message,
-                            stderr ? truncateText(stderr, 400) : undefined,
-                        ]
-                            .filter(Boolean)
-                            .join(" | ")
-                    )
-                );
-                return;
+        execFile(
+            command,
+            args,
+            {
+                encoding: "utf8",
+                maxBuffer: 1024 * 1024,
+                env: options?.env,
+            },
+            (error, stdout, stderr) => {
+                if (error) {
+                    const details = errorDetails(error);
+                    reject(
+                        new Error(
+                            [
+                                `command=${command}`,
+                                details.message,
+                                stderr ? truncateText(stderr, 400) : undefined,
+                            ]
+                                .filter(Boolean)
+                                .join(" | ")
+                        )
+                    );
+                    return;
+                }
+                resolve({ stdout, stderr });
             }
-            resolve({ stdout, stderr });
-        });
+        );
     });
 }
 
@@ -925,6 +962,8 @@ export class XiaomiAccountClient {
     private readonly accountCookies: Record<string, string>;
     private token: XiaomiTokenStore | null;
     private loadTokenStorePromise?: Promise<void>;
+    private readonly loginPromises = new Map<XiaomiSid, Promise<void>>();
+    private readonly sidRefreshPromises = new Map<XiaomiSid, Promise<void>>();
     private verificationUrl?: string;
     private verificationMethods: XiaomiVerificationMethod[] = [];
     private identitySession?: string;
@@ -1125,6 +1164,7 @@ export class XiaomiAccountClient {
 
         try {
             const info = await stat(this.debugLogPath);
+            await chmod(this.debugLogPath, 0o600);
             if (info.size <= DEBUG_LOG_MAX_BYTES) {
                 return;
             }
@@ -1149,6 +1189,7 @@ export class XiaomiAccountClient {
                 nextContent.endsWith("\n") ? nextContent : `${nextContent}\n`,
                 "utf8"
             );
+            await chmod(this.debugLogPath, 0o600);
         } catch {
             // Ignore cleanup failures to avoid breaking runtime behavior.
         }
@@ -1167,6 +1208,7 @@ export class XiaomiAccountClient {
             details: sanitizeData(context),
         });
         await writeFile(this.debugLogPath, `${line}\n`, "utf8");
+        await chmod(this.debugLogPath, 0o600).catch(() => undefined);
     }
 
     private async trace(event: string, details: Record<string, any>) {
@@ -1183,6 +1225,7 @@ export class XiaomiAccountClient {
                 details: sanitizeData(details),
             });
             await appendFile(this.debugLogPath, `${line}\n`, "utf8");
+            await chmod(this.debugLogPath, 0o600);
         } catch {
             // Ignore trace write failures to avoid breaking login flow.
         }
@@ -1231,6 +1274,7 @@ export class XiaomiAccountClient {
                             ? [parsed.xiaomiio[0], parsed.xiaomiio[1]]
                             : undefined,
                     };
+                    await chmod(this.tokenStorePath, 0o600).catch(() => undefined);
                     await this.trace("token_store_loaded", {
                         tokenStorePath: this.tokenStorePath,
                         token: {
@@ -1282,25 +1326,42 @@ export class XiaomiAccountClient {
             return;
         }
         await mkdir(path.dirname(this.tokenStorePath), { recursive: true });
-        await writeFile(
-            this.tokenStorePath,
-            JSON.stringify(
-                {
-                    deviceId: this.token.deviceId,
-                    userId: this.token.userId,
-                    cUserId: this.token.cUserId,
-                    passToken: this.token.passToken,
-                    micoapi: this.token.micoapi,
-                    xiaomiio: this.token.xiaomiio,
-                },
-                null,
-                2
-            ),
+        const content = JSON.stringify(
             {
+                deviceId: this.token.deviceId,
+                userId: this.token.userId,
+                cUserId: this.token.cUserId,
+                passToken: this.token.passToken,
+                micoapi: this.token.micoapi,
+                xiaomiio: this.token.xiaomiio,
+            },
+            null,
+            2
+        );
+        const temporaryPath = `${this.tokenStorePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+        try {
+            await writeFile(temporaryPath, content, {
                 encoding: "utf8",
                 mode: 0o600,
+            });
+            await chmod(temporaryPath, 0o600).catch(() => undefined);
+            try {
+                await rename(temporaryPath, this.tokenStorePath);
+            } catch (error: any) {
+                // Windows cannot replace an existing file with rename; keep a
+                // private direct-write fallback for that platform.
+                if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+                    throw error;
+                }
+                await writeFile(this.tokenStorePath, content, {
+                    encoding: "utf8",
+                    mode: 0o600,
+                });
             }
-        );
+        } finally {
+            await unlink(temporaryPath).catch(() => undefined);
+        }
+        await chmod(this.tokenStorePath, 0o600).catch(() => undefined);
         await this.trace("token_store_saved", {
             tokenStorePath: this.tokenStorePath,
             token: {
@@ -1962,9 +2023,13 @@ export class XiaomiAccountClient {
                     PYTHON_MICOAPI_LOGIN_SCRIPT,
                     this.token.deviceId,
                     this.token.userId,
-                    this.token.passToken,
                     userAgent,
-                ]);
+                ], {
+                    env: {
+                        ...process.env,
+                        XIAOAI_CLOUD_PASS_TOKEN: this.token.passToken,
+                    },
+                });
                 const payload = parseJson<any>((stdout || "").trim());
                 await this.trace("python_micoapi_login_result", {
                     command: candidate.command,
@@ -2608,6 +2673,65 @@ export class XiaomiAccountClient {
         await this.saveTokenStore();
     }
 
+    private async runLoginSerialized(
+        sid: XiaomiSid,
+        options?: { verifyTicket?: string }
+    ) {
+        const existing = this.loginPromises.get(sid);
+        if (existing) {
+            await existing;
+            return;
+        }
+
+        const operation = this.runLoginRequest(sid, options);
+        this.loginPromises.set(sid, operation);
+        try {
+            await operation;
+        } finally {
+            if (this.loginPromises.get(sid) === operation) {
+                this.loginPromises.delete(sid);
+            }
+        }
+    }
+
+    /**
+     * Serialize invalidation and re-login as one transaction. A request can
+     * receive a 401 after another request has already refreshed the sid; in
+     * that case the failed token is stale and must not delete the new token.
+     */
+    private async refreshSidSerialized(
+        sid: XiaomiSid,
+        failedToken?: XiaomiTokenEntry
+    ) {
+        const existing = this.sidRefreshPromises.get(sid);
+        if (existing) {
+            await existing;
+            return;
+        }
+
+        const operation = (async () => {
+            await this.loadTokenStore();
+            const currentToken = this.token?.[sid];
+            if (failedToken && currentToken && !sameTokenEntry(currentToken, failedToken)) {
+                await this.trace("mi_request_refresh_skipped_stale_failure", {
+                    sid,
+                });
+                return;
+            }
+
+            await this.invalidateSid(sid);
+            await this.login(sid);
+        })();
+        this.sidRefreshPromises.set(sid, operation);
+        try {
+            await operation;
+        } finally {
+            if (this.sidRefreshPromises.get(sid) === operation) {
+                this.sidRefreshPromises.delete(sid);
+            }
+        }
+    }
+
     async completeVerification(sid: XiaomiSid, ticket: string) {
         const trimmedTicket = ticket.trim();
         if (!trimmedTicket) {
@@ -2622,7 +2746,7 @@ export class XiaomiAccountClient {
             delete this.token[sid];
         }
 
-        await this.runLoginRequest(sid, {
+        await this.runLoginSerialized(sid, {
             verifyTicket: trimmedTicket,
         });
     }
@@ -2881,7 +3005,7 @@ export class XiaomiAccountClient {
             );
         }
 
-        await this.runLoginRequest(sid);
+        await this.runLoginSerialized(sid);
     }
 
     async miRequest<T = any>(options: {
@@ -2909,6 +3033,7 @@ export class XiaomiAccountClient {
         }
 
         const sidToken = this.token[options.sid] as XiaomiTokenEntry;
+        const requestSidToken: XiaomiTokenEntry = [sidToken[0], sidToken[1]];
         const dstOffset = currentDstOffsetMillis();
         const requestCookies: Record<string, string> = {
             userId: this.token.userId,
@@ -3076,8 +3201,7 @@ export class XiaomiAccountClient {
                     url,
                     status: response.status,
                 });
-                await this.invalidateSid(options.sid);
-                await this.login(options.sid);
+                await this.refreshSidSerialized(options.sid, requestSidToken);
                 return this.miRequest<T>({ ...options, allowRelogin: false });
             }
             throw new Error(`Xiaomi request failed for ${url}: HTTP ${response.status} ${text}`);
@@ -3108,8 +3232,7 @@ export class XiaomiAccountClient {
                     status: response.status,
                     payload,
                 });
-                await this.invalidateSid(options.sid);
-                await this.login(options.sid);
+                await this.refreshSidSerialized(options.sid, requestSidToken);
                 return this.miRequest<T>({ ...options, allowRelogin: false });
             }
             throw new Error(`Xiaomi request failed for ${url}: ${JSON.stringify(payload)}`);
@@ -3410,12 +3533,38 @@ export class MiotSpecClient {
                 const response = await fetch(MIOT_SPEC_INSTANCES_URL, {
                     signal: buildTimeoutSignal()
                 });
-                const data = await response.json() as { instances?: Array<{ model: string; type: string }> };
-                return data.instances || [];
+                if (!response.ok) {
+                    throw new Error(
+                        `MIoT spec instances request failed: HTTP ${response.status}`
+                    );
+                }
+                const data = await response.json() as {
+                    instances?: Array<{ model?: unknown; type?: unknown }>;
+                };
+                if (!data || !Array.isArray(data.instances)) {
+                    throw new Error("MIoT spec instances response is invalid.");
+                }
+                return data.instances.filter(
+                    (item): item is { model: string; type: string } =>
+                        Boolean(
+                            item &&
+                                typeof item.model === "string" &&
+                                typeof item.type === "string"
+                        )
+                );
             })();
         }
 
-        const instances = await this.instancesPromise;
+        const instancesPromise = this.instancesPromise;
+        let instances: Array<{ model: string; type: string }>;
+        try {
+            instances = await instancesPromise;
+        } catch (error) {
+            if (this.instancesPromise === instancesPromise) {
+                this.instancesPromise = undefined;
+            }
+            throw error;
+        }
         const candidates = instances
             .filter((item) => item.model === model)
             .sort((left, right) => parseVersionFromUrn(right.type) - parseVersionFromUrn(left.type));
@@ -3436,7 +3585,13 @@ export class MiotSpecClient {
         const response = await fetch(`${MIOT_SPEC_INSTANCE_URL}${encodeURIComponent(type)}`, {
             signal: buildTimeoutSignal()
         });
+        if (!response.ok) {
+            throw new Error(`MIoT spec request failed: HTTP ${response.status}`);
+        }
         const spec = await response.json() as MiotDeviceSpec;
+        if (!spec || typeof spec !== "object") {
+            throw new Error("MIoT spec response is invalid.");
+        }
         this.specCache.set(model, spec);
         return spec;
     }

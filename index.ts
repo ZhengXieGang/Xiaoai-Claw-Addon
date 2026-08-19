@@ -19,7 +19,17 @@ const pluginEntry = definePluginEntry({
     description: "Direct Xiaomi cloud integration for OpenClaw XiaoAi speaker control.",
     register(api: any) {
         const plugin = createXiaoaiCloudPlugin(api);
-        plugin.registerTools();
+        const registrationMode =
+            typeof api?.registrationMode === "string"
+                ? api.registrationMode
+                : "full";
+        if (registrationMode === "cli-metadata") {
+            return;
+        }
+        plugin.registerTools(registrationMode);
+        if (registrationMode !== "full") {
+            return;
+        }
         api.registerService({
             id: "xiaoai-cloud-listener",
             start: async (ctx: any) => {

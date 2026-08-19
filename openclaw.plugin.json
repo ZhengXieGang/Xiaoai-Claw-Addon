@@ -109,7 +109,7 @@
       },
       "authListenHost": {
         "type": "string",
-        "description": "临时登录门户监听地址，默认 0.0.0.0。"
+        "description": "旧版 OpenClaw 无 Gateway HTTP 路由时的临时登录门户监听地址，默认 127.0.0.1。新版宿主会优先使用 Gateway 路由，不启动独立明文 HTTP 监听。"
       },
       "authPort": {
         "type": "integer",
@@ -121,7 +121,7 @@
       },
       "publicBaseUrl": {
         "type": "string",
-        "description": "用户手机可访问的插件基地址，例如 https://example.com/api/xiaoai-cloud 或 http://192.168.1.10:17890。留空时插件会优先根据当前 OpenClaw gateway 配置自动推导。"
+        "description": "用户手机可访问的插件基地址，例如 https://example.com/api/xiaoai-cloud。留空时插件会优先根据当前 OpenClaw gateway 配置自动推导；旧版宿主回退到独立登录门户时，应通过 HTTPS 反向代理提供远程访问。"
       },
       "audioPublicBaseUrl": {
         "type": "string",

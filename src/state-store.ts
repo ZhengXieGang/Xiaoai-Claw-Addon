@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "fs/promises";
+import { randomBytes } from "crypto";
 import path from "path";
 import { defaultPluginStorageDir } from "./openclaw-paths.js";
 
@@ -144,9 +145,39 @@ export function defaultConsoleStatePath(baseStateDir?: string): string {
     return path.join(defaultStateBaseDir(baseStateDir), "console.json");
 }
 
+async function writePrivateJsonFile(filePath: string, value: unknown) {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const content = JSON.stringify(value, null, 2);
+    const temporaryPath = `${filePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+        await writeFile(temporaryPath, content, {
+            encoding: "utf8",
+            mode: 0o600,
+        });
+        await chmod(temporaryPath, 0o600).catch(() => undefined);
+        try {
+            await rename(temporaryPath, filePath);
+        } catch (error: any) {
+            // Windows cannot replace an existing file with rename; retain a
+            // private direct-write fallback there while keeping POSIX writes atomic.
+            if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+                throw error;
+            }
+            await writeFile(filePath, content, {
+                encoding: "utf8",
+                mode: 0o600,
+            });
+        }
+    } finally {
+        await unlink(temporaryPath).catch(() => undefined);
+    }
+    await chmod(filePath, 0o600).catch(() => undefined);
+}
+
 export async function loadPersistedProfile(filePath: string): Promise<PersistedCloudProfile> {
     try {
         const content = await readFile(filePath, "utf8");
+        await chmod(filePath, 0o600).catch(() => undefined);
         const parsed = JSON.parse(content) as PersistedCloudProfile;
         return parsed && typeof parsed === "object" ? parsed : {};
     } catch {
@@ -159,11 +190,7 @@ export async function savePersistedProfile(filePath: string, profile: PersistedC
         ...profile,
         updatedAt: new Date().toISOString()
     };
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, JSON.stringify(next, null, 2), {
-        encoding: "utf8",
-        mode: 0o600,
-    });
+    await writePrivateJsonFile(filePath, next);
 }
 
 export async function loadPersistedConsoleState(
@@ -171,6 +198,7 @@ export async function loadPersistedConsoleState(
 ): Promise<PersistedConsoleState> {
     try {
         const content = await readFile(filePath, "utf8");
+        await chmod(filePath, 0o600).catch(() => undefined);
         const parsed = JSON.parse(content) as PersistedConsoleState;
         if (!parsed || typeof parsed !== "object") {
             return {};
@@ -375,9 +403,5 @@ export async function savePersistedConsoleState(
                 : undefined,
         updatedAt: new Date().toISOString(),
     };
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, JSON.stringify(next, null, 2), {
-        encoding: "utf8",
-        mode: 0o600,
-    });
+    await writePrivateJsonFile(filePath, next);
 }

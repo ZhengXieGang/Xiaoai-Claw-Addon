@@ -1,9 +1,13 @@
 import path from "path";
-import { mkdir, readFile, readdir, stat, unlink, utimes, writeFile } from "fs/promises";
+import { chmod, mkdir, readFile, readdir, stat, unlink, utimes, writeFile } from "fs/promises";
 import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import { execFile, spawn } from "child_process";
+import { lookup } from "dns/promises";
+import { request as httpRequest } from "http";
 import { networkInterfaces } from "os";
+import { Readable } from "stream";
 import { fileURLToPath } from "url";
+import { request as httpsRequest } from "https";
 import JSON5 from "json5";
 import { renderConsoleAccessPage, renderConsolePage } from "./console-page.js";
 import {
@@ -425,6 +429,11 @@ interface ParsedAudioRelayReference {
     extension: string;
 }
 
+interface PinnedAudioRelayDnsRecord {
+    address: string;
+    family: 4 | 6;
+}
+
 type AudioPlaybackStrategy =
     | "original-direct"
     | "original-music"
@@ -732,6 +741,9 @@ const AUDIO_PLAYBACK_NON_INTERRUPT_BASELINE_STATUS_TIMEOUT_MS = 320;
 const AUDIO_PLAYBACK_VERIFY_FAST_STATUS_TIMEOUT_MS = 520;
 const AUDIO_PLAYBACK_VERIFY_FAST_PROBE_ATTEMPTS = 2;
 const AUDIO_SOURCE_PREFLIGHT_TIMEOUT_MS = 4500;
+const AUDIO_RELAY_FETCH_TIMEOUT_MS = 30_000;
+const AUDIO_RELAY_MAX_REDIRECTS = 4;
+const AUDIO_RELAY_MAX_CONCURRENT_REQUESTS = 8;
 const AUDIO_RELAY_RANGE0_FULL_RESPONSE_COMPAT =
     readBoolean(process.env.XIAOAI_CLOUD_AUDIO_RELAY_RANGE0_FULL_RESPONSE) ===
     true;
@@ -1321,6 +1333,150 @@ function isPrivateHostname(hostname: string) {
         );
     }
     return false;
+}
+
+const BLOCKED_AUDIO_RELAY_HOSTNAMES = new Set([
+    "metadata.google.internal",
+    "metadata.google",
+    "instance-data.ec2.internal",
+    "instance-data",
+    "metadata.azure.internal",
+]);
+
+function validateAudioRelayUpstreamUrl(value: string) {
+    let parsed: URL;
+    try {
+        parsed = new URL(value);
+    } catch {
+        throw new Error("音频 relay 只支持有效的 http/https URL。");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error("音频 relay 只允许 http/https 上游地址。");
+    }
+    if (parsed.username || parsed.password) {
+        throw new Error("音频 relay 不允许带账号密码的 URL。");
+    }
+
+    const hostname = parsed.hostname
+        .trim()
+        .toLowerCase()
+        .replace(/^\[|\]$/g, "")
+        .replace(/\.$/, "");
+    if (
+        isBlockedAudioRelayResolvedAddress(hostname) ||
+        BLOCKED_AUDIO_RELAY_HOSTNAMES.has(hostname) ||
+        hostname === "169.254.169.254" ||
+        hostname === "169.254.170.2" ||
+        hostname === "100.100.100.200" ||
+        hostname === "fd00:ec2::254" ||
+        hostname.startsWith("169.254.") ||
+        hostname.startsWith("fe80:")
+    ) {
+        throw new Error("音频 relay 已拒绝云元数据或链路本地地址。");
+    }
+    return parsed;
+}
+
+function isBlockedAudioRelayResolvedAddress(value: string) {
+    const normalized = value.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    let ipv4Mapped = normalized.startsWith("::ffff:")
+        ? normalized.slice("::ffff:".length)
+        : normalized;
+    const mappedHex = normalized.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (mappedHex) {
+        const high = Number.parseInt(mappedHex[1], 16);
+        const low = Number.parseInt(mappedHex[2], 16);
+        ipv4Mapped = `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+    }
+    return (
+        ipv4Mapped === "169.254.169.254" ||
+        ipv4Mapped === "169.254.170.2" ||
+        ipv4Mapped === "100.100.100.200" ||
+        ipv4Mapped.startsWith("169.254.") ||
+        normalized === "fd00:ec2::254" ||
+        normalized.startsWith("fe80:")
+    );
+}
+
+async function resolveAudioRelayDnsTarget(url: URL): Promise<PinnedAudioRelayDnsRecord[] | undefined> {
+    const hostname = url.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    if (!hostname || looksLikeIpHostname(hostname)) {
+        return undefined;
+    }
+    try {
+        const records = await lookup(hostname, { all: true, verbatim: true });
+        if (!records.length) {
+            throw new Error("音频 relay 上游地址没有可用的 DNS 记录。");
+        }
+        if (records.some((record) => isBlockedAudioRelayResolvedAddress(record.address))) {
+            throw new Error("音频 relay 已拒绝解析到云元数据或链路本地地址。");
+        }
+        const pinnedRecords = records
+            .filter(
+                (record): record is { address: string; family: 4 | 6 } =>
+                    record.family === 4 || record.family === 6
+            )
+            .map((record) => ({
+                address: record.address,
+                family: record.family,
+            }));
+        if (!pinnedRecords.length) {
+            throw new Error("音频 relay 上游地址没有受支持的 DNS 记录。");
+        }
+        return pinnedRecords;
+    } catch (error) {
+        if (error instanceof Error && error.message.includes("已拒绝解析到")) {
+            throw error;
+        }
+        throw new Error(
+            `音频 relay 无法解析上游地址 ${hostname}: ${
+                error instanceof Error ? error.message : String(error)
+            }`
+        );
+    }
+}
+
+function createPinnedAudioRelayLookup(
+    hostname: string,
+    records: PinnedAudioRelayDnsRecord[]
+) {
+    const normalizedHostname = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    return ((requestedHostname: string, options: any, callback: any) => {
+        const complete = typeof options === "function" ? options : callback;
+        if (typeof complete !== "function") {
+            return;
+        }
+        const requested = requestedHostname
+            .trim()
+            .toLowerCase()
+            .replace(/^\[|\]$/g, "");
+        if (requested !== normalizedHostname) {
+            complete(new Error("音频 relay DNS 固定解析的主机名不匹配。"));
+            return;
+        }
+
+        const requestedOptions =
+            options && typeof options === "object" ? options : ({} as Record<string, unknown>);
+        const requestedFamily =
+            typeof options === "number"
+                ? options
+                : typeof requestedOptions.family === "number"
+                    ? requestedOptions.family
+                    : 0;
+        const candidates = records.filter(
+            (record) => requestedFamily === 0 || record.family === requestedFamily
+        );
+        if (candidates.length === 0) {
+            complete(new Error("音频 relay DNS 固定解析没有匹配的地址族。"));
+            return;
+        }
+        if (requestedOptions.all === true) {
+            complete(null, candidates.map((record) => ({ ...record })));
+            return;
+        }
+        const selected = candidates[0];
+        complete(null, selected.address, selected.family);
+    }) as any;
 }
 
 function scoreConsoleBaseUrl(value: string) {
@@ -2774,8 +2930,8 @@ async function resolvePluginConfig(
             pickFirstString(
                 apiConfig.authListenHost,
                 env.XIAOAI_CLOUD_AUTH_LISTEN_HOST,
-                "0.0.0.0"
-            ) || "0.0.0.0",
+                "127.0.0.1"
+            ) || "127.0.0.1",
         authPort: clamp(
             Math.round(
                 readNumber(apiConfig.authPort) ||
@@ -2847,6 +3003,7 @@ class XiaoaiCloudPlugin {
     private initPromise?: Promise<void>;
     private config?: PluginConfig;
     private toolsRegistered = false;
+    private fullRuntimeRegistrationStarted = false;
     private serviceStateDir?: string;
     private loginPortal?: LoginPortal;
     private readonly registeredGatewayRoutePaths = new Set<string>();
@@ -2854,6 +3011,7 @@ class XiaoaiCloudPlugin {
     private loginNotificationSessionId?: string;
     private observedGatewayAuthBaseUrls: string[] = [];
     private startServicePromise?: Promise<void>;
+    private serviceGeneration = 0;
     private consoleState?: {
         accessToken?: string;
         accessGrants?: PersistedConsoleAccessGrant[];
@@ -2921,6 +3079,7 @@ class XiaoaiCloudPlugin {
     private notificationChannelUnavailableMessage = "";
     private pendingGatewayRestart = false;
     private readonly audioRelayEntries = new Map<string, AudioRelayEntry>();
+    private activeAudioRelayRequests = 0;
     private readonly audioPlaybackCapability = new Map<string, AudioPlaybackCapabilityEntry>();
     private readonly externalAudioLoopGuards = new Map<string, ExternalAudioLoopGuard>();
     private readonly speakerAudioLatencyProfiles = new Map<string, SpeakerAudioLatencyProfile>();
@@ -2958,12 +3117,23 @@ class XiaoaiCloudPlugin {
         this.api = api;
     }
 
-    registerTools() {
-        if (this.toolsRegistered) {
+    registerTools(registrationMode?: string) {
+        const mode = readString(registrationMode || this.api?.registrationMode) || "full";
+        const shouldRegisterTools =
+            mode === "full" || mode === "discovery" || mode === "tool-discovery";
+        if (!shouldRegisterTools) {
             return;
         }
-        this.toolsRegistered = true;
-        this.registerPluginTools();
+
+        if (!this.toolsRegistered) {
+            this.toolsRegistered = true;
+            this.registerPluginTools();
+        }
+
+        if (mode !== "full" || this.fullRuntimeRegistrationStarted) {
+            return;
+        }
+        this.fullRuntimeRegistrationStarted = true;
         this.ensureGatewayRouteRegistered(resolveStaticAuthRoutePath());
         void this.ensureGatewayRouteRegisteredFromCurrentConfig();
     }
@@ -2978,17 +3148,36 @@ class XiaoaiCloudPlugin {
             return this.startServicePromise;
         }
 
-        this.startServicePromise = (async () => {
+        const generation = ++this.serviceGeneration;
+        const startPromise = (async () => {
             this.registerTools();
             await this.ensureGatewayRouteRegisteredFromCurrentConfig();
-            this.ensureReady()
-                .then(() => this.startPolling())
-                .catch((error) => {
-                    this.lastError = this.errorMessage(error);
-                    this.reportInitializationOutcome(error);
-                });
-        })().catch((error) => {
-            this.startServicePromise = undefined;
+            try {
+                await this.ensureReady();
+            } catch (error) {
+                if (generation === this.serviceGeneration) {
+                    const message = this.errorMessage(error);
+                    this.lastError = message;
+                    if (
+                        this.isTransientNetworkError(message) ||
+                        this.isRateLimitedNetworkError(message)
+                    ) {
+                        this.startPolling();
+                    } else {
+                        this.reportInitializationOutcome(error);
+                    }
+                }
+                return;
+            }
+            if (generation === this.serviceGeneration) {
+                this.startPolling();
+            }
+        })();
+
+        this.startServicePromise = startPromise.catch((error) => {
+            if (generation === this.serviceGeneration) {
+                this.startServicePromise = undefined;
+            }
             throw error;
         });
 
@@ -2996,7 +3185,12 @@ class XiaoaiCloudPlugin {
     }
 
     async stopService() {
+        this.serviceGeneration += 1;
         this.stopPolling();
+        const startPromise = this.startServicePromise;
+        if (startPromise) {
+            await startPromise.catch(() => undefined);
+        }
         await this.stopOpenclawGatewayClient();
         this.initPromise = undefined;
         this.config = undefined;
@@ -3054,6 +3248,7 @@ class XiaoaiCloudPlugin {
         const lower = message.toLowerCase();
         return [
             "fetch failed",
+            "aborterror",
             "etimedout",
             "econnreset",
             "eai_again",
@@ -3062,7 +3257,7 @@ class XiaoaiCloudPlugin {
             "timeout",
             "socket hang up",
             "network error",
-        ].some((keyword) => lower.includes(keyword));
+        ].some((keyword) => lower.includes(keyword)) || /\bhttp 5\d\d\b/.test(lower);
     }
 
     private isRateLimitedNetworkError(message: string): boolean {
@@ -3272,10 +3467,15 @@ class XiaoaiCloudPlugin {
                         ts: new Date().toISOString(),
                         seq: traceDetails.seq,
                         event,
-                        details: traceDetails,
+                        details: {
+                            source: "provider",
+                            fallback: true,
+                            traceWriteFailed: true,
+                        },
                     })}\n`,
                     { encoding: "utf8", flag: "a" }
                 );
+                await chmod(debugLogPath, 0o600).catch(() => undefined);
             }
         } catch {
             // Ignore provider trace failures to avoid breaking runtime behavior.
@@ -5958,11 +6158,22 @@ class XiaoaiCloudPlugin {
         if (!this.initPromise) {
             this.initPromise = this.initialize().catch(async (error) => {
                 this.initPromise = undefined;
-                await this.handleInitializationFailure(error).catch((portalError) => {
-                    console.error(
-                        `[XiaoAI Cloud] 生成登录入口失败: ${this.errorMessage(portalError)}`
-                    );
-                });
+                const message = this.errorMessage(error);
+                if (
+                    this.isTransientNetworkError(message) ||
+                    this.isRateLimitedNetworkError(message)
+                ) {
+                    this.lastError = message;
+                    await this.appendDebugTrace("initialization_transient_failure", {
+                        message,
+                    });
+                } else {
+                    await this.handleInitializationFailure(error).catch((portalError) => {
+                        console.error(
+                            `[XiaoAI Cloud] 生成登录入口失败: ${this.errorMessage(portalError)}`
+                        );
+                    });
+                }
                 throw error;
             });
         }
@@ -6018,6 +6229,7 @@ class XiaoaiCloudPlugin {
         }
 
         const gatewayBaseUrls = await discoverGatewayBaseUrls(this.api);
+        const hasGatewayHttpRoute = typeof this.api?.registerHttpRoute === "function";
         const portal = new LoginPortal({
             listenHost: config.authListenHost,
             port: config.authPort,
@@ -6028,7 +6240,7 @@ class XiaoaiCloudPlugin {
                     : undefined,
             gatewayBaseUrls,
             baseUrlHints: this.observedGatewayAuthBaseUrls,
-            standaloneOptional: typeof this.api?.registerHttpRoute === "function",
+            standaloneEnabled: !hasGatewayHttpRoute,
             onPasswordDiscover: async (sessionId, payload) =>
                 this.handlePasswordDiscover(sessionId, payload),
             onPasswordLogin: async (sessionId, payload) =>
@@ -7275,10 +7487,20 @@ class XiaoaiCloudPlugin {
         if (matchedPath.startsWith("/console/open/")) {
             const rawCode = matchedPath.replace(/^\/console\/open\/?/, "");
             const code = decodeURIComponentSafe(rawCode);
-            if (await this.verifyConsoleAccessGrant(code)) {
-                await this.getConsoleAccessToken();
+            const existingAuthorization = await this.resolveConsoleAuthorization(
+                request,
+                requestUrl
+            );
+            if (existingAuthorization.authorized) {
                 this.setConsoleAccessCookie(response, request, config, routePath);
                 sendRedirect(response, `${routePath.replace(/\/+$/, "")}/console`);
+            } else if (await this.verifyConsoleAccessGrant(code)) {
+                const accessToken = await this.getConsoleAccessToken();
+                this.setConsoleAccessCookie(response, request, config, routePath);
+                sendRedirect(
+                    response,
+                    `${routePath.replace(/\/+$/, "")}/console#access_token=${encodeURIComponent(accessToken)}`
+                );
             } else {
                 sendHtml(
                     response,
@@ -9116,7 +9338,19 @@ class XiaoaiCloudPlugin {
             throw new Error("无法确定音箱 model。");
         }
 
-        const spec = await specClient.getSpecForModel(model);
+        let spec = null;
+        try {
+            spec = await specClient.getSpecForModel(model);
+        } catch (error) {
+            const message = this.errorMessage(error);
+            await this.appendDebugTrace("miot_spec_unavailable", {
+                model,
+                message,
+            });
+            console.warn(
+                `[XiaoAI Cloud] MIoT 规格暂时不可用，将使用音箱兼容 fallback: ${message}`
+            );
+        }
         const speakerFeatures = normalizeSpeakerFeaturesForDevice(pickSpeakerFeatures(spec));
 
         return {
@@ -10014,14 +10248,80 @@ class XiaoaiCloudPlugin {
         text: string,
         sessionKey = this.openclawVoiceSessionKey
     ) {
-        void role;
-        void text;
-        void sessionKey;
+        const maxTurns = clamp(
+            Math.round(this.config?.voiceContextMaxTurns ?? DEFAULT_VOICE_CONTEXT_MAX_TURNS),
+            0,
+            MAX_VOICE_CONTEXT_TURNS
+        );
+        const maxChars = clamp(
+            Math.round(this.config?.voiceContextMaxChars ?? DEFAULT_VOICE_CONTEXT_MAX_CHARS),
+            0,
+            MAX_VOICE_CONTEXT_CHARS
+        );
+        if (maxTurns <= 0 || maxChars <= 0) {
+            this.voiceContextTurns = [];
+            return;
+        }
+
+        const normalized =
+            normalizeEventText(typeof text === "string" ? text : "", Math.min(320, maxChars)) ||
+            (typeof text === "string" ? text.trim() : "");
+        if (!normalized || !sessionKey) {
+            return;
+        }
+
+        const turns = this.voiceContextTurns.filter((item) => item.sessionKey === sessionKey);
+        turns.push({
+            sessionKey,
+            role,
+            text: normalized,
+            timeMs: Date.now(),
+        });
+
+        if (turns.length > maxTurns) {
+            const overflowTurns = turns.slice(0, turns.length - maxTurns);
+            this.mergeVoiceContextArchive(sessionKey, overflowTurns, maxChars);
+        }
+        this.voiceContextTurns = turns.slice(-maxTurns);
     }
 
     private buildVoiceContextPrompt(sessionKey: string) {
-        void sessionKey;
-        return "";
+        const maxChars = clamp(
+            Math.round(this.config?.voiceContextMaxChars ?? DEFAULT_VOICE_CONTEXT_MAX_CHARS),
+            0,
+            MAX_VOICE_CONTEXT_CHARS
+        );
+        if (maxChars <= 0) {
+            return "";
+        }
+
+        const turns = this.voiceContextTurns.filter((item) => item.sessionKey === sessionKey);
+        if (turns.length === 0) {
+            return "";
+        }
+
+        const lines = ["最近几轮对话上下文:"];
+        let totalChars = lines[0].length;
+        const archiveLine =
+            this.voiceContextArchiveSessionKey === sessionKey && this.voiceContextArchiveText
+                ? `更早对话摘要: ${this.voiceContextArchiveText}`
+                : "";
+        if (archiveLine && totalChars + archiveLine.length <= maxChars) {
+            lines.push(archiveLine);
+            totalChars += archiveLine.length;
+        }
+
+        for (let index = turns.length - 1; index >= 0; index -= 1) {
+            const turn = turns[index];
+            const line = `${turn.role === "user" ? "用户" : "你刚才播报"}: ${turn.text}`;
+            if (totalChars + line.length > maxChars) {
+                break;
+            }
+            lines.splice(1, 0, line);
+            totalChars += line.length;
+        }
+
+        return lines.length > 1 ? lines.join("\n") : "";
     }
 
     private buildVoiceSessionNotice(options?: { renewVoiceSession?: boolean }) {
@@ -11930,6 +12230,7 @@ class XiaoaiCloudPlugin {
         const relayDir = await this.getAudioRelayStorageDir();
         const filePath = path.join(relayDir, `${relayId}${extension}`);
         await writeFile(filePath, buffer);
+        await chmod(filePath, 0o600).catch(() => undefined);
         return filePath;
     }
 
@@ -11957,6 +12258,8 @@ class XiaoaiCloudPlugin {
             unlink(filePath).catch(() => undefined);
             return undefined;
         }
+
+        await chmod(filePath, 0o600).catch(() => undefined);
 
         return {
             id: relayId,
@@ -12099,17 +12402,18 @@ class XiaoaiCloudPlugin {
         sourceUrl: string,
         options?: { transcodeToMp3?: boolean }
     ) {
+        const normalizedSourceUrl = validateAudioRelayUpstreamUrl(sourceUrl).toString();
         const relayId = randomBytes(12).toString("hex");
-        const localSourceUrl = await this.resolveLocalAudioSourceUrl(sourceUrl);
+        const localSourceUrl = await this.resolveLocalAudioSourceUrl(normalizedSourceUrl);
         const extension = options?.transcodeToMp3
             ? ".mp3"
-            : this.normalizeAudioRelayExtension(sourceUrl);
+            : this.normalizeAudioRelayExtension(normalizedSourceUrl);
         const nowMs = Date.now();
         this.audioRelayEntries.set(relayId, {
             id: relayId,
-            sourceUrl,
+            sourceUrl: normalizedSourceUrl,
             localSourceUrl:
-                localSourceUrl && localSourceUrl !== sourceUrl
+                localSourceUrl && localSourceUrl !== normalizedSourceUrl
                     ? localSourceUrl
                     : undefined,
             extension,
@@ -15131,6 +15435,246 @@ class XiaoaiCloudPlugin {
         return uniqueStrings(candidates);
     }
 
+    private async fetchAudioRelayUpstream(
+        sourceUrl: string,
+        init: RequestInit = {}
+    ): Promise<{ response: Response; finalUrl: string; cleanup: () => void }> {
+        let currentUrl = validateAudioRelayUpstreamUrl(sourceUrl);
+
+        for (let redirectCount = 0; redirectCount <= AUDIO_RELAY_MAX_REDIRECTS; redirectCount += 1) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(
+                () => controller.abort(new Error("音频 relay 上游请求超时。")),
+                AUDIO_RELAY_FETCH_TIMEOUT_MS
+            );
+            const externalSignal = init.signal;
+            const abortFromExternalSignal = () => {
+                controller.abort(externalSignal?.reason);
+            };
+            if (externalSignal) {
+                if (externalSignal.aborted) {
+                    controller.abort(externalSignal.reason);
+                } else {
+                    externalSignal.addEventListener("abort", abortFromExternalSignal, {
+                        once: true,
+                    });
+                }
+            }
+
+            let cleanedUp = false;
+            const cleanup = () => {
+                if (cleanedUp) {
+                    return;
+                }
+                cleanedUp = true;
+                controller.abort();
+                clearTimeout(timeoutId);
+                externalSignal?.removeEventListener("abort", abortFromExternalSignal);
+            };
+            try {
+                const pinnedDnsRecords = await resolveAudioRelayDnsTarget(currentUrl);
+                const response = await this.requestAudioRelayUpstreamWithPinnedDns(
+                    currentUrl,
+                    {
+                        ...init,
+                        signal: controller.signal,
+                    },
+                    pinnedDnsRecords
+                );
+                const location = readString(response.headers.get("location") || undefined);
+                if (
+                    location &&
+                    response.status >= 300 &&
+                    response.status < 400
+                ) {
+                    await response.body?.cancel().catch(() => undefined);
+                    cleanup();
+                    if (redirectCount >= AUDIO_RELAY_MAX_REDIRECTS) {
+                        throw new Error("音频 relay 上游重定向次数过多。");
+                    }
+                    currentUrl = validateAudioRelayUpstreamUrl(
+                        new URL(location, currentUrl).toString()
+                    );
+                    continue;
+                }
+                return {
+                    response,
+                    finalUrl: currentUrl.toString(),
+                    cleanup,
+                };
+            } catch (error) {
+                cleanup();
+                throw error;
+            }
+        }
+
+        throw new Error("音频 relay 上游重定向失败。");
+    }
+
+    private async requestAudioRelayUpstreamWithPinnedDns(
+        url: URL,
+        init: RequestInit,
+        pinnedDnsRecords?: PinnedAudioRelayDnsRecord[]
+    ): Promise<Response> {
+        if (init.body !== undefined && init.body !== null) {
+            throw new Error("音频 relay 上游请求不支持请求体。");
+        }
+
+        const method = readString(init.method)?.toUpperCase() || "GET";
+        const headers = new Headers(init.headers || undefined);
+        headers.delete("host");
+        const requestHeaders = Object.fromEntries(headers.entries());
+        const signal = init.signal;
+
+        return new Promise<Response>((resolve, reject) => {
+            let settled = false;
+            let request: ReturnType<typeof httpRequest> | ReturnType<typeof httpsRequest> | undefined;
+            const settleError = (error: unknown) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                reject(error instanceof Error ? error : new Error(String(error)));
+            };
+            const destroyRequest = () => {
+                const reason = signal?.reason;
+                request?.destroy(
+                    reason instanceof Error
+                        ? reason
+                        : new Error("音频 relay 上游请求已取消。")
+                );
+            };
+            const handleResponse = (incoming: any) => {
+                if (settled) {
+                    incoming.destroy();
+                    return;
+                }
+                settled = true;
+                const responseHeaders = new Headers();
+                for (const [key, value] of Object.entries(incoming.headers || {})) {
+                    if (Array.isArray(value)) {
+                        for (const item of value) {
+                            responseHeaders.append(key, String(item));
+                        }
+                    } else if (value !== undefined) {
+                        responseHeaders.set(key, String(value));
+                    }
+                }
+                const status = Math.max(200, Math.min(599, Number(incoming.statusCode) || 502));
+                const bodyless =
+                    method === "HEAD" || status === 204 || status === 205 || status === 304;
+                if (bodyless) {
+                    incoming.resume();
+                }
+                try {
+                    resolve(
+                        new Response(
+                            bodyless
+                                ? null
+                                : (Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>),
+                            {
+                                status,
+                                statusText: readString(incoming.statusMessage) || "",
+                                headers: responseHeaders,
+                            }
+                        )
+                    );
+                } catch (error) {
+                    incoming.destroy();
+                    reject(error);
+                }
+            };
+
+            const requestOptions: Record<string, any> = {
+                protocol: url.protocol,
+                hostname: url.hostname,
+                port: url.port ? Number(url.port) : undefined,
+                path: `${url.pathname}${url.search}`,
+                method,
+                headers: requestHeaders,
+                ...(pinnedDnsRecords?.length
+                    ? {
+                          lookup: createPinnedAudioRelayLookup(
+                              url.hostname,
+                              pinnedDnsRecords
+                          ),
+                      }
+                    : {}),
+            };
+            if (url.protocol === "https:") {
+                requestOptions.servername = url.hostname;
+            }
+            request =
+                url.protocol === "https:"
+                    ? httpsRequest(requestOptions, handleResponse)
+                    : httpRequest(requestOptions, handleResponse);
+            request.once("error", settleError);
+            if (signal) {
+                if (signal.aborted) {
+                    destroyRequest();
+                    return;
+                }
+                signal.addEventListener("abort", destroyRequest, { once: true });
+            }
+            request.end();
+        });
+    }
+
+    private async readAudioRelayResponseBuffer(response: Response) {
+        const contentLength = Number(response.headers.get("content-length") || 0);
+        if (Number.isFinite(contentLength) && contentLength > AUDIO_RELAY_MAX_BYTES) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new Error("上游音频超过允许的最大体积。");
+        }
+        if (!response.body) {
+            throw new Error("上游音频没有返回内容。");
+        }
+
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        for await (const chunk of response.body as any) {
+            const nextChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            totalBytes += nextChunk.length;
+            if (totalBytes > AUDIO_RELAY_MAX_BYTES) {
+                await response.body.cancel().catch(() => undefined);
+                throw new Error("上游音频超过允许的最大体积。");
+            }
+            chunks.push(nextChunk);
+        }
+        return Buffer.concat(chunks);
+    }
+
+    private async readAudioRelayInputBuffer(sourceUrl: string) {
+        const localPath = normalizeLocalMediaPath(sourceUrl);
+        if (localPath) {
+            const stats = await stat(localPath).catch(() => undefined);
+            if (!stats?.isFile()) {
+                throw new Error("本地音频文件不存在。");
+            }
+            if (stats.size > AUDIO_RELAY_MAX_BYTES) {
+                throw new Error("本地音频超过允许的最大体积。");
+            }
+            return readFile(localPath);
+        }
+
+        const normalized = normalizeRemoteMediaUrl(sourceUrl);
+        if (!normalized) {
+            throw new Error("音频 relay 上游地址无效。");
+        }
+        const { response, cleanup } = await this.fetchAudioRelayUpstream(normalized, {
+            headers: { Accept: "audio/*,*/*;q=0.8" },
+        });
+        try {
+            if (!response.ok) {
+                await response.body?.cancel().catch(() => undefined);
+                throw new Error(`上游音频返回 HTTP ${response.status || 502}。`);
+            }
+            return await this.readAudioRelayResponseBuffer(response);
+        } finally {
+            cleanup();
+        }
+    }
+
     private remoteAudioPreflightAcceptHeader(method: "HEAD" | "GET") {
         return {
             Accept: "audio/*,*/*;q=0.8",
@@ -15148,9 +15692,8 @@ class XiaoaiCloudPlugin {
         let lastError: Error | undefined;
         for (const method of methods) {
             try {
-                const response = await fetch(normalized, {
+                const { response, cleanup } = await this.fetchAudioRelayUpstream(normalized, {
                     method,
-                    redirect: "follow",
                     headers: this.remoteAudioPreflightAcceptHeader(method),
                     signal:
                         typeof AbortSignal !== "undefined" &&
@@ -15158,33 +15701,37 @@ class XiaoaiCloudPlugin {
                             ? AbortSignal.timeout(AUDIO_SOURCE_PREFLIGHT_TIMEOUT_MS)
                             : undefined,
                 });
-                if (response.body) {
-                    response.body.cancel().catch(() => undefined);
-                }
+                try {
+                    if (response.body) {
+                        response.body.cancel().catch(() => undefined);
+                    }
 
-                if (response.status === 404) {
-                    throw new Error("音频源链接返回 404（文件不存在或已失效）。");
-                }
-                if (response.status >= 400 && response.status < 500) {
-                    throw new Error(`音频源链接不可访问（HTTP ${response.status}）。`);
-                }
-                if (response.status >= 500) {
-                    throw new Error(`音频源服务异常（HTTP ${response.status}）。`);
-                }
+                    if (response.status === 404) {
+                        throw new Error("音频源链接返回 404（文件不存在或已失效）。");
+                    }
+                    if (response.status >= 400 && response.status < 500) {
+                        throw new Error(`音频源链接不可访问（HTTP ${response.status}）。`);
+                    }
+                    if (response.status >= 500) {
+                        throw new Error(`音频源服务异常（HTTP ${response.status}）。`);
+                    }
 
-                const contentType = readString(response.headers.get("content-type") || undefined)
-                    ?.toLowerCase();
-                if (
-                    contentType &&
-                    !contentType.includes("audio/") &&
-                    !contentType.includes("application/octet-stream")
-                ) {
-                    throw new Error(
-                        `音频源返回内容类型不是音频：${contentType}`
-                    );
-                }
+                    const contentType = readString(response.headers.get("content-type") || undefined)
+                        ?.toLowerCase();
+                    if (
+                        contentType &&
+                        !contentType.includes("audio/") &&
+                        !contentType.includes("application/octet-stream")
+                    ) {
+                        throw new Error(
+                            `音频源返回内容类型不是音频：${contentType}`
+                        );
+                    }
 
-                return;
+                    return;
+                } finally {
+                    cleanup();
+                }
             } catch (error) {
                 const reason = this.errorMessage(error) || "unknown";
                 const normalizedReason = reason.toLowerCase();
@@ -15269,41 +15816,51 @@ class XiaoaiCloudPlugin {
         if (!ffmpegAvailable) {
             throw new Error("本机缺少 ffmpeg，无法先在本地标准化音频。");
         }
+        const inputBuffer = await this.readAudioRelayInputBuffer(sourceUrl);
+        const inputFormat = this.ffmpegInputFormatForAudioExtension(
+            readAudioSourceExtension(sourceUrl)
+        );
+        const ffmpegArgs = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ];
+        if (inputFormat) {
+            ffmpegArgs.push("-f", inputFormat);
+        }
+        ffmpegArgs.push(
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-af",
+            `apad=pad_dur=${(tailPaddingMs / 1000).toFixed(3)}`,
+            "-f",
+            "mp3",
+            "-codec:a",
+            "libmp3lame",
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            "-b:a",
+            "64k",
+            "-write_xing",
+            "0",
+            "-id3v2_version",
+            "3",
+            "-map_metadata",
+            "-1",
+            "pipe:1"
+        );
 
         const process = spawn(
             "ffmpeg",
-            [
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                sourceUrl,
-                "-vn",
-                "-sn",
-                "-dn",
-                "-af",
-                `apad=pad_dur=${(tailPaddingMs / 1000).toFixed(3)}`,
-                "-f",
-                "mp3",
-                "-codec:a",
-                "libmp3lame",
-                "-ar",
-                "24000",
-                "-ac",
-                "1",
-                "-b:a",
-                "64k",
-                "-write_xing",
-                "0",
-                "-id3v2_version",
-                "3",
-                "-map_metadata",
-                "-1",
-                "pipe:1",
-            ],
+            ffmpegArgs,
             {
-                stdio: ["ignore", "pipe", "pipe"],
+                stdio: ["pipe", "pipe", "pipe"],
             }
         );
 
@@ -15373,6 +15930,9 @@ class XiaoaiCloudPlugin {
                 }
                 resolve(buffer);
             });
+
+            process.stdin.on("error", () => undefined);
+            process.stdin.end(inputBuffer);
         });
     }
 
@@ -15664,6 +16224,8 @@ class XiaoaiCloudPlugin {
             return undefined;
         }
 
+        await chmod(filePath, 0o600).catch(() => undefined);
+
         try {
             const audioBuffer = await readFile(filePath);
             if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
@@ -15708,6 +16270,7 @@ class XiaoaiCloudPlugin {
         );
 
         await writeFile(filePath, audioBuffer);
+        await chmod(filePath, 0o600).catch(() => undefined);
         return filePath;
     }
 
@@ -16409,6 +16972,18 @@ class XiaoaiCloudPlugin {
             return true;
         }
 
+        let inputBuffer: Buffer;
+        try {
+            inputBuffer = await this.readAudioRelayInputBuffer(upstreamSourceUrl);
+        } catch (error) {
+            sendText(
+                response,
+                502,
+                `Failed to fetch upstream audio: ${this.errorMessage(error)}`
+            );
+            return true;
+        }
+
         const process = spawn(
             "ffmpeg",
             [
@@ -16417,7 +16992,7 @@ class XiaoaiCloudPlugin {
                 "-loglevel",
                 "error",
                 "-i",
-                upstreamSourceUrl,
+                "pipe:0",
                 "-vn",
                 "-sn",
                 "-dn",
@@ -16440,7 +17015,7 @@ class XiaoaiCloudPlugin {
                 "pipe:1",
             ],
             {
-                stdio: ["ignore", "pipe", "pipe"],
+                stdio: ["pipe", "pipe", "pipe"],
             }
         );
 
@@ -16516,6 +17091,9 @@ class XiaoaiCloudPlugin {
                         .join(": ")
                 );
             });
+
+            process.stdin.on("error", () => undefined);
+            process.stdin.end(inputBuffer);
         });
     }
 
@@ -16646,6 +17224,30 @@ class XiaoaiCloudPlugin {
         response: any,
         matchedPath: string
     ) {
+        if (this.activeAudioRelayRequests >= AUDIO_RELAY_MAX_CONCURRENT_REQUESTS) {
+            sendText(response, 429, "Too many audio relay requests");
+            return true;
+        }
+        this.activeAudioRelayRequests += 1;
+        try {
+            return await this.handleAudioRelayHttpRouteInternal(
+                request,
+                response,
+                matchedPath
+            );
+        } finally {
+            this.activeAudioRelayRequests = Math.max(
+                0,
+                this.activeAudioRelayRequests - 1
+            );
+        }
+    }
+
+    private async handleAudioRelayHttpRouteInternal(
+        request: any,
+        response: any,
+        matchedPath: string
+    ) {
         const requestMethod = (request.method || "GET").toUpperCase();
         if (requestMethod !== "GET" && requestMethod !== "HEAD") {
             sendText(response, 405, "Method not allowed");
@@ -16743,6 +17345,7 @@ class XiaoaiCloudPlugin {
         }
 
         let upstream: Response;
+        let cleanupUpstream: () => void = () => undefined;
         try {
             const requestHeaders: Record<string, string> = {
                 Accept: readRequestHeader(request, "accept") || "audio/*,*/*;q=0.8",
@@ -16755,17 +17358,19 @@ class XiaoaiCloudPlugin {
             if (ifRangeHeader) {
                 requestHeaders["If-Range"] = ifRangeHeader;
             }
-            upstream = await fetch(upstreamSourceUrl, {
+            const fetched = await this.fetchAudioRelayUpstream(upstreamSourceUrl, {
                 method: requestMethod,
-                redirect: "follow",
                 headers: requestHeaders,
             });
+            upstream = fetched.response;
+            cleanupUpstream = fetched.cleanup;
         } catch (error) {
             sendText(response, 502, `Failed to fetch upstream audio: ${this.errorMessage(error)}`);
             return true;
         }
 
         if (!upstream.ok || (requestMethod === "GET" && !upstream.body)) {
+            cleanupUpstream();
             sendText(
                 response,
                 upstream.status || 502,
@@ -16804,6 +17409,7 @@ class XiaoaiCloudPlugin {
         const contentLength = readNumber(upstream.headers.get("content-length") || undefined);
         if (typeof contentLength === "number" && contentLength > 0) {
             if (contentLength > AUDIO_RELAY_MAX_BYTES) {
+                cleanupUpstream();
                 sendText(response, 413, "Audio file is too large");
                 return true;
             }
@@ -16829,6 +17435,7 @@ class XiaoaiCloudPlugin {
                             )
                     ),
             });
+            cleanupUpstream();
             return true;
         }
 
@@ -16838,6 +17445,7 @@ class XiaoaiCloudPlugin {
                 const nextChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                 totalBytes += nextChunk.length;
                 if (totalBytes > AUDIO_RELAY_MAX_BYTES) {
+                    await upstream.body?.cancel().catch(() => undefined);
                     response.destroy(new Error("Audio relay exceeded max size"));
                     return true;
                 }
@@ -16865,6 +17473,8 @@ class XiaoaiCloudPlugin {
             if (!response.writableEnded) {
                 response.destroy(error instanceof Error ? error : undefined);
             }
+        } finally {
+            cleanupUpstream();
         }
         return true;
     }

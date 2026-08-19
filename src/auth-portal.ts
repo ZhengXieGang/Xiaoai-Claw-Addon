@@ -103,6 +103,8 @@ interface InternalSession extends LoginPortalSessionSnapshot {
 const PENDING_SESSION_TTL_MS = 30 * 60 * 1000;
 const SUCCESS_SESSION_TTL_MS = 10 * 60 * 1000;
 const PORTAL_JSON_BODY_LIMIT_BYTES = 64 * 1024;
+const PORTAL_ACTION_RATE_WINDOW_MS = 60_000;
+const PORTAL_ACTION_RATE_LIMIT = 12;
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT_DIR = path.resolve(MODULE_DIR, "..", "..");
 const STATIC_ASSETS_DIR = path.join(PLUGIN_ROOT_DIR, "assets");
@@ -585,6 +587,10 @@ ${renderSharedHead("XiaoAI Cloud Login", assetBasePath)}
 
 export class LoginPortal {
     private readonly sessions = new Map<string, InternalSession>();
+    private readonly actionRateLimits = new Map<
+        string,
+        { windowStartedAtMs: number; count: number }
+    >();
     private server?: Server;
     private standaloneAvailable = false;
     private baseUrlHints: string[];
@@ -596,7 +602,7 @@ export class LoginPortal {
         routeBasePath?: string;
         gatewayBaseUrls?: string[];
         baseUrlHints?: string[];
-        standaloneOptional?: boolean;
+        standaloneEnabled?: boolean;
         onPasswordDiscover: (
             sessionId: string,
             payload: LoginSubmission
@@ -622,6 +628,10 @@ export class LoginPortal {
         if (this.server) {
             return;
         }
+        if (this.options.standaloneEnabled === false) {
+            this.standaloneAvailable = false;
+            return;
+        }
         const server = createServer((request, response) => {
             this.handleRequest(request, response).catch((error) => {
                 sendJson(
@@ -636,10 +646,6 @@ export class LoginPortal {
             const handleError = (error: Error) => {
                 server.off("error", handleError);
                 this.server = undefined;
-                if (this.options.standaloneOptional) {
-                    resolve();
-                    return;
-                }
                 reject(error);
             };
 
@@ -655,6 +661,7 @@ export class LoginPortal {
     async stop() {
         const server = this.server;
         if (!server) {
+            this.standaloneAvailable = false;
             return;
         }
         this.server = undefined;
@@ -672,6 +679,26 @@ export class LoginPortal {
 
     private touchSession(session: InternalSession, ttlMs = PENDING_SESSION_TTL_MS) {
         session.expiresAt = new Date(Date.now() + ttlMs).toISOString();
+    }
+
+    private isActionRateLimited(request: IncomingMessage) {
+        const key = request.socket.remoteAddress || "unknown";
+        const nowMs = Date.now();
+        for (const [address, state] of this.actionRateLimits.entries()) {
+            if (nowMs - state.windowStartedAtMs >= PORTAL_ACTION_RATE_WINDOW_MS) {
+                this.actionRateLimits.delete(address);
+            }
+        }
+        const current = this.actionRateLimits.get(key);
+        if (!current || nowMs - current.windowStartedAtMs >= PORTAL_ACTION_RATE_WINDOW_MS) {
+            this.actionRateLimits.set(key, {
+                windowStartedAtMs: nowMs,
+                count: 1,
+            });
+            return false;
+        }
+        current.count += 1;
+        return current.count > PORTAL_ACTION_RATE_LIMIT;
     }
 
     private tryRespondWithExistingActionState(
@@ -745,7 +772,11 @@ export class LoginPortal {
         this.pruneExpiredSessions();
         const id = randomId(12);
         const baseUrls = this.computeBaseUrls(options?.preferredBaseUrls);
-        const primaryUrl = `${baseUrls[0]}/auth/${id}`;
+        const fallbackBase = this.options.routeBasePath
+            ? normalizeHttpPath(this.options.routeBasePath)
+            : "";
+        const resolvedBaseUrls = baseUrls.length > 0 ? baseUrls : [fallbackBase];
+        const primaryUrl = `${resolvedBaseUrls[0].replace(/\/+$/, "")}/auth/${id}`;
 
         const session: InternalSession = {
             id,
@@ -753,7 +784,9 @@ export class LoginPortal {
             createdAt: new Date().toISOString(),
             expiresAt: new Date(Date.now() + PENDING_SESSION_TTL_MS).toISOString(),
             primaryUrl,
-            allUrls: baseUrls.map((item) => `${item}/auth/${id}`),
+            allUrls: resolvedBaseUrls.map(
+                (item) => `${item.replace(/\/+$/, "")}/auth/${id}`
+            ),
             seed,
         };
         this.sessions.set(id, session);
@@ -894,10 +927,12 @@ export class LoginPortal {
             }
         }
 
+        const standaloneEnabled = this.options.standaloneEnabled !== false;
         if (
-            this.server ||
-            this.standaloneAvailable ||
-            (preferred.length === 0 && direct.length === 0 && loopback.length === 0)
+            standaloneEnabled &&
+            (this.server ||
+                this.standaloneAvailable ||
+                (preferred.length === 0 && direct.length === 0 && loopback.length === 0))
         ) {
             const hosts = getCandidateHosts(this.options.listenHost);
             for (const host of hosts) {
@@ -1078,6 +1113,15 @@ export class LoginPortal {
         }
 
         const action = matches[2] || "";
+        if (request.method === "POST" && action && this.isActionRateLimited(request)) {
+            await this.trace("portal_action_rate_limited", {
+                ...this.requestMeta(request, matchedPath, session.id, action),
+            });
+            sendJson(response, 429, {
+                error: "操作过于频繁，请稍后再试。",
+            });
+            return;
+        }
         if (isReadOnlyRequest && action === "") {
             this.touchSession(session);
             await this.trace("portal_page_open", {
@@ -1114,9 +1158,13 @@ export class LoginPortal {
         }
 
         if (request.method === "POST" && action === "discover/password") {
+            if (this.tryRespondWithExistingActionState(response, session, action)) {
+                return;
+            }
             const body = await readJsonBody(request);
             this.touchSession(session);
             session.status = "processing";
+            session.activeAction = action;
             session.message = "正在发现设备…";
             session.error = undefined;
             session.verification = undefined;
@@ -1141,6 +1189,7 @@ export class LoginPortal {
                 session.verification = "verification" in result ? result.verification : undefined;
                 session.status = "pending";
                 session.message = result.message;
+                session.activeAction = undefined;
                 this.touchSession(session);
                 await this.trace("portal_action_success", {
                     ...this.requestMeta(request, matchedPath, session.id, action),
@@ -1154,6 +1203,7 @@ export class LoginPortal {
                 sendJson(response, 200, this.toPublicSnapshot(session));
             } catch (error) {
                 session.status = "error";
+                session.activeAction = undefined;
                 session.error = error instanceof Error ? error.message : String(error);
                 this.touchSession(session);
                 await this.trace("portal_action_error", {

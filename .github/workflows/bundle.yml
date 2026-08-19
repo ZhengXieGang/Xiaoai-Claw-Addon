@@ -250,15 +250,23 @@ jobs:
           if (plugin.id !== pkg.name) {
             throw new Error(`Plugin id ${plugin.id} does not match package name ${pkg.name}`);
           }
-          const extensions = pkg.openclaw && Array.isArray(pkg.openclaw.extensions)
-            ? pkg.openclaw.extensions
+          const openclaw = pkg.openclaw || {};
+          const extensions = Array.isArray(openclaw.extensions) ? openclaw.extensions : [];
+          const runtimeExtensions = Array.isArray(openclaw.runtimeExtensions)
+            ? openclaw.runtimeExtensions
             : [];
           if (extensions.length === 0) {
             throw new Error("Missing package.json openclaw.extensions");
           }
-          for (const extension of extensions) {
+          if (runtimeExtensions.length > 0 && runtimeExtensions.length !== extensions.length) {
+            throw new Error(
+              `package.json openclaw.runtimeExtensions length (${runtimeExtensions.length}) must match openclaw.extensions length (${extensions.length})`
+            );
+          }
+          const entriesToCheck = runtimeExtensions.length > 0 ? runtimeExtensions : extensions;
+          for (const extension of entriesToCheck) {
             if (!fs.existsSync(path.join(root, extension))) {
-              throw new Error(`Missing OpenClaw extension file: ${extension}`);
+              throw new Error(`Missing OpenClaw runtime extension file: ${extension}`);
             }
           }
           if (!pkg.openclaw.compat || !pkg.openclaw.build) {
@@ -360,7 +368,7 @@ jobs:
             }
           }
 
-          node -e "const fs = require('node:fs'); const path = require('node:path'); const root = process.argv[1]; const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); const plugin = JSON.parse(fs.readFileSync(path.join(root, 'openclaw.plugin.json'), 'utf8')); if (pkg.name !== 'openclaw-plugin-xiaoai-cloud') throw new Error('Unexpected package name: ' + pkg.name); if (plugin.id !== pkg.name) throw new Error('Plugin id mismatch'); const extensions = pkg.openclaw && Array.isArray(pkg.openclaw.extensions) ? pkg.openclaw.extensions : []; if (extensions.length === 0) throw new Error('Missing openclaw.extensions'); for (const extension of extensions) { if (!fs.existsSync(path.join(root, extension))) throw new Error('Missing OpenClaw extension file: ' + extension); } if (!pkg.openclaw.compat || !pkg.openclaw.build) throw new Error('Missing OpenClaw ClawHub compatibility metadata');" "$root"
+          node -e "const fs = require('node:fs'); const path = require('node:path'); const root = process.argv[1]; const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); const plugin = JSON.parse(fs.readFileSync(path.join(root, 'openclaw.plugin.json'), 'utf8')); if (pkg.name !== 'openclaw-plugin-xiaoai-cloud') throw new Error('Unexpected package name: ' + pkg.name); if (plugin.id !== pkg.name) throw new Error('Plugin id mismatch'); const openclaw = pkg.openclaw || {}; const extensions = Array.isArray(openclaw.extensions) ? openclaw.extensions : []; const runtimeExtensions = Array.isArray(openclaw.runtimeExtensions) ? openclaw.runtimeExtensions : []; if (extensions.length === 0) throw new Error('Missing openclaw.extensions'); if (runtimeExtensions.length > 0 && runtimeExtensions.length !== extensions.length) throw new Error('runtimeExtensions length must match extensions length'); const entriesToCheck = runtimeExtensions.length > 0 ? runtimeExtensions : extensions; for (const extension of entriesToCheck) { if (!fs.existsSync(path.resolve(root, extension))) throw new Error('Missing OpenClaw runtime extension file: ' + extension); } if (!openclaw.compat || !openclaw.build) throw new Error('Missing OpenClaw ClawHub compatibility metadata');" "$root"
 
       - name: Smoke test extracted Windows helpers
         shell: powershell

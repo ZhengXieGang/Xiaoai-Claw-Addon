@@ -338,9 +338,16 @@ detect_package_manager() {
 }
 
 ensure_supported_node() {
-  node_major=$(node -p "Number(process.versions.node.split('.')[0] || 0)")
-  if [ "$node_major" -lt 22 ]; then
-    error "Node.js $(node -p 'process.versions.node') is too old. OpenClaw 官方文档要求插件环境使用 Node.js 22 或更高版本。"
+  if ! node -e '
+const [major, minor, patch] = process.versions.node.split(".").map(Number);
+const supported =
+  (major === 22 && (minor > 22 || (minor === 22 && patch >= 3))) ||
+  (major === 24 && minor >= 15) ||
+  (major === 25 && minor >= 9) ||
+  major > 25;
+process.exit(supported ? 0 : 1);
+' >/dev/null 2>&1; then
+    error "Node.js $(node -p 'process.versions.node') is not supported. OpenClaw 官方支持 Node.js 22.22.3+, 24.15+, 或 25.9+（不含 23.x 和早于 24.15 的 24.x）。"
     exit 1
   fi
 }

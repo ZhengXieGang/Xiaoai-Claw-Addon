@@ -220,13 +220,6 @@ function initAccessPage() {
 
   if (accessToken) {
     accessTokenInput.value = accessToken;
-    persistConsoleAccessToken(accessToken);
-  }
-
-  if (accessForm) {
-    accessForm.addEventListener("submit", () => {
-      persistConsoleAccessToken(accessTokenInput.value || "");
-    });
   }
 
   if (accessToken && accessForm) {
@@ -266,10 +259,6 @@ function initConsolePage() {
     hashParams.get("access_token") ||
     readPersistedConsoleAccessToken() ||
     "";
-
-  if (consoleAccessToken) {
-    persistConsoleAccessToken(consoleAccessToken);
-  }
 
   stripConsoleAccessTokenFromUrl(locationUrl);
 
@@ -2417,6 +2406,12 @@ function initConsolePage() {
         payload,
         status: response.status,
       });
+    }
+
+    // Persist only after the server accepts the token. This prevents a typo
+    // pasted into a query/hash URL from overwriting a previously valid token.
+    if (consoleAccessToken) {
+      persistConsoleAccessToken(consoleAccessToken);
     }
 
     return payload;

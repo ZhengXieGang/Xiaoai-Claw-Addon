@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/OpenClaw-Plugin-1f6feb?style=flat-square" alt="OpenClaw Plugin">
-  <img src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 22+">
+  <img src="https://img.shields.io/badge/Node.js-22.22.3%2B%20%7C%2024.15%2B%20%7C%2025.9%2B-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 22.22.3+ | 24.15+ | 25.9+">
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178c6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript 5">
 </p>
 
@@ -212,9 +212,11 @@ uninstall.cmd
 
 #### 环境要求（安装过程中会自动安装依赖）
 - Openclaw 2026.03.24 +
-- Node.js `>= 22`
+- Node.js `22.22.3+`、`24.15+` 或 `25.9+`（OpenClaw 官方支持范围；不含 `23.x` 和早于 `24.15` 的 `24.x`）
 - 可执行的 `openclaw` CLI
 - 建议安装 Python 3 + `requests`
+
+登录入口在支持 `registerHttpRoute` 的 OpenClaw 上通过 Gateway 路由提供，插件不会另外启动明文 HTTP 端口。旧版宿主只能使用独立回退入口时，默认仅监听 `127.0.0.1`；需要远程访问时请放在 HTTPS 反向代理后，不要把 `authPort` 直接暴露到公网。
 
 <details>
 <summary><strong>CLI 登录调试</strong></summary>

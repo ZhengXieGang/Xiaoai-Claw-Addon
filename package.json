@@ -48,6 +48,9 @@
   ],
   "openclaw": {
     "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
       "./dist/index.js"
     ],
     "compat": {
@@ -71,7 +74,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   },
   "dependencies": {
     "json5": "^2.2.3"

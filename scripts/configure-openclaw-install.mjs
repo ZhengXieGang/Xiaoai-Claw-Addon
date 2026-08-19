@@ -175,11 +175,18 @@ function isRecord(value) {
 }
 
 function ensureSupportedNodeVersion() {
-    const major = Number.parseInt(String(process.versions.node || "0").split(".")[0] || "0", 10);
-    if (!Number.isFinite(major) || major < 22) {
+    const [major, minor, patch] = String(process.versions.node || "0")
+        .split(".")
+        .map(Number);
+    const supported =
+        (major === 22 && (minor > 22 || (minor === 22 && patch >= 3))) ||
+        (major === 24 && minor >= 15) ||
+        (major === 25 && minor >= 9) ||
+        major > 25;
+    if (!supported) {
         fail(
-            `[install] Node.js ${process.versions.node || "unknown"} is too old. ` +
-                "OpenClaw 官方文档要求插件环境使用 Node.js 22 或更高版本。"
+            `[install] Node.js ${process.versions.node || "unknown"} is not supported. ` +
+                "OpenClaw 官方支持 Node.js 22.22.3+、24.15+ 或 25.9+（不含 23.x 和早于 24.15 的 24.x）。"
         );
     }
 }

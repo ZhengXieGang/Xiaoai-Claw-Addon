@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { randomBytes } from "crypto";
 
 const CLOUD_LOGIN_SIDS = ["xiaomiio", "micoapi"];
 const DEFAULT_SERVER_COUNTRY = process.env.XIAOAI_SERVER_COUNTRY || "cn";
@@ -199,7 +200,23 @@ async function readJsonFile(filePath) {
 
 async function writeJsonFile(filePath, payload) {
     await ensureDirForFile(filePath);
-    await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    const content = `${JSON.stringify(payload, null, 2)}\n`;
+    const temporaryPath = `${filePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+        await fs.writeFile(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+        await fs.chmod(temporaryPath, 0o600).catch(() => undefined);
+        try {
+            await fs.rename(temporaryPath, filePath);
+        } catch (error) {
+            if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+                throw error;
+            }
+            await fs.writeFile(filePath, content, { encoding: "utf8", mode: 0o600 });
+        }
+    } finally {
+        await fs.unlink(temporaryPath).catch(() => undefined);
+    }
+    await fs.chmod(filePath, 0o600).catch(() => undefined);
 }
 
 function normalizeMethod(method) {

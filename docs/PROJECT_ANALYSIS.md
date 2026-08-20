@@ -46,7 +46,7 @@
 4. 把插件安装到当前 OpenClaw 正在使用的 state dir 对应扩展目录。
 5. 自动为小爱创建或校正专属 `xiaoai` agent。
 6. 自动修复插件 allowlist 和工具 allowlist。
-7. 自动补装 OpenClaw 宿主运行时缺失的依赖，例如 Telegram / Slack / Bedrock 相关包。
+7. 解析 OpenClaw npm 包目录，用于读取官方 workspace 模板；不修改宿主依赖树，插件自身依赖只安装在插件目录内。
 8. 自动把插件目录 owner 修正到当前安装用户，避免安装后出现权限问题。
 9. 支持 `plugins install --force` 时用它覆盖已有插件；旧版 OpenClaw 仅允许首次普通安装，已有插件时停止流程，不主动删除旧插件目录或配置。
 10. 在 OpenClaw 新版本存在危险代码拦截时，根据 CLI 官方能力自动决定是否带上 `--dangerously-force-unsafe-install`。

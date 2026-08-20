@@ -59,6 +59,7 @@ jobs:
           node scripts/configure-openclaw-uninstall.mjs --help >/dev/null
           node --check scripts/xiaomi-login-cli.mjs
           node --check scripts/probe-xiaomi-status.mjs
+          node tests/configure-install-contract.mjs
           node tests/install-overwrite-contract.mjs
 
   verify-windows:
@@ -91,6 +92,7 @@ jobs:
           node scripts\configure-openclaw-install.mjs --help >NUL
           node scripts\configure-openclaw-uninstall.mjs --help >NUL
           node --check scripts\xiaomi-login-cli.mjs
+          node tests\configure-install-contract.mjs
           node tests\install-overwrite-contract.mjs
 
   bundle:

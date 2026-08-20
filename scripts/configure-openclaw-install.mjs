@@ -12,14 +12,6 @@ let INSTALL_LOG_FILE = process.env.XIAOAI_INSTALL_LOG_FILE || "";
 const INSTALL_LOG_CAPTURED = process.env.XIAOAI_INSTALL_LOG_CAPTURED === "1";
 const localRequire = createRequire(import.meta.url);
 let cachedJson5 = null;
-const HOST_RUNTIME_DEPENDENCIES = [
-    { name: "@slack/web-api", spec: "@slack/web-api@7.15.0" },
-    { name: "@slack/bolt", spec: "@slack/bolt@4.6.0" },
-    { name: "grammy", spec: "grammy@1.41.1" },
-    { name: "@grammyjs/runner", spec: "@grammyjs/runner@2.0.3" },
-    { name: "@grammyjs/transformer-throttler", spec: "@grammyjs/transformer-throttler@1.2.1" },
-    { name: "@aws-sdk/client-bedrock", spec: "@aws-sdk/client-bedrock@3.1021.0" },
-];
 const REQUIRED_XIAOAI_TOOLS = [
     "xiaoai_speak",
     "xiaoai_play_audio",
@@ -113,7 +105,7 @@ Options:
   --openclaw-bin CMD  OpenClaw CLI command path (default: openclaw)
   --log-file PATH     Persist configure-stage log to PATH
   --openclaw-package-dir DIR
-                      Override the detected OpenClaw npm package directory
+                      Override the detected OpenClaw npm package directory used for workspace templates
   --help              Show this help message`);
 }
 
@@ -383,99 +375,20 @@ function resolveOpenclawPackageDir(options) {
     };
 }
 
-function listMissingHostRuntimeDependencies(packageDir) {
-    const result = runCommand(
-        process.execPath,
-        [
-            "-e",
-            `
-const { createRequire } = require("module");
-const path = require("path");
-const req = createRequire(path.join(process.cwd(), "package.json"));
-const dependencies = ${JSON.stringify(HOST_RUNTIME_DEPENDENCIES.map((item) => item.name))};
-const missing = [];
-for (const dependency of dependencies) {
-  try {
-    req.resolve(dependency);
-  } catch {
-    missing.push(dependency);
-  }
-}
-process.stdout.write(JSON.stringify(missing));
-            `.trim(),
-        ],
-        { cwd: packageDir }
-    );
-
-    if (result.error || (result.status ?? 1) !== 0) {
-        fail(
-            `[install] Failed to inspect OpenClaw host runtime dependencies in ${packageDir}.${
-                result.error ? ` ${result.error.message}` : ""
-            }`
-        );
-    }
-
-    return parseJsonFromCliOutput(result.stdout, []);
-}
-
-function ensureOpenclawHostRuntimeDependencies(options) {
+function resolveOpenclawHostRuntime(options) {
     const { packageDir, candidates } = resolveOpenclawPackageDir(options);
     if (!packageDir) {
         fail(
             "[install] Unable to locate the active OpenClaw npm package directory. " +
-                "Please pass --openclaw-package-dir DIR and point it at the installed openclaw package.\n" +
+                "Please pass --openclaw-package-dir DIR and point it at the installed openclaw package so workspace templates can be read.\n" +
                 `Candidates checked: ${candidates.length > 0 ? candidates.join(", ") : "<none>"}`
         );
     }
-    logInfo(`[install] OpenClaw npm package dir: ${packageDir}`);
-
-    const missingBefore = listMissingHostRuntimeDependencies(packageDir);
-    if (!Array.isArray(missingBefore) || missingBefore.length === 0) {
-        logInfo("[install] OpenClaw host runtime dependencies already satisfied.");
-        return {
-            packageDir,
-            installed: false,
-            missingBefore: [],
-        };
-    }
-    logWarn(
-        `[install] Missing host runtime dependencies detected: ${missingBefore.join(", ")}`
+    logInfo(
+        `[install] OpenClaw npm package dir for official workspace templates: ${packageDir}`
     );
-
-    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-    const installResult = runCommand(
-        npmCommand,
-        ["install", "--no-save", ...HOST_RUNTIME_DEPENDENCIES.map((item) => item.spec)],
-        {
-            cwd: packageDir,
-            capture: false,
-        }
-    );
-
-    if (installResult.error) {
-        fail(
-            `[install] Failed to install OpenClaw host runtime dependencies in ${packageDir}: ` +
-                installResult.error.message
-        );
-    }
-    if ((installResult.status ?? 1) !== 0) {
-        fail(
-            `[install] Failed to install OpenClaw host runtime dependencies in ${packageDir}. ` +
-                "If OpenClaw was installed system-wide, rerun the installer with the same owner / permissions as that OpenClaw installation."
-        );
-    }
-
-    const missingAfter = listMissingHostRuntimeDependencies(packageDir);
-    if (Array.isArray(missingAfter) && missingAfter.length > 0) {
-        fail(
-            `[install] OpenClaw host runtime dependencies are still missing after install: ${missingAfter.join(", ")}`
-        );
-    }
-
     return {
         packageDir,
-        installed: true,
-        missingBefore,
     };
 }
 
@@ -1109,7 +1022,7 @@ function configureOpenclaw(options) {
         `[install] configure-openclaw-install started: profile=${options.profile || "<default>"}, stateDir=${options.stateDir || "<default>"}, agent=${options.agentId}, plugin=${options.pluginId}`
     );
     const runOpenclaw = createRunner(options);
-    const hostRuntime = ensureOpenclawHostRuntimeDependencies(options);
+    const hostRuntime = resolveOpenclawHostRuntime(options);
     const configFile = expandHome(extractCliTextLine(runOpenclaw(["config", "file"]).stdout));
     if (!configFile) {
         fail("[install] Unable to determine the active OpenClaw config file path.");

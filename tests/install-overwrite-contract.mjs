@@ -92,14 +92,21 @@ if (process.platform === "win32") {
   writeFileSync(windowsFakeOpenclaw, fakeOpenclawScript, "utf8");
 
   function runWindowsInstaller({ traceFile, uninstallFile, installFile, logFile, env }) {
-    const command = [
-      `call \"${join(windowsSourceDir, "install.cmd")}\"`,
+    const commandArgs = [
+      "/d",
+      "/s",
+      "/c",
+      "call",
+      `\"${join(windowsSourceDir, "install.cmd")}\"`,
       "--skip-npm-install",
-      `--openclaw-bin \"${windowsFakeOpenclaw}\"`,
-      `--state-dir \"${windowsStateDir}\"`,
-      `--log-file \"${logFile}\"`,
-    ].join(" ");
-    return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
+      "--openclaw-bin",
+      `\"${windowsFakeOpenclaw}\"`,
+      "--state-dir",
+      `\"${windowsStateDir}\"`,
+      "--log-file",
+      `\"${logFile}\"`,
+    ];
+    return spawnSync(process.env.ComSpec || "cmd.exe", commandArgs, {
       cwd: windowsSourceDir,
       encoding: "utf8",
       // cmd.exe parses its own quoting rules and does not understand the
@@ -143,7 +150,13 @@ if (process.platform === "win32") {
   assert.equal(
     existsSync(failedInstallFile),
     true,
-    "install.cmd must attempt the force install",
+    [
+      "install.cmd must attempt the force install",
+      `status=${failedInstallResult.status}`,
+      `error=${failedInstallResult.error?.message || ""}`,
+      `stdout=${failedInstallResult.stdout || ""}`,
+      `stderr=${failedInstallResult.stderr || ""}`,
+    ].join("\n"),
   );
   assert.match(readFileSync(failedInstallTraceFile, "utf8"), /plugins install --force/iu);
 

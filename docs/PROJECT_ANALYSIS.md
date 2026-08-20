@@ -190,6 +190,10 @@ assets/ui/xiaoai-console.js
 assets/ui/xiaoai-console.css
 install.sh
 install.cmd
+scripts/install/install.sh
+scripts/install/install.cmd
+scripts/install/uninstall.sh
+scripts/install/uninstall.cmd
 scripts/configure-openclaw-install.mjs
 ```
 
@@ -218,7 +222,9 @@ scripts/configure-openclaw-install.mjs
 - `src/openclaw-agent-wrapper.ts`
   对 OpenClaw CLI 输出做包装，尽量拿到稳定摘要。这同样属于 OpenClaw adapter 能力。
 - `install.sh` / `install.cmd`
-  用户安装入口。
+  用户安装入口，只保留兼容转发逻辑，实际实现位于 `scripts/install/`。
+- `uninstall.sh` / `uninstall.cmd`
+  用户卸载入口，只保留兼容转发逻辑，实际实现位于 `scripts/install/`。
 - `scripts/configure-openclaw-install.mjs`
   安装后自动配置专属 agent、workspace、工具 allowlist。
 

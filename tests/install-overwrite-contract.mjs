@@ -13,9 +13,12 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const linuxInstaller = readFileSync(join(repositoryRoot, "install.sh"), "utf8");
+const linuxInstaller = readFileSync(
+  join(repositoryRoot, "scripts", "install", "install.sh"),
+  "utf8",
+);
 const windowsInstaller = readFileSync(
-  join(repositoryRoot, "install.cmd"),
+  join(repositoryRoot, "scripts", "install", "install.cmd"),
   "utf8",
 );
 

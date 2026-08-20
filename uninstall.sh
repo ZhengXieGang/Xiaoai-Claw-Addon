@@ -2,38 +2,86 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+IMPLEMENTATION="$SCRIPT_DIR/scripts/install/uninstall.sh"
+if [ -f "$IMPLEMENTATION" ]; then
+  export XIAOAI_PROJECT_ROOT="$SCRIPT_DIR"
+  exec sh "$IMPLEMENTATION" "$@"
+fi
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "Missing required command: node" >&2
+if [ -f "$SCRIPT_DIR/scripts/configure-openclaw-uninstall.mjs" ]; then
+  export XIAOAI_PROJECT_ROOT="$SCRIPT_DIR"
+  exec node "$SCRIPT_DIR/scripts/configure-openclaw-uninstall.mjs" "$@"
+fi
+
+find_release_archive() {
+  for candidate in \
+    "$SCRIPT_DIR"/openclaw-plugin-xiaoai-cloud-bundle.zip \
+    "$SCRIPT_DIR"/openclaw-plugin-xiaoai-cloud-*.zip \
+    "$SCRIPT_DIR"/openclaw-plugin-xiaoai-cloud-bundle.tar.gz \
+    "$SCRIPT_DIR"/openclaw-plugin-xiaoai-cloud-*.tgz \
+    "$SCRIPT_DIR"/openclaw-plugin-xiaoai-cloud-*.tar.gz
+  do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+}
+
+archive=$(find_release_archive || true)
+if [ -z "$archive" ]; then
+  echo "Missing uninstaller implementation: $IMPLEMENTATION" >&2
+  echo "Run uninstall.sh from a complete Release bundle or repository checkout." >&2
   exit 1
 fi
 
-append_node_path_entry() {
-  candidate="$1"
-  if [ -z "$candidate" ] || [ ! -d "$candidate" ]; then
-    return 0
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/xiaoai-uninstall-entry.XXXXXX")
+cleanup() { rm -rf "$temp_dir"; }
+trap cleanup EXIT HUP INT TERM
+case "$archive" in
+  *.zip)
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q "$archive" -d "$temp_dir"
+    elif command -v bsdtar >/dev/null 2>&1; then
+      bsdtar -xf "$archive" -C "$temp_dir"
+    elif command -v python3 >/dev/null 2>&1; then
+      python3 - "$archive" "$temp_dir" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as zf:
+    zf.extractall(sys.argv[2])
+PY
+    else
+      echo "Missing required command to extract zip archive: unzip / bsdtar / python3" >&2
+      exit 1
+    fi
+    ;;
+  *.tar.gz|*.tgz)
+    tar -xzf "$archive" -C "$temp_dir"
+    ;;
+  *)
+    echo "Unsupported release bundle archive: $archive" >&2
+    exit 1
+    ;;
+esac
+
+bundle_root=""
+for candidate in \
+  "$temp_dir/openclaw-plugin-xiaoai-cloud" \
+  "$temp_dir/package" \
+  "$temp_dir"
+do
+  if [ -f "$candidate/scripts/install/uninstall.sh" ] || [ -f "$candidate/uninstall.sh" ]; then
+    bundle_root="$candidate"
+    break
   fi
-  case ":${NODE_PATH:-}:" in
-    *":$candidate:"*)
-      ;;
-    *)
-      NODE_PATH="${NODE_PATH:+$NODE_PATH:}$candidate"
-      ;;
-  esac
-}
-
-append_node_path_entry "$SCRIPT_DIR/node_modules"
-if command -v npm >/dev/null 2>&1; then
-  npm_root=$(npm root -g 2>/dev/null || true)
-  append_node_path_entry "$npm_root"
-fi
-node_global_paths=$(node -p "require('module').globalPaths.join(':')" 2>/dev/null || true)
-old_ifs=$IFS
-IFS=:
-for candidate in $node_global_paths; do
-  append_node_path_entry "$candidate"
 done
-IFS=$old_ifs
-export NODE_PATH
-
-exec node "$SCRIPT_DIR/scripts/configure-openclaw-uninstall.mjs" "$@"
+if [ -z "$bundle_root" ]; then
+  echo "Failed to locate an uninstaller in $archive" >&2
+  exit 1
+fi
+export XIAOAI_PROJECT_ROOT="$bundle_root"
+if [ -f "$bundle_root/scripts/install/uninstall.sh" ]; then
+  sh "$bundle_root/scripts/install/uninstall.sh" "$@"
+else
+  sh "$bundle_root/uninstall.sh" "$@"
+fi

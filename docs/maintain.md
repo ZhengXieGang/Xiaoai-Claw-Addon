@@ -550,5 +550,5 @@ flowchart TB
 - 改控制台前，检查 `renderConsolePage()`、`assets/ui/xiaoai-console.js`、`handleConsoleHttpRoute()` 三处是否一致。
 - 改音频播放前，检查 `playAudioUrl()`、relay route、`verifySpeakerPlaybackStarted()`、loop guard 四条链路。
 - 改会话转发前，检查 `forwardToOpenclaw()`、`deliverAgentPrompt()`、`handleOpenclawFinalPayloads()`、`recordVoiceContextTurn()`。
-- 改安装和发布前，检查 `package.json files`、`openclaw.plugin.json`、`install.sh`、`scripts/configure-openclaw-install.mjs`、GitHub Action。
+- 改安装和发布前，检查 `package.json files`、`openclaw.plugin.json`、根目录兼容入口、`scripts/install/` 实现、`scripts/configure-openclaw-install.mjs`、GitHub Action。
 - 做跨宿主适配前，先读 `CROSS_CLAW_ADAPTATION_PLAN.md`，不要直接让新宿主加载 OpenClaw 插件入口。

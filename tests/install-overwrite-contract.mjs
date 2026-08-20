@@ -63,7 +63,7 @@ if (process.platform === "win32") {
     "@echo off",
     "if not \"%XIAOAI_TRACE_FILE%\"==\"\" >> \"%XIAOAI_TRACE_FILE%\" echo %*",
     "if /i \"%~1\"==\"--version\" (",
-    "  echo OpenClaw 2026.7.1 ^(contract-test^)",
+    "  echo OpenClaw 2026.7.1",
     "  exit /b 0",
     ")",
     "if /i \"%~1\"==\"plugins\" if /i \"%~2\"==\"install\" if /i \"%~3\"==\"--help\" (",
@@ -102,6 +102,9 @@ if (process.platform === "win32") {
     return spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
       cwd: windowsSourceDir,
       encoding: "utf8",
+      // cmd.exe parses its own quoting rules and does not understand the
+      // backslash escaping Node normally adds for Windows argv values.
+      windowsVerbatimArguments: true,
       env: {
         ...process.env,
         XIAOAI_TRACE_FILE: traceFile,

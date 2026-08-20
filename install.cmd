@@ -435,7 +435,7 @@ if not defined OPENCLAW_VERSION_OUTPUT (
   echo Failed to detect OpenClaw version from %OPENCLAW_BIN%.
   exit /b 1
 )
-node -e "const raw=(process.argv[1]||'').trim(); const min=[2026,3,24]; const match=raw.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/); if (!match) process.exit(2); const current=match.slice(1).map(Number); for (let i=0; i<min.length; i+=1) { if (current[i] > min[i]) process.exit(0); if (current[i] < min[i]) process.exit(1); } process.exit(0);" "%OPENCLAW_VERSION_OUTPUT%" >nul 2>nul
+node -e "const raw=String(process.argv[1]??'').trim(); const min=[2026,3,24]; const match=raw.match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/); if (match===null) process.exit(2); const current=match.slice(1).map(Number); for (let i=0; i<min.length; i+=1) { const delta=current[i]-min[i]; if (delta) process.exit(Math.sign(delta)===-1?1:0); } process.exit(0);" "%OPENCLAW_VERSION_OUTPUT%" >nul 2>nul
 set "OPENCLAW_VERSION_STATUS=%ERRORLEVEL%"
 if "%OPENCLAW_VERSION_STATUS%"=="0" exit /b 0
 if "%OPENCLAW_VERSION_STATUS%"=="2" (

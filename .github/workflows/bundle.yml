@@ -59,6 +59,7 @@ jobs:
           node scripts/configure-openclaw-uninstall.mjs --help >/dev/null
           node --check scripts/xiaomi-login-cli.mjs
           node --check scripts/probe-xiaomi-status.mjs
+          node tests/install-overwrite-contract.mjs
 
   verify-windows:
     runs-on: windows-latest
@@ -90,6 +91,7 @@ jobs:
           node scripts\configure-openclaw-install.mjs --help >NUL
           node scripts\configure-openclaw-uninstall.mjs --help >NUL
           node --check scripts\xiaomi-login-cli.mjs
+          node tests\install-overwrite-contract.mjs
 
   bundle:
     runs-on: ubuntu-latest
@@ -126,7 +128,7 @@ jobs:
           mkdir -p "$pack_work_dir"
 
           npm pack --json > release-bundle/npm-pack.json
-          package_tgz=$(node -e "const fs = require('fs'); const pack = JSON.parse(fs.readFileSync('release-bundle/npm-pack.json', 'utf8')); console.log(pack[0].filename);")
+          package_tgz=$(node -e "const fs = require('fs'); const pack = JSON.parse(fs.readFileSync('release-bundle/npm-pack.json', 'utf8')); const entries = Array.isArray(pack) ? pack : Object.values(pack); const entry = entries.find((item) => item && typeof item.filename === 'string'); if (!entry) throw new Error('npm pack did not report an output filename'); console.log(entry.filename);")
           tar -xzf "$package_tgz" -C "$pack_work_dir"
           mv "$pack_work_dir/package" "$bundle_root"
           rm -f "$package_tgz"
@@ -145,6 +147,8 @@ jobs:
           test -f "$bundle_root/scripts/publish-clawhub-package.mjs"
           test ! -e "$bundle_root/PROJECT_ANALYSIS.md"
           test ! -e "$bundle_root/CROSS_CLAW_ADAPTATION_PLAN.md"
+          test ! -e "$bundle_root/docs"
+          test ! -e "$bundle_root/tests"
 
           chmod +x "$bundle_root/install.sh"
           chmod +x "$bundle_root/uninstall.sh"
@@ -235,6 +239,8 @@ jobs:
           test ! -e "$root/openclaw-plugin-xiaoai-cloud/package.json"
           test ! -e "$root/PROJECT_ANALYSIS.md"
           test ! -e "$root/CROSS_CLAW_ADAPTATION_PLAN.md"
+          test ! -e "$root/docs"
+          test ! -e "$root/tests"
 
           node - "$root" <<'NODE'
           const fs = require("node:fs");
@@ -361,7 +367,9 @@ jobs:
           @(
             "$root\openclaw-plugin-xiaoai-cloud\package.json",
             "$root\PROJECT_ANALYSIS.md",
-            "$root\CROSS_CLAW_ADAPTATION_PLAN.md"
+            "$root\CROSS_CLAW_ADAPTATION_PLAN.md",
+            "$root\docs",
+            "$root\tests"
           ) | ForEach-Object {
             if (Test-Path $_) {
               throw "Unexpected file found in bundle: $_"

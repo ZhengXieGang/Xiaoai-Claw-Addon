@@ -48,7 +48,7 @@
 6. 自动修复插件 allowlist 和工具 allowlist。
 7. 自动补装 OpenClaw 宿主运行时缺失的依赖，例如 Telegram / Slack / Bedrock 相关包。
 8. 自动把插件目录 owner 修正到当前安装用户，避免安装后出现权限问题。
-9. 在发现旧插件处于“半卸载残留”状态时，先清理残留目录和配置，再继续安装。
+9. 支持 `plugins install --force` 时用它覆盖已有插件；旧版 OpenClaw 仅允许首次普通安装，已有插件时停止流程，不主动删除旧插件目录或配置。
 10. 在 OpenClaw 新版本存在危险代码拦截时，根据 CLI 官方能力自动决定是否带上 `--dangerously-force-unsafe-install`。
 
 另外还有一个很实际的发布细节：
@@ -1685,9 +1685,9 @@ deadline 到点后，当前实现不会再等一整轮普通轮询，而是直�
 
 支持：
 
-- 正常安装
+- 正常安装；支持时使用 `plugins install --force` 覆盖已有插件
 - `--dev` link install
-- 已存在插件时先卸载再重装
+- 覆盖失败时保留原有插件和配置，避免留下半安装状态
 
 ### 31.5 修复 owner 问题
 

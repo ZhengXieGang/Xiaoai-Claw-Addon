@@ -424,6 +424,14 @@ resolve_plugin_install_safety_flag() {
   printf '%s\n' ''
 }
 
+resolve_plugin_install_force_flag() {
+  if run_openclaw plugins install --help 2>/dev/null | grep -q -- '--force'; then
+    printf '%s\n' '--force'
+    return 0
+  fi
+  return 1
+}
+
 extract_last_nonempty_line() {
   awk 'NF { line = $0 } END { print line }'
 }
@@ -606,56 +614,24 @@ normalize_installed_plugin_owner() {
   fi
 }
 
-cleanup_unmanaged_plugin_install() {
-  state_dir=$(resolve_active_state_dir)
-  plugin_extension_path="$state_dir/extensions/openclaw-plugin-xiaoai-cloud"
-  plugin_copy_path="$state_dir/plugins/openclaw-plugin-xiaoai-cloud"
-  rm -rf "$plugin_extension_path" "$plugin_copy_path"
-
-  config_file=$(resolve_openclaw_config_file || true)
-  config_file=$(expand_home_path "$config_file")
-  if [ -n "$config_file" ] && [ -f "$config_file" ]; then
-    node - "$config_file" <<'NODE'
-const fs = require("fs");
-const filePath = process.argv[2];
-const raw = fs.readFileSync(filePath, "utf8");
-let config;
-try {
-  config = JSON.parse(raw);
-} catch {
-  const JSON5 = require("json5");
-  config = JSON5.parse(raw);
-}
-if (config && typeof config === "object") {
-  if (config.plugins && typeof config.plugins === "object") {
-    if (config.plugins.entries && typeof config.plugins.entries === "object") {
-      delete config.plugins.entries["openclaw-plugin-xiaoai-cloud"];
-    }
-    if (Array.isArray(config.plugins.allow)) {
-      config.plugins.allow = config.plugins.allow.filter(
-        (item) => item !== "openclaw-plugin-xiaoai-cloud"
-      );
-    }
-  }
-}
-fs.writeFileSync(filePath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-NODE
-  fi
-}
-
-remove_existing_plugin_install() {
+install_plugin() {
   if [ "$DEV_MODE" -eq 1 ]; then
-    return 0
+    if [ -n "$PLUGIN_INSTALL_SAFETY_FLAG" ]; then
+      run_openclaw plugins install "$PLUGIN_INSTALL_SAFETY_FLAG" -l "$SOURCE_DIR"
+    else
+      run_openclaw plugins install -l "$SOURCE_DIR"
+    fi
+    return
   fi
 
-  if run_openclaw plugins inspect openclaw-plugin-xiaoai-cloud --json >/dev/null 2>&1; then
-    info "Existing plugin detected, uninstalling old version first."
-    if run_openclaw plugins uninstall openclaw-plugin-xiaoai-cloud --force; then
-      cleanup_unmanaged_plugin_install
-      return 0
-    fi
-    warn "OpenClaw 标准卸载失败，正在清理残留插件目录和配置。"
-    cleanup_unmanaged_plugin_install
+  if [ -n "$PLUGIN_INSTALL_FORCE_FLAG" ] && [ -n "$PLUGIN_INSTALL_SAFETY_FLAG" ]; then
+    run_openclaw plugins install "$PLUGIN_INSTALL_FORCE_FLAG" "$PLUGIN_INSTALL_SAFETY_FLAG" "$SOURCE_DIR"
+  elif [ -n "$PLUGIN_INSTALL_FORCE_FLAG" ]; then
+    run_openclaw plugins install "$PLUGIN_INSTALL_FORCE_FLAG" "$SOURCE_DIR"
+  elif [ -n "$PLUGIN_INSTALL_SAFETY_FLAG" ]; then
+    run_openclaw plugins install "$PLUGIN_INSTALL_SAFETY_FLAG" "$SOURCE_DIR"
+  else
+    run_openclaw plugins install "$SOURCE_DIR"
   fi
 }
 
@@ -793,20 +769,25 @@ fi
 
 set_stage "install_plugin"
 info "[3/6] Installing plugin into OpenClaw..."
-remove_existing_plugin_install
 PLUGIN_INSTALL_SAFETY_FLAG=$(resolve_plugin_install_safety_flag)
-if [ "$DEV_MODE" -eq 1 ]; then
-  if [ -n "$PLUGIN_INSTALL_SAFETY_FLAG" ]; then
-    run_openclaw plugins install "$PLUGIN_INSTALL_SAFETY_FLAG" -l "$SOURCE_DIR"
+PLUGIN_INSTALL_FORCE_FLAG=""
+if [ "$DEV_MODE" -eq 0 ]; then
+  if PLUGIN_INSTALL_FORCE_FLAG=$(resolve_plugin_install_force_flag); then
+    :
+  elif run_openclaw plugins inspect openclaw-plugin-xiaoai-cloud --json >/dev/null 2>&1; then
+    error "当前 OpenClaw 不支持安全覆盖安装（plugins install --force），已有插件未被修改。请先升级 OpenClaw，再重新运行安装。"
+    exit 1
   else
-    run_openclaw plugins install -l "$SOURCE_DIR"
+    warn "当前 OpenClaw 不支持 plugins install --force，未检测到已有插件，将尝试普通安装。"
   fi
-else
-  if [ -n "$PLUGIN_INSTALL_SAFETY_FLAG" ]; then
-    run_openclaw plugins install "$PLUGIN_INSTALL_SAFETY_FLAG" "$SOURCE_DIR"
+fi
+if ! install_plugin; then
+  if [ -n "$PLUGIN_INSTALL_FORCE_FLAG" ]; then
+    error "OpenClaw 插件覆盖安装失败，旧插件不会被脚本主动删除。"
   else
-    run_openclaw plugins install "$SOURCE_DIR"
+    error "OpenClaw 插件安装失败，脚本未主动删除任何旧插件文件或配置。"
   fi
+  exit 1
 fi
 
 set_stage "normalize_owner"

@@ -156,16 +156,15 @@ call :set_stage install_plugin
 call :log_info [3/5] Installing plugin into OpenClaw...
 call :resolve_plugin_install_safety_flag
 if not "%DEV_MODE%"=="1" (
-  call :run_openclaw plugins inspect openclaw-plugin-xiaoai-cloud --json >nul 2>nul
-  if not errorlevel 1 (
-    call :log_info [3/5] Existing plugin detected, uninstalling old version...
-    call :run_openclaw plugins uninstall openclaw-plugin-xiaoai-cloud --force >> "%LOG_FILE%" 2>&1
-    if errorlevel 1 (
-      call :log_warn [3/5] OpenClaw 标准卸载失败，正在清理残留插件目录和配置...
-      call :cleanup_unmanaged_plugin_install || (set "EXIT_CODE=1" & goto cleanup_and_exit)
-    ) else (
-      call :cleanup_unmanaged_plugin_install || (set "EXIT_CODE=1" & goto cleanup_and_exit)
+  call :resolve_plugin_install_force_flag
+  if errorlevel 1 (
+    call :run_openclaw plugins inspect openclaw-plugin-xiaoai-cloud --json >nul 2>nul
+    if not errorlevel 1 (
+      call :log_warn [3/5] 当前 OpenClaw 不支持安全覆盖安装（plugins install --force），已有插件未被修改。请先升级 OpenClaw，再重新运行安装。
+      set "EXIT_CODE=1"
+      goto cleanup_and_exit
     )
+    call :log_warn [3/5] 当前 OpenClaw 不支持 plugins install --force，未检测到已有插件，将尝试普通安装。
   )
 )
 if "%DEV_MODE%"=="1" (
@@ -176,9 +175,17 @@ if "%DEV_MODE%"=="1" (
   )
 ) else (
   if defined PLUGIN_INSTALL_SAFETY_FLAG (
-    call :run_openclaw plugins install %PLUGIN_INSTALL_SAFETY_FLAG% "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (set "EXIT_CODE=1" & goto cleanup_and_exit)
+    if defined PLUGIN_INSTALL_FORCE_FLAG (
+      call :run_openclaw plugins install --force %PLUGIN_INSTALL_SAFETY_FLAG% "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (call :log_warn [3/5] OpenClaw 覆盖安装失败，旧插件未被脚本主动删除。 & set "EXIT_CODE=1" & goto cleanup_and_exit)
+    ) else (
+      call :run_openclaw plugins install %PLUGIN_INSTALL_SAFETY_FLAG% "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (call :log_warn [3/5] OpenClaw 插件安装失败，脚本未主动删除任何旧插件文件或配置。 & set "EXIT_CODE=1" & goto cleanup_and_exit)
+    )
   ) else (
-    call :run_openclaw plugins install "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (set "EXIT_CODE=1" & goto cleanup_and_exit)
+    if defined PLUGIN_INSTALL_FORCE_FLAG (
+      call :run_openclaw plugins install --force "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (call :log_warn [3/5] OpenClaw 覆盖安装失败，旧插件未被脚本主动删除。 & set "EXIT_CODE=1" & goto cleanup_and_exit)
+    ) else (
+      call :run_openclaw plugins install "%SOURCE_DIR%" >> "%LOG_FILE%" 2>&1 || (call :log_warn [3/5] OpenClaw 插件安装失败，脚本未主动删除任何旧插件文件或配置。 & set "EXIT_CODE=1" & goto cleanup_and_exit)
+    )
   )
 )
 
@@ -457,18 +464,13 @@ for /f "delims=" %%L in ('call :run_openclaw plugins install --help ^| findstr /
 )
 exit /b 0
 
-:cleanup_unmanaged_plugin_install
-setlocal
-set "ACTIVE_STATE_DIR=%STATE_DIR%"
-if "%ACTIVE_STATE_DIR%"=="" set "ACTIVE_STATE_DIR=%OPENCLAW_STATE_DIR%"
-if "%ACTIVE_STATE_DIR%"=="" set "ACTIVE_STATE_DIR=%USERPROFILE%\.openclaw"
-if exist "%ACTIVE_STATE_DIR%\extensions\openclaw-plugin-xiaoai-cloud" rmdir /s /q "%ACTIVE_STATE_DIR%\extensions\openclaw-plugin-xiaoai-cloud" >nul 2>nul
-if exist "%ACTIVE_STATE_DIR%\plugins\openclaw-plugin-xiaoai-cloud" rmdir /s /q "%ACTIVE_STATE_DIR%\plugins\openclaw-plugin-xiaoai-cloud" >nul 2>nul
-set "CONFIG_FILE=%ACTIVE_STATE_DIR%\openclaw.json"
-if exist "%CONFIG_FILE%" (
-  node -e "const fs=require('fs'); const filePath=process.argv[1]; const raw=fs.readFileSync(filePath,'utf8'); let config; try { config=JSON.parse(raw); } catch { const JSON5=require('json5'); config=JSON5.parse(raw); } if (config && typeof config==='object' && config.plugins && typeof config.plugins==='object') { if (config.plugins.entries && typeof config.plugins.entries==='object') delete config.plugins.entries['openclaw-plugin-xiaoai-cloud']; if (Array.isArray(config.plugins.allow)) config.plugins.allow=config.plugins.allow.filter((item)=>item!=='openclaw-plugin-xiaoai-cloud'); } fs.writeFileSync(filePath, JSON.stringify(config,null,2)+'\n', 'utf8');" "%CONFIG_FILE%" || (endlocal & exit /b 1)
+:resolve_plugin_install_force_flag
+set "PLUGIN_INSTALL_FORCE_FLAG="
+for /f "delims=" %%L in ('call :run_openclaw plugins install --help ^| findstr /c:"--force"') do (
+  set "PLUGIN_INSTALL_FORCE_FLAG=--force"
 )
-endlocal & exit /b 0
+if defined PLUGIN_INSTALL_FORCE_FLAG exit /b 0
+exit /b 1
 
 :cleanup_and_exit
 if not "%EXIT_CODE%"=="0" (

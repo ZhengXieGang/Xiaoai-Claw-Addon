@@ -64,6 +64,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test:install": "node tests/install-overwrite-contract.mjs",
     "login:cli": "npm run build && node scripts/xiaomi-login-cli.mjs",
     "prepack": "npm run build",
     "pack:dry-run": "npm pack --dry-run",

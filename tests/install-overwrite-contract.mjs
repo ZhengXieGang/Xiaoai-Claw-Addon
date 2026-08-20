@@ -21,6 +21,11 @@ const windowsInstaller = readFileSync(
 
 assert.doesNotMatch(linuxInstaller, /plugins\s+uninstall/u);
 assert.doesNotMatch(windowsInstaller, /plugins\s+uninstall/iu);
+assert.doesNotMatch(
+  windowsInstaller,
+  /for\s+\/f[^\r\n]*call\s+:run_openclaw/iu,
+  "install.cmd must not call a batch label from a for /f child cmd.exe",
+);
 assert.match(linuxInstaller, /plugins install "\$PLUGIN_INSTALL_FORCE_FLAG"/u);
 assert.match(windowsInstaller, /plugins install --force/iu);
 assert.match(

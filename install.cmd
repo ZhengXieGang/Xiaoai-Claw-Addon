@@ -459,16 +459,24 @@ endlocal & exit /b %RUN_EXIT%
 
 :resolve_plugin_install_safety_flag
 set "PLUGIN_INSTALL_SAFETY_FLAG="
-for /f "delims=" %%L in ('call :run_openclaw plugins install --help ^| findstr /c:"--dangerously-force-unsafe-install"') do (
+set "OPENCLAW_HELP_FILE=%TEMP%\xiaoai-openclaw-install-help-%RANDOM%%RANDOM%.txt"
+call :run_openclaw plugins install --help > "%OPENCLAW_HELP_FILE%" 2>&1
+findstr /c:"--dangerously-force-unsafe-install" "%OPENCLAW_HELP_FILE%" >nul 2>nul
+if not errorlevel 1 (
   set "PLUGIN_INSTALL_SAFETY_FLAG=--dangerously-force-unsafe-install"
 )
+del /q "%OPENCLAW_HELP_FILE%" >nul 2>nul
 exit /b 0
 
 :resolve_plugin_install_force_flag
 set "PLUGIN_INSTALL_FORCE_FLAG="
-for /f "delims=" %%L in ('call :run_openclaw plugins install --help ^| findstr /c:"--force"') do (
+set "OPENCLAW_HELP_FILE=%TEMP%\xiaoai-openclaw-install-help-%RANDOM%%RANDOM%.txt"
+call :run_openclaw plugins install --help > "%OPENCLAW_HELP_FILE%" 2>&1
+findstr /c:"--force" "%OPENCLAW_HELP_FILE%" >nul 2>nul
+if not errorlevel 1 (
   set "PLUGIN_INSTALL_FORCE_FLAG=--force"
 )
+del /q "%OPENCLAW_HELP_FILE%" >nul 2>nul
 if defined PLUGIN_INSTALL_FORCE_FLAG exit /b 0
 exit /b 1
 

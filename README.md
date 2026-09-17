@@ -105,14 +105,14 @@ install.cmd
 
 ```bash
 cd openclaw-plugin-xiaoai-cloud
-chmod +x install.sh
-./install.sh
+chmod +x installers/install.sh
+./installers/install.sh
 ```
 
 Windows：
 ```bat
 cd openclaw-plugin-xiaoai-cloud
-install.cmd
+installers\install.cmd
 ```
 
 </details>
@@ -172,6 +172,8 @@ Windows：
 ```bat
 uninstall.cmd
 ```
+
+在源码目录里操作时，卸载脚本位于 `installers/`，把上面命令里的 `uninstall.sh` 换成 `installers/uninstall.sh`，`uninstall.cmd` 换成 `installers\uninstall.cmd` 即可。
 
 卸载脚本会交互式询问是否保留专用 `xiaoai` agent、是否保留该 agent 的对话记录。
 如果选择“删除 agent，但保留对话记录”，脚本会把记录备份到当前 OpenClaw state dir 下的 `plugin-backups/`。

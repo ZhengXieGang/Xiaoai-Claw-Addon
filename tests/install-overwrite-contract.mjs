@@ -14,11 +14,11 @@ import os from "node:os";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const linuxInstaller = readFileSync(
-  join(repositoryRoot, "scripts", "install", "install.sh"),
+  join(repositoryRoot, "installers", "install.sh"),
   "utf8",
 );
 const windowsInstaller = readFileSync(
-  join(repositoryRoot, "scripts", "install", "install.cmd"),
+  join(repositoryRoot, "installers", "install.cmd"),
   "utf8",
 );
 

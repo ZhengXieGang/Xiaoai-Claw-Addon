@@ -53,7 +53,7 @@
 
 另外还有一个很实际的发布细节：
 
-- `install.sh` 和 `uninstall.sh` 都应该在仓库和 release 包里保留可执行位
+- `installers/install.sh` 和 `installers/uninstall.sh` 应该保留可执行位，打包时复制到 release 压缩包根目录的那一份同样可执行
 - 如果某些解压工具把执行位丢了，用户仍然可以直接运行 `bash ./install.sh` 或 `bash ./uninstall.sh`
 
 ### 0.2 通知路由策略
@@ -188,12 +188,10 @@ src/openclaw-gateway-runtime.ts
 src/openclaw-agent-wrapper.ts
 assets/ui/xiaoai-console.js
 assets/ui/xiaoai-console.css
-install.sh
-install.cmd
-scripts/install/install.sh
-scripts/install/install.cmd
-scripts/install/uninstall.sh
-scripts/install/uninstall.cmd
+installers/install.sh
+installers/install.cmd
+installers/uninstall.sh
+installers/uninstall.cmd
 scripts/configure-openclaw-install.mjs
 ```
 
@@ -221,10 +219,11 @@ scripts/configure-openclaw-install.mjs
   动态加载 OpenClaw 官方 Gateway SDK。这属于 OpenClaw adapter 能力，不应被 PicoClaw、ZeroClaw、Hermes 复用。
 - `src/openclaw-agent-wrapper.ts`
   对 OpenClaw CLI 输出做包装，尽量拿到稳定摘要。这同样属于 OpenClaw adapter 能力。
-- `install.sh` / `install.cmd`
-  用户安装入口，只保留兼容转发逻辑，实际实现位于 `scripts/install/`。
-- `uninstall.sh` / `uninstall.cmd`
-  用户卸载入口，只保留兼容转发逻辑，实际实现位于 `scripts/install/`。
+- `installers/install.sh` / `installers/install.cmd`
+  用户安装入口的实现。脚本按自身位置推断项目根目录，兼容源码树、解压后的 release 目录，以及单独下载脚本加发布压缩包三种用法。
+- `installers/uninstall.sh` / `installers/uninstall.cmd`
+  用户卸载入口的实现，目录推断规则与安装脚本一致。
+- 根目录不再放置安装脚本。发布流程在打包时把这四个脚本复制到压缩包根目录，用户拿到的 release 结构不变。
 - `scripts/configure-openclaw-install.mjs`
   安装后自动配置专属 agent、workspace、工具 allowlist。
 
@@ -2697,7 +2696,7 @@ deadline 提前量现在按下面的思路动态计算：
 7. `assets/ui/xiaoai-console.js`
 8. `assets/ui/xiaoai-console.css`
 9. `scripts/configure-openclaw-install.mjs`
-10. `install.sh` / `install.cmd`
+10. `installers/install.sh` / `installers/install.cmd`
 
 如果你只关心某一块：
 
@@ -2705,7 +2704,7 @@ deadline 提前量现在按下面的思路动态计算：
 - 拦截延迟：先看 `src/provider.ts` 里的 `pollConversationOnce / interceptAndForward / pauseSpeaker`
 - 音频兼容性：先看 `playAudioUrl()` 以及 `audio-relay`
 - 控制台异常：先看 `handleGatewayHttpRoute()`、`src/console-page.ts`、`assets/ui/xiaoai-console.js`
-- 安装问题：先看 `install.sh`、`install.cmd`、`scripts/configure-openclaw-install.mjs`
+- 安装问题：先看 `installers/install.sh`、`installers/install.cmd`、`scripts/configure-openclaw-install.mjs`
 
 ## 36. 总结
 

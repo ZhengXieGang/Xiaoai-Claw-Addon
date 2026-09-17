@@ -51,12 +51,10 @@ jobs:
         run: |
           set -eu
 
-          sh -n install.sh
-          sh -n uninstall.sh
-          sh -n scripts/install/install.sh
-          sh -n scripts/install/uninstall.sh
-          sh install.sh --help >/dev/null
-          sh uninstall.sh --help >/dev/null
+          sh -n installers/install.sh
+          sh -n installers/uninstall.sh
+          sh installers/install.sh --help >/dev/null
+          sh installers/uninstall.sh --help >/dev/null
           node scripts/configure-openclaw-install.mjs --help >/dev/null
           node scripts/configure-openclaw-uninstall.mjs --help >/dev/null
           node --check scripts/xiaomi-login-cli.mjs
@@ -89,8 +87,8 @@ jobs:
       - name: Verify source Windows install helper
         shell: cmd
         run: |
-          call install.cmd --help >NUL
-          call uninstall.cmd --help >NUL
+          call installers\install.cmd --help >NUL
+          call installers\uninstall.cmd --help >NUL
           node scripts\configure-openclaw-install.mjs --help >NUL
           node scripts\configure-openclaw-uninstall.mjs --help >NUL
           node --check scripts\xiaomi-login-cli.mjs
@@ -143,14 +141,10 @@ jobs:
           test -f "$bundle_root/LICENSE"
           test -f "$bundle_root/dist/index.js"
           test -f "$bundle_root/dist/src/provider.js"
-          test -f "$bundle_root/install.sh"
-          test -f "$bundle_root/install.cmd"
-          test -f "$bundle_root/uninstall.sh"
-          test -f "$bundle_root/uninstall.cmd"
-          test -f "$bundle_root/scripts/install/install.sh"
-          test -f "$bundle_root/scripts/install/install.cmd"
-          test -f "$bundle_root/scripts/install/uninstall.sh"
-          test -f "$bundle_root/scripts/install/uninstall.cmd"
+          test -f "$bundle_root/installers/install.sh"
+          test -f "$bundle_root/installers/install.cmd"
+          test -f "$bundle_root/installers/uninstall.sh"
+          test -f "$bundle_root/installers/uninstall.cmd"
           test -f "$bundle_root/scripts/xiaomi-login-cli.mjs"
           test -f "$bundle_root/scripts/publish-clawhub-package.mjs"
           test ! -e "$bundle_root/PROJECT_ANALYSIS.md"
@@ -158,8 +152,25 @@ jobs:
           test ! -e "$bundle_root/docs"
           test ! -e "$bundle_root/tests"
 
+          # The repository keeps installers under installers/, while the extracted
+          # release has always exposed them at its root. Publish the same layout the
+          # previous releases used so existing instructions keep working.
+          cp "$bundle_root/installers/install.sh" "$bundle_root/install.sh"
+          cp "$bundle_root/installers/install.cmd" "$bundle_root/install.cmd"
+          cp "$bundle_root/installers/uninstall.sh" "$bundle_root/uninstall.sh"
+          cp "$bundle_root/installers/uninstall.cmd" "$bundle_root/uninstall.cmd"
+          rm -rf "$bundle_root/installers"
+
+          test -f "$bundle_root/install.sh"
+          test -f "$bundle_root/install.cmd"
+          test -f "$bundle_root/uninstall.sh"
+          test -f "$bundle_root/uninstall.cmd"
           chmod +x "$bundle_root/install.sh"
           chmod +x "$bundle_root/uninstall.sh"
+
+          # install.sh / install.cmd are also shipped as standalone release assets.
+          cp "$bundle_root/install.sh" install.sh
+          cp "$bundle_root/install.cmd" install.cmd
           python3 - <<'PY'
           import pathlib
           import zipfile
@@ -227,10 +238,6 @@ jobs:
           test -f "$root/install.cmd"
           test -f "$root/uninstall.sh"
           test -f "$root/uninstall.cmd"
-          test -f "$root/scripts/install/install.sh"
-          test -f "$root/scripts/install/install.cmd"
-          test -f "$root/scripts/install/uninstall.sh"
-          test -f "$root/scripts/install/uninstall.cmd"
           test -f "$root/openclaw.plugin.json"
           test -f "$root/package.json"
           test -f "$root/README.md"
@@ -253,6 +260,7 @@ jobs:
           test ! -e "$root/CROSS_CLAW_ADAPTATION_PLAN.md"
           test ! -e "$root/docs"
           test ! -e "$root/tests"
+          test ! -e "$root/installers"
 
           node - "$root" <<'NODE'
           const fs = require("node:fs");
@@ -299,8 +307,6 @@ jobs:
           root="$PWD/smoke-test/zip"
           sh -n "$root/install.sh"
           sh -n "$root/uninstall.sh"
-          sh -n "$root/scripts/install/install.sh"
-          sh -n "$root/scripts/install/uninstall.sh"
           sh "$root/install.sh" --help >/dev/null
           sh "$root/uninstall.sh" --help >/dev/null
           node "$root/scripts/configure-openclaw-install.mjs" --help >/dev/null
@@ -355,10 +361,6 @@ jobs:
             "$root\install.sh",
             "$root\install.cmd",
             "$root\uninstall.sh",
-            "$root\scripts\install\install.sh",
-            "$root\scripts\install\install.cmd",
-            "$root\scripts\install\uninstall.sh",
-            "$root\scripts\install\uninstall.cmd",
             "$root\uninstall.cmd",
             "$root\openclaw.plugin.json",
             "$root\package.json",
@@ -387,7 +389,8 @@ jobs:
             "$root\PROJECT_ANALYSIS.md",
             "$root\CROSS_CLAW_ADAPTATION_PLAN.md",
             "$root\docs",
-            "$root\tests"
+            "$root\tests",
+            "$root\installers"
           ) | ForEach-Object {
             if (Test-Path $_) {
               throw "Unexpected file found in bundle: $_"

@@ -6,8 +6,12 @@ if [ -n "${XIAOAI_PROJECT_ROOT:-}" ]; then
   SCRIPT_DIR=$(CDPATH= cd -- "$XIAOAI_PROJECT_ROOT" && pwd)
 elif [ -f "$ENTRY_DIR/package.json" ]; then
   SCRIPT_DIR="$ENTRY_DIR"
-else
+elif [ -f "$ENTRY_DIR/../package.json" ]; then
+  SCRIPT_DIR=$(CDPATH= cd -- "$ENTRY_DIR/.." && pwd)
+elif [ -f "$ENTRY_DIR/../../package.json" ]; then
   SCRIPT_DIR=$(CDPATH= cd -- "$ENTRY_DIR/../.." && pwd)
+else
+  SCRIPT_DIR="$ENTRY_DIR"
 fi
 
 if ! command -v node >/dev/null 2>&1; then

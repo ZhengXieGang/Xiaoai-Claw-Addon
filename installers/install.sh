@@ -5,9 +5,16 @@ ENTRY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -n "${XIAOAI_PROJECT_ROOT:-}" ]; then
   SCRIPT_DIR=$(CDPATH= cd -- "$XIAOAI_PROJECT_ROOT" && pwd)
 elif [ -f "$ENTRY_DIR/package.json" ]; then
+  # Release bundle root, or a standalone script inside an extracted tree.
   SCRIPT_DIR="$ENTRY_DIR"
-else
+elif [ -f "$ENTRY_DIR/../package.json" ]; then
+  # Repository checkout: installers/ sits one level below the project root.
+  SCRIPT_DIR=$(CDPATH= cd -- "$ENTRY_DIR/.." && pwd)
+elif [ -f "$ENTRY_DIR/../../package.json" ]; then
   SCRIPT_DIR=$(CDPATH= cd -- "$ENTRY_DIR/../.." && pwd)
+else
+  # Standalone download: the release archive is expected beside this script.
+  SCRIPT_DIR="$ENTRY_DIR"
 fi
 SOURCE_DIR="$SCRIPT_DIR"
 TEMP_RELEASE_DIR=""
@@ -28,8 +35,8 @@ INITIAL_GATEWAY_PID=""
 
 print_help() {
   cat <<'EOF'
-Usage: ./install.sh [options]
-   or: bash ./install.sh [options]
+Usage: install.sh [options]
+   or: sh install.sh [options]
 
 Options:
   --dev                  Install in local link mode (openclaw plugins install -l)
@@ -42,7 +49,9 @@ Options:
   --help                 Show this help message
 
 Notes:
-  - You can run this script in the source repo directory.
+  - You can run this script in the source repo directory (installers/install.sh),
+    from the extracted release directory, or anywhere else as long as the
+    project tree is reachable from the script location.
   - You can also place this script beside a GitHub Release bundle archive
     (`openclaw-plugin-xiaoai-cloud-bundle.zip`), and it will
     auto-extract and install from that bundle.

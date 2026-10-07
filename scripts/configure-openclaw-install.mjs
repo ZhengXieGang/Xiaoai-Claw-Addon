@@ -100,7 +100,7 @@ function printHelp() {
 Options:
   --profile NAME      Use the given OpenClaw profile
   --state-dir DIR     Use the given OpenClaw state dir
-  --agent ID          Dedicated agent id to use for XiaoAi forwarding
+  --agent ID          Dedicated agent id. Omit to keep xiaoai; otherwise create or reuse ID
   --plugin-id ID      Plugin id to configure
   --openclaw-bin CMD  OpenClaw CLI command path (default: openclaw)
   --log-file PATH     Persist configure-stage log to PATH
@@ -201,6 +201,7 @@ function parseArgs(argv) {
         profile: "",
         stateDir: "",
         agentId: DEFAULT_AGENT_ID,
+        agentIdExplicit: false,
         pluginId: DEFAULT_PLUGIN_ID,
         openclawBin: "openclaw",
         openclawPackageDir: "",
@@ -223,7 +224,7 @@ function parseArgs(argv) {
             arg === "--openclaw-package-dir"
         ) {
             const next = argv[index + 1];
-            if (!next) {
+            if (!next || (arg === "--agent" && !String(next).trim())) {
                 fail(`Missing value for ${arg}`);
             }
             if (arg === "--profile") {
@@ -231,7 +232,8 @@ function parseArgs(argv) {
             } else if (arg === "--state-dir") {
                 options.stateDir = next;
             } else if (arg === "--agent") {
-                options.agentId = next;
+                options.agentId = normalizeAgentId(String(next).trim());
+                options.agentIdExplicit = true;
             } else if (arg === "--plugin-id") {
                 options.pluginId = next;
             } else if (arg === "--openclaw-package-dir") {
@@ -889,7 +891,24 @@ function normalizeAgentSystemPrompt(value, fallbackToDefault = true) {
     return fallbackToDefault ? DEFAULT_XIAOAI_AGENT_SYSTEM_PROMPT : "";
 }
 
-function determineDesiredAgent(pluginEntry, pluginId, fallbackAgentId) {
+function normalizeAgentId(value) {
+    const agentId = typeof value === "string" ? value.trim() : "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(agentId)) {
+        fail(
+            `[install] Invalid --agent id "${value}". ` +
+                "Use 1-64 letters, numbers, '_' or '-', and start with a letter or number."
+        );
+    }
+    if (agentId === "main") {
+        fail(
+            `[install] --agent cannot be "main". ` +
+                `Choose another id, or omit --agent to use "${DEFAULT_AGENT_ID}".`
+        );
+    }
+    return agentId;
+}
+
+function determineDesiredAgent(pluginEntry, pluginId, fallbackAgentId, agentIdExplicit) {
     const staleKey = `"${pluginId}"`;
     const staleConfig = isRecord(pluginEntry.entries[staleKey]?.config)
         ? pluginEntry.entries[staleKey].config
@@ -906,8 +925,11 @@ function determineDesiredAgent(pluginEntry, pluginId, fallbackAgentId) {
     return {
         staleKey,
         mergedConfig,
-        desiredAgentId:
-            configuredAgent && configuredAgent !== "main" ? configuredAgent : fallbackAgentId,
+        desiredAgentId: agentIdExplicit
+            ? fallbackAgentId
+            : configuredAgent && configuredAgent !== "main"
+                ? configuredAgent
+                : fallbackAgentId,
     };
 }
 
@@ -970,11 +992,19 @@ function buildPrimaryAgentConfig(
 function ensureDedicatedAgentDoesNotBecomeDefault(
     agentList,
     desiredAgentId,
-    primaryAgentTemplate
+    primaryAgentTemplate,
+    preserveExistingDefault = false
 ) {
     const nextAgentList = Array.isArray(agentList) ? agentList : [];
+    if (preserveExistingDefault) {
+        return nextAgentList;
+    }
     const targetIndex = findAgentIndex(nextAgentList, desiredAgentId);
-    if (targetIndex >= 0 && isRecord(nextAgentList[targetIndex])) {
+    if (
+        !preserveExistingDefault &&
+        targetIndex >= 0 &&
+        isRecord(nextAgentList[targetIndex])
+    ) {
         nextAgentList[targetIndex] = {
             ...nextAgentList[targetIndex],
             default: false,
@@ -1038,7 +1068,8 @@ function configureOpenclaw(options) {
     const { staleKey, mergedConfig, desiredAgentId } = determineDesiredAgent(
         { entries },
         options.pluginId,
-        options.agentId
+        options.agentId,
+        options.agentIdExplicit === true
     );
 
     const listedAgents = parseJsonFromCliOutput(
@@ -1075,10 +1106,18 @@ function configureOpenclaw(options) {
                 ? listedTargetAgent.workspace
                 : ""
     );
-    ensureWorkspaceScaffold(desiredWorkspace, {
-        openclawPackageDir: hostRuntime.packageDir,
-    });
-    logInfo(`[install] Dedicated workspace: ${desiredWorkspace}`);
+    const agentAlreadyPresent = Boolean(listedTargetAgent) || Boolean(configTargetAgent);
+    const preserveExistingAgent = options.agentIdExplicit === true && agentAlreadyPresent;
+    if (!preserveExistingAgent) {
+        ensureWorkspaceScaffold(desiredWorkspace, {
+            openclawPackageDir: hostRuntime.packageDir,
+        });
+        logInfo(`[install] Dedicated workspace: ${desiredWorkspace}`);
+    } else {
+        logInfo(
+            `[install] Existing agent "${desiredAgentId}" will be reused; its workspace is left unchanged.`
+        );
+    }
 
     const { created } = ensureAgent(
         runOpenclaw,
@@ -1086,8 +1125,11 @@ function configureOpenclaw(options) {
         desiredWorkspace,
         desiredModel
     );
+    const reuseExistingAgent = preserveExistingAgent && !created;
     logInfo(
-        `[install] Dedicated agent ${created ? "created" : "already exists"}: ${desiredAgentId}`
+        reuseExistingAgent
+            ? `[install] Dedicated agent already exists, reusing: ${desiredAgentId}`
+            : `[install] Dedicated agent ${created ? "created" : "already exists"}: ${desiredAgentId}`
     );
 
     const nextConfig = isRecord(config) ? { ...config } : {};
@@ -1126,7 +1168,11 @@ function configureOpenclaw(options) {
     }
 
     Object.assign(nextPluginConfig, mergedConfig);
-    if (!nextPluginConfig.openclawAgent || nextPluginConfig.openclawAgent === "main") {
+    if (
+        options.agentIdExplicit === true ||
+        !nextPluginConfig.openclawAgent ||
+        nextPluginConfig.openclawAgent === "main"
+    ) {
         nextPluginConfig.openclawAgent = desiredAgentId;
     }
     nextPluginConfig.openclawChannel = resolvedOpenclawChannel;
@@ -1150,27 +1196,39 @@ function configureOpenclaw(options) {
         typeof previousAgent.systemPrompt === "string" ? previousAgent.systemPrompt : "";
 
     previousAgent.id = desiredAgentId;
-    previousAgent.workspace = desiredWorkspace;
-    if (desiredModel) {
-        previousAgent.model = desiredModel;
+    if (reuseExistingAgent) {
+        if (!readString(previousAgent.workspace)) {
+            previousAgent.workspace =
+                readString(listedTargetAgent?.workspace) ||
+                readString(configTargetAgent?.workspace) ||
+                desiredWorkspace;
+        }
+        logInfo(
+            `[install] Reusing existing agent "${desiredAgentId}" without recreating its workspace or tool profile.`
+        );
+    } else {
+        previousAgent.workspace = desiredWorkspace;
+        if (desiredModel) {
+            previousAgent.model = desiredModel;
+        }
+        syncWorkspacePrompt(
+            desiredWorkspace,
+            previousAgentSystemPrompt ||
+                nextPluginConfig.openclawVoiceSystemPrompt ||
+                mergedConfig.openclawVoiceSystemPrompt,
+            [
+                previousAgentSystemPrompt,
+                nextPluginConfig.openclawVoiceSystemPrompt,
+                mergedConfig.openclawVoiceSystemPrompt,
+            ]
+        );
+        previousAgent.tools = {
+            ...previousTools,
+            profile: "minimal",
+            allow: pickDedicatedToolAllow(previousTools.allow, options.pluginId),
+        };
     }
-    syncWorkspacePrompt(
-        desiredWorkspace,
-        previousAgentSystemPrompt ||
-            nextPluginConfig.openclawVoiceSystemPrompt ||
-            mergedConfig.openclawVoiceSystemPrompt,
-        [
-            previousAgentSystemPrompt,
-            nextPluginConfig.openclawVoiceSystemPrompt,
-            mergedConfig.openclawVoiceSystemPrompt,
-        ]
-    );
     delete previousAgent.systemPrompt;
-    previousAgent.tools = {
-        ...previousTools,
-        profile: "minimal",
-        allow: pickDedicatedToolAllow(previousTools.allow, options.pluginId),
-    };
     if (targetAgentIndex >= 0) {
         nextAgentList[targetAgentIndex] = previousAgent;
     } else {
@@ -1184,7 +1242,8 @@ function configureOpenclaw(options) {
             listedMainAgent,
             agentsConfig,
             desiredModel
-        )
+        ),
+        reuseExistingAgent && previousAgent.default === true
     );
 
     const allow = Array.isArray(nextPlugins.allow)
@@ -1250,7 +1309,7 @@ function configureOpenclaw(options) {
                 `Expected plugins.allow to include ${options.pluginId}.`
         );
     }
-    if (desiredModel && verifiedAgent?.model !== desiredModel) {
+    if (!reuseExistingAgent && desiredModel && verifiedAgent?.model !== desiredModel) {
         fail(
             `[install] Dedicated agent model sync failed for "${desiredAgentId}". ` +
                 `Expected ${desiredModel}, got ${verifiedAgent?.model || "<empty>"}.`
@@ -1263,7 +1322,9 @@ function configureOpenclaw(options) {
                 configFile,
                 pluginId: options.pluginId,
                 agentId: desiredAgentId,
-                workspace: desiredWorkspace,
+                workspace: reuseExistingAgent
+                    ? readString(previousAgent.workspace) || desiredWorkspace
+                    : desiredWorkspace,
                 createdAgent: created,
                 createdAgentMeaning: created
                     ? "OpenClaw CLI 新建了专属 agent。"
@@ -1279,11 +1340,18 @@ function configureOpenclaw(options) {
                     openclawChannel: nextPluginConfig.openclawChannel,
                     openclawTo: nextPluginConfig.openclawTo || "",
                 },
-                updatedAgentConfig: {
-                    model: previousAgent.model,
-                    profile: previousAgent.tools.profile,
-                    allow: previousAgent.tools.allow,
-                },
+                updatedAgentConfig: reuseExistingAgent
+                    ? {
+                        model: previousAgent.model || "",
+                        profile: previousAgent.tools?.profile || "",
+                        allow: previousAgent.tools?.allow || [],
+                        reusedExistingAgent: true,
+                    }
+                    : {
+                        model: previousAgent.model,
+                        profile: previousAgent.tools.profile,
+                        allow: previousAgent.tools.allow,
+                    },
                 updatedGlobalTools: {
                     alsoAllow,
                 },

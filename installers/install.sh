@@ -21,6 +21,7 @@ TEMP_RELEASE_DIR=""
 DEV_MODE=0
 PROFILE=""
 STATE_DIR="${OPENCLAW_STATE_DIR:-}"
+AGENT_ID=""
 SKIP_NPM_INSTALL=0
 PACKAGE_MANAGER="auto"
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
@@ -42,6 +43,7 @@ Options:
   --dev                  Install in local link mode (openclaw plugins install -l)
   --profile NAME         Use the given OpenClaw profile
   --state-dir DIR        Use the given OpenClaw state dir
+  --agent ID             Dedicated agent id. Omit to keep xiaoai; otherwise create or reuse ID
   --package-manager PM   Package manager: auto | npm | pnpm
   --openclaw-bin CMD     OpenClaw CLI path or wrapper script path
   --log-file PATH        Persist installer log to PATH
@@ -673,6 +675,14 @@ while [ "$#" -gt 0 ]; do
       STATE_DIR="$2"
       shift 2
       ;;
+    --agent)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "Missing value for --agent" >&2
+        exit 1
+      fi
+      AGENT_ID="$2"
+      shift 2
+      ;;
     --package-manager)
       if [ "$#" -lt 2 ]; then
         echo "Missing value for --package-manager" >&2
@@ -740,6 +750,9 @@ info "Resolved package manager: $PKG_MANAGER"
 info "OpenClaw binary: $OPENCLAW_BIN"
 info "OpenClaw profile: ${PROFILE:-<default>}"
 info "OpenClaw state dir: $(resolve_active_state_dir)"
+if [ -n "$AGENT_ID" ]; then
+  info "Dedicated agent: $AGENT_ID"
+fi
 info "Source tree mode: $( [ "$HAS_SOURCE_TREE" -eq 1 ] && printf 'source' || printf 'release-bundle' )"
 
 cd "$SOURCE_DIR"
@@ -818,6 +831,9 @@ if [ -n "$PROFILE" ]; then
 fi
 if [ -n "$STATE_DIR" ]; then
   set -- "$@" --state-dir "$STATE_DIR"
+fi
+if [ -n "$AGENT_ID" ]; then
+  set -- "$@" --agent "$AGENT_ID"
 fi
 XIAOAI_INSTALL_LOG_CAPTURED=1 XIAOAI_INSTALL_LOG_FILE="$LOG_FILE" \
   node "$SOURCE_DIR/scripts/configure-openclaw-install.mjs" "$@"

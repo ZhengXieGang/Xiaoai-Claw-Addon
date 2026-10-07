@@ -94,6 +94,7 @@ install.cmd
 
 - `--profile <name>`：指定 OpenClaw profile
 - `--state-dir <dir>`：指定 `OPENCLAW_STATE_DIR`
+- `--agent <id>`：指定小爱转发使用的 agent。不传时仍使用默认 `xiaoai`。传入 id 时，不存在则创建，已存在则复用
 - `--openclaw-bin <path>`：指定 OpenClaw CLI 路径
 - `--skip-npm-install`：跳过依赖安装
 
@@ -202,7 +203,7 @@ uninstall.cmd
 
 1. 安装依赖并构建插件
 2. 安装到 OpenClaw
-3. 创建或复用专属 `xiaoai` agent
+3. 创建或复用专属 agent（默认 `xiaoai`，可用 `--agent` 指定）
 4. 写入 `openclawAgent`
 5. 保留当前默认 agent，避免 `xiaoai` 抢占已有渠道入口
 6. 自动推断当前通知渠道与目标（能唯一识别时）

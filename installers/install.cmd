@@ -13,6 +13,7 @@ set "TEMP_RELEASE_DIR="
 set "DEV_MODE=0"
 set "PROFILE="
 set "STATE_DIR=%OPENCLAW_STATE_DIR%"
+set "AGENT_ID="
 set "SKIP_NPM_INSTALL=0"
 set "PACKAGE_MANAGER=auto"
 set "OPENCLAW_BIN=%OPENCLAW_BIN%"
@@ -53,6 +54,17 @@ if /i "%~1"=="--state-dir" (
     goto cleanup_and_exit
   )
   set "STATE_DIR=%~2"
+  shift
+  shift
+  goto parse_args
+)
+if /i "%~1"=="--agent" (
+  if "%~2"=="" (
+    echo Missing value for --agent
+    set "EXIT_CODE=1"
+    goto cleanup_and_exit
+  )
+  set "AGENT_ID=%~2"
   shift
   shift
   goto parse_args
@@ -199,6 +211,7 @@ call :log_info [4/5] Configuring dedicated lightweight XiaoAi agent...
 set "CONFIGURE_ARGS=--openclaw-bin ""%OPENCLAW_BIN%"""
 if not "%PROFILE%"=="" set "CONFIGURE_ARGS=%CONFIGURE_ARGS% --profile ""%PROFILE%"""
 if not "%STATE_DIR%"=="" set "CONFIGURE_ARGS=%CONFIGURE_ARGS% --state-dir ""%STATE_DIR%"""
+if not "%AGENT_ID%"=="" set "CONFIGURE_ARGS=%CONFIGURE_ARGS% --agent ""%AGENT_ID%"""
 if defined LOG_FILE set "CONFIGURE_ARGS=%CONFIGURE_ARGS% --log-file ""%LOG_FILE%"""
 set "XIAOAI_INSTALL_LOG_CAPTURED=1"
 set "XIAOAI_INSTALL_LOG_FILE=%LOG_FILE%"
@@ -224,6 +237,7 @@ echo.
 echo   --dev                  Install in local link mode ^(openclaw plugins install -l^)
 echo   --profile NAME         Use the given OpenClaw profile
 echo   --state-dir DIR        Use the given OpenClaw state dir
+echo   --agent ID             Dedicated agent id. Omit to keep xiaoai; otherwise create or reuse ID
 echo   --package-manager PM   Package manager: auto ^| npm ^| pnpm
 echo   --openclaw-bin CMD     OpenClaw CLI path or wrapper script path
 echo   --log-file PATH        Persist installer log to PATH
